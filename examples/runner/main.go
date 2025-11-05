@@ -32,6 +32,8 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	sessioninmemory "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
 	"trpc.group/trpc-go/trpc-agent-go/session/redis"
+	ametric "trpc.group/trpc-go/trpc-agent-go/telemetry/metric"
+	atrace "trpc.group/trpc-go/trpc-agent-go/telemetry/trace"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 	"trpc.group/trpc-go/trpc-agent-go/tool/function"
 )
@@ -48,6 +50,44 @@ var (
 func main() {
 	// Parse command line flags.
 	flag.Parse()
+
+	ctx := context.Background()
+
+	// Initialize OpenTelemetry tracing
+	cleanTrace, err := atrace.Start(
+		ctx,
+		atrace.WithEndpoint("localhost:4317"),
+		atrace.WithServiceName("trpc-runner-demo"),
+		atrace.WithServiceNamespace("examples"),
+	)
+	if err != nil {
+		log.Fatalf("Failed to start trace: %v", err)
+	}
+	defer func() {
+		if err := cleanTrace(); err != nil {
+			log.Printf("Failed to clean up trace: %v", err)
+		}
+	}()
+
+	// Initialize OpenTelemetry metrics
+	mp, err := ametric.NewMeterProvider(
+		ctx,
+		ametric.WithEndpoint("localhost:4317"),
+		ametric.WithServiceName("trpc-runner-demo"),
+		ametric.WithServiceNamespace("examples"),
+	)
+	if err != nil {
+		log.Fatalf("Failed to create meter provider: %v", err)
+	}
+	defer func() {
+		if err := mp.Shutdown(ctx); err != nil {
+			log.Printf("Failed to shutdown meter provider: %v", err)
+		}
+	}()
+
+	if err := ametric.InitMeterProvider(mp); err != nil {
+		log.Fatalf("Failed to init meter provider: %v", err)
+	}
 
 	fmt.Printf("🚀 Multi-turn Chat with Runner + Tools\n")
 	fmt.Printf("Provider: %s\n", *provider)

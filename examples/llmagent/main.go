@@ -20,12 +20,16 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/model/openai"
 	"trpc.group/trpc-go/trpc-agent-go/session"
+	ametric "trpc.group/trpc-go/trpc-agent-go/telemetry/metric"
+	atrace "trpc.group/trpc-go/trpc-agent-go/telemetry/trace"
 )
 
 var (
@@ -36,6 +40,43 @@ var (
 func main() {
 	// Parse command line flags.
 	flag.Parse()
+
+	ctx := context.Background()
+
+	// Initialize OpenTelemetry tracing (gRPC exporter to localhost:4317).
+	cleanTrace, err := atrace.Start(
+		ctx,
+		atrace.WithEndpoint("localhost:4317"),
+		atrace.WithServiceName("llmagent-demo"),
+		atrace.WithResourceAttributes(attribute.String("service.namespace", "llmagent-demo")),
+	)
+	if err != nil {
+		log.Fatalf("Failed to start trace telemetry: %v", err)
+	}
+	defer func() {
+		if err := cleanTrace(); err != nil {
+			log.Printf("Failed to clean up trace telemetry: %v", err)
+		}
+	}()
+
+	// Initialize OpenTelemetry metrics (gRPC exporter to localhost:4317).
+	mp, err := ametric.NewMeterProvider(
+		ctx,
+		ametric.WithEndpoint("localhost:4317"),
+		ametric.WithServiceName("llmagent-demo"),
+	)
+	if err != nil {
+		log.Fatalf("Failed to create metric provider: %v", err)
+	}
+	defer func() {
+		if err := mp.Shutdown(ctx); err != nil {
+			log.Printf("Failed to clean up metric telemetry: %v", err)
+		}
+	}()
+
+	if err := ametric.InitMeterProvider(mp); err != nil {
+		log.Fatalf("Failed to init metric telemetry: %v", err)
+	}
 
 	fmt.Printf("🚀 Interactive Chat with LLMAgent\n")
 	fmt.Printf("Model: %s\n", *modelName)
@@ -48,7 +89,7 @@ func main() {
 		streaming: *streaming,
 	}
 
-	if err := chat.run(); err != nil {
+	if err := chat.run(ctx); err != nil {
 		log.Fatalf("Chat failed: %v", err)
 	}
 }
@@ -62,9 +103,7 @@ type llmAgentChat struct {
 }
 
 // run starts the interactive chat session.
-func (c *llmAgentChat) run() error {
-	ctx := context.Background()
-
+func (c *llmAgentChat) run(ctx context.Context) error {
 	// Setup the agent.
 	if err := c.setup(ctx); err != nil {
 		return fmt.Errorf("setup failed: %w", err)
