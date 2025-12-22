@@ -12,6 +12,7 @@ package chainagent
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,6 +97,40 @@ func (m *mockAgent) Run(ctx context.Context, invocation *agent.Invocation) (<-ch
 
 func (m *mockAgent) Tools() []tool.Tool {
 	return m.tools
+}
+
+type mockErrorEventAgent struct {
+	name string
+}
+
+func (m *mockErrorEventAgent) Info() agent.Info                { return agent.Info{Name: m.name} }
+func (m *mockErrorEventAgent) SubAgents() []agent.Agent        { return nil }
+func (m *mockErrorEventAgent) FindSubAgent(string) agent.Agent { return nil }
+func (m *mockErrorEventAgent) Tools() []tool.Tool              { return nil }
+func (m *mockErrorEventAgent) Run(ctx context.Context, inv *agent.Invocation) (<-chan *event.Event, error) {
+	ch := make(chan *event.Event, 1)
+	go func() {
+		defer close(ch)
+		evt := event.NewErrorEvent(inv.InvocationID, m.name, model.ErrorTypeFlowError, "boom")
+		_ = agent.EmitEvent(ctx, inv, ch, evt)
+	}()
+	return ch, nil
+}
+
+type countingAgent struct {
+	name     string
+	runCount *int32
+}
+
+func (m *countingAgent) Info() agent.Info                { return agent.Info{Name: m.name} }
+func (m *countingAgent) SubAgents() []agent.Agent        { return nil }
+func (m *countingAgent) FindSubAgent(string) agent.Agent { return nil }
+func (m *countingAgent) Tools() []tool.Tool              { return nil }
+func (m *countingAgent) Run(ctx context.Context, inv *agent.Invocation) (<-chan *event.Event, error) {
+	atomic.AddInt32(m.runCount, 1)
+	ch := make(chan *event.Event, 1)
+	close(ch)
+	return ch, nil
 }
 
 func TestChainAgent_Sequential(t *testing.T) {
@@ -225,6 +260,35 @@ func TestChainAgent_SubAgentError(t *testing.T) {
 	lastEvent := events[len(events)-1]
 	require.NotNil(t, lastEvent.Error)
 	require.Equal(t, model.ErrorTypeFlowError, lastEvent.Error.Type)
+}
+
+func TestChainAgent_ErrorEventStopsSubsequentAgents(t *testing.T) {
+	var downstreamRuns int32
+
+	errAgent := &mockErrorEventAgent{name: "err-agent"}
+	downstream := &countingAgent{name: "next-agent", runCount: &downstreamRuns}
+
+	chain := New(
+		"test-chain",
+		WithSubAgents([]agent.Agent{errAgent, downstream}),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	inv := &agent.Invocation{InvocationID: "inv-error-event", AgentName: "test-chain"}
+	ch, err := chain.Run(ctx, inv)
+	require.NoError(t, err)
+
+	var events []*event.Event
+	for evt := range ch {
+		events = append(events, evt)
+	}
+
+	require.Equal(t, int32(0), atomic.LoadInt32(&downstreamRuns))
+	require.NotEmpty(t, events)
+	require.NotNil(t, events[len(events)-1].Error)
+	require.Equal(t, model.ErrorTypeFlowError, events[len(events)-1].Error.Type)
 }
 
 func TestChainAgent_EmptySubAgents(t *testing.T) {
@@ -432,6 +496,55 @@ func TestChainAgent_AfterCallback(t *testing.T) {
 	require.Equal(t, 1, count)
 }
 
+func TestChainAgent_AfterCallbackError(t *testing.T) {
+	// Prepare mock agents.
+	minimal := &mockMinimalAgent{name: "child"}
+
+	// Prepare callbacks with after agent returning error.
+	callbacks := agent.NewCallbacks()
+	callbacks.RegisterAfterAgent(func(ctx context.Context, inv *agent.Invocation, _ error) (*model.Response, error) {
+		return nil, errors.New("after callback failed")
+	})
+
+	chain := New(
+		"root",
+		WithSubAgents([]agent.Agent{minimal}),
+		WithAgentCallbacks(callbacks),
+	)
+
+	inv := &agent.Invocation{
+		InvocationID: "inv-after-error",
+		AgentName:    "root",
+	}
+
+	ctx := context.Background()
+	events, err := chain.Run(ctx, inv)
+	require.NoError(t, err)
+
+	// Expect exactly one error event from after-agent callback.
+	count := 0
+	for e := range events {
+		count++
+		require.NotNil(t, e.Error)
+		require.Equal(t, agent.ErrorTypeAgentCallbackError, e.Error.Type)
+		require.Contains(t, e.Error.Message, "after callback failed")
+	}
+	require.Equal(t, 1, count)
+}
+
+func TestChainAgent_SubAgents(t *testing.T) {
+	sub1 := &mockMinimalAgent{name: "sub1"}
+	sub2 := &mockMinimalAgent{name: "sub2"}
+
+	chain := New("root", WithSubAgents([]agent.Agent{sub1, sub2}))
+
+	// Test SubAgents.
+	subs := chain.SubAgents()
+	require.Len(t, subs, 2)
+	require.Equal(t, "sub1", subs[0].Info().Name)
+	require.Equal(t, "sub2", subs[1].Info().Name)
+}
+
 // mockNoEventAgent is a sub-agent that never produces events (used to
 // verify short-circuit behaviour when a before-callback returns).
 type mockNoEventAgent struct{ name string }
@@ -512,4 +625,55 @@ func TestChainAgent_BeforeCallbackError(t *testing.T) {
 		require.Equal(t, agent.ErrorTypeAgentCallbackError, e.Error.Type)
 	}
 	require.Equal(t, 1, cnt)
+}
+
+// TestChainAgent_CallbackContextPropagation tests that context values set in
+// BeforeAgent callback can be retrieved in AfterAgent callback.
+func TestChainAgent_CallbackContextPropagation(t *testing.T) {
+	type contextKey string
+	const testKey contextKey = "test-key"
+	const testValue = "test-value-from-before"
+
+	// Create callbacks that set and read context values.
+	callbacks := agent.NewCallbacks()
+	var capturedValue any
+
+	// BeforeAgent callback sets a context value.
+	callbacks.RegisterBeforeAgent(func(ctx context.Context, args *agent.BeforeAgentArgs) (*agent.BeforeAgentResult, error) {
+		ctxWithValue := context.WithValue(ctx, testKey, testValue)
+		return &agent.BeforeAgentResult{
+			Context: ctxWithValue,
+		}, nil
+	})
+
+	// AfterAgent callback reads the context value.
+	callbacks.RegisterAfterAgent(func(ctx context.Context, args *agent.AfterAgentArgs) (*agent.AfterAgentResult, error) {
+		capturedValue = ctx.Value(testKey)
+		return nil, nil
+	})
+
+	// Create chain agent with callbacks.
+	subAgent := &mockMinimalAgent{name: "child"}
+	chainAgent := New(
+		"test-chain",
+		WithSubAgents([]agent.Agent{subAgent}),
+		WithAgentCallbacks(callbacks),
+	)
+
+	// Run the agent.
+	ctx := context.Background()
+	invocation := &agent.Invocation{
+		InvocationID: "test-invocation",
+		AgentName:    "test-chain",
+	}
+
+	events, err := chainAgent.Run(ctx, invocation)
+	require.NoError(t, err)
+
+	// Consume all events to ensure callbacks are executed.
+	for range events {
+	}
+
+	// Verify that the context value was captured in AfterAgent callback.
+	require.Equal(t, testValue, capturedValue, "context value should be propagated from BeforeAgent to AfterAgent")
 }

@@ -12,7 +12,18 @@ package redis
 import (
 	"time"
 
+	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/session/summary"
+)
+
+const (
+	defaultSessionEventLimit   = 1000
+	defaultAsyncPersistTimeout = 2 * time.Second
+	defaultChanBufferSize      = 100
+	defaultAsyncPersisterNum   = 10
+
+	defaultAsyncSummaryNum  = 3
+	defaultSummaryQueueSize = 100
 )
 
 // ServiceOpts is the options for the redis session service.
@@ -34,10 +45,27 @@ type ServiceOpts struct {
 	summaryQueueSize int
 	// summaryJobTimeout is the timeout for processing a single summary job.
 	summaryJobTimeout time.Duration
+	// hooks for session operations.
+	appendEventHooks []session.AppendEventHook
+	getSessionHooks  []session.GetSessionHook
 }
 
 // ServiceOpt is the option for the redis session service.
 type ServiceOpt func(*ServiceOpts)
+
+var (
+	defaultOptions = ServiceOpts{
+		sessionEventLimit:  defaultSessionEventLimit,
+		sessionTTL:         0,
+		appStateTTL:        0,
+		userStateTTL:       0,
+		asyncPersisterNum:  defaultAsyncPersisterNum,
+		enableAsyncPersist: false,
+		asyncSummaryNum:    defaultAsyncSummaryNum,
+		summaryQueueSize:   defaultSummaryQueueSize,
+		summaryJobTimeout:  30 * time.Second,
+	}
+)
 
 // WithSessionEventLimit sets the limit of events in a session.
 func WithSessionEventLimit(limit int) ServiceOpt {
@@ -147,5 +175,19 @@ func WithSummaryJobTimeout(timeout time.Duration) ServiceOpt {
 			return
 		}
 		opts.summaryJobTimeout = timeout
+	}
+}
+
+// WithAppendEventHook adds AppendEvent hooks.
+func WithAppendEventHook(hooks ...session.AppendEventHook) ServiceOpt {
+	return func(opts *ServiceOpts) {
+		opts.appendEventHooks = append(opts.appendEventHooks, hooks...)
+	}
+}
+
+// WithGetSessionHook adds GetSession hooks.
+func WithGetSessionHook(hooks ...session.GetSessionHook) ServiceOpt {
+	return func(opts *ServiceOpts) {
+		opts.getSessionHooks = append(opts.getSessionHooks, hooks...)
 	}
 }

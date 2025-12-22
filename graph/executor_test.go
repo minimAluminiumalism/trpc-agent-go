@@ -1946,14 +1946,25 @@ func TestProcessConditionalEdges_DedupMulti(t *testing.T) {
 
 	exec, err := NewExecutor(g)
 	require.NoError(t, err)
-	execCtx := &ExecutionContext{Graph: g, State: State{}, EventChan: make(chan *event.Event, 16)}
+	// Build a full execution context so that conditional edges create
+	// per-run channels on the ExecutionContext instead of mutating the
+	// shared Graph definition.
+	execCtx := exec.buildExecutionContext(
+		make(chan *event.Event, 16),
+		"inv-cond-dedup",
+		State{},
+		false,
+		nil,
+	)
 
 	// Process and verify only one update per target channel.
 	require.NoError(t, exec.processConditionalEdges(context.Background(), nil, execCtx, "start", 0))
-	chB, _ := g.getChannel("branch:to:B")
-	chC, _ := g.getChannel("branch:to:C")
-	require.NotNil(t, chB)
-	require.NotNil(t, chC)
+	// The dynamic branch channels should exist only on the per-execution
+	// channel manager and each receive a single update.
+	chB, okB := execCtx.channels.GetChannel(ChannelBranchPrefix + "B")
+	chC, okC := execCtx.channels.GetChannel(ChannelBranchPrefix + "C")
+	require.True(t, okB)
+	require.True(t, okC)
 	require.Equal(t, int64(1), chB.Version)
 	require.Equal(t, int64(1), chC.Version)
 }
@@ -2075,29 +2086,29 @@ func TestProcessConditionalEdges_Multi_SkipEmpty(t *testing.T) {
 	exec, err := NewExecutor(g)
 	require.NoError(t, err)
 
-	execCtx := &ExecutionContext{
-		Graph:        g,
-		State:        State{},
-		EventChan:    make(chan *event.Event, 8),
-		InvocationID: "inv-multi-skip",
-	}
+	execCtx := exec.buildExecutionContext(
+		make(chan *event.Event, 8),
+		"inv-multi-skip",
+		State{},
+		false,
+		nil,
+	)
 
 	require.NoError(t, exec.processConditionalEdges(
 		context.Background(), nil, execCtx, nodeStart, 0,
 	))
 
 	// Expect channels only for B and C, one update each.
-	chB, okB := g.getChannel(ChannelBranchPrefix + nodeB)
-	chC, okC := g.getChannel(ChannelBranchPrefix + nodeC)
+	chB, okB := execCtx.channels.GetChannel(ChannelBranchPrefix + nodeB)
+	chC, okC := execCtx.channels.GetChannel(ChannelBranchPrefix + nodeC)
 	require.True(t, okB)
 	require.True(t, okC)
 	require.Equal(t, int64(1), chB.Version)
 	require.Equal(t, int64(1), chC.Version)
 
 	// No channel should be created for empty branch key.
-	if _, ok := g.getChannel(ChannelBranchPrefix + ""); ok {
-		t.Fatalf("unexpected channel for empty branch key created")
-	}
+	_, okEmpty := execCtx.channels.GetChannel(ChannelBranchPrefix + "")
+	require.False(t, okEmpty, "expected no channel for empty branch key")
 }
 
 // minimalNoopNode returns a trivial node function for building test graphs.
@@ -2283,116 +2294,6 @@ func TestResolveTargetByEnds(t *testing.T) {
 	require.Equal(t, "", exec.resolveTargetByEnds("X", "nope"))
 	// Unknown node returns empty
 	require.Equal(t, "", exec.resolveTargetByEnds("ZZ", "ok"))
-}
-
-func TestExecutor_isDisableDeepCopyKey(t *testing.T) {
-	type fields struct {
-		graph *Graph
-	}
-	type args struct {
-		key string
-	}
-	tests := []struct {
-		name   string
-		fields fields
-		args   args
-		want   bool
-	}{
-		{
-			name: "schema is nil",
-			fields: fields{
-				graph: &Graph{schema: nil},
-			},
-			args: args{key: "anyKey"},
-			want: false,
-		},
-		{
-			name: "key not found in schema",
-			fields: fields{
-				graph: &Graph{
-					schema: &StateSchema{
-						Fields: map[string]StateField{},
-					},
-				},
-			},
-			args: args{key: "missingKey"},
-			want: false,
-		},
-		{
-			name: "key exists with DisableDeepCopy true",
-			fields: fields{
-				graph: &Graph{
-					schema: &StateSchema{
-						Fields: map[string]StateField{
-							"testKey": {DisableDeepCopy: true},
-						},
-					},
-				},
-			},
-			args: args{key: "testKey"},
-			want: true,
-		},
-		{
-			name: "key exists with DisableDeepCopy false",
-			fields: fields{
-				graph: &Graph{
-					schema: &StateSchema{
-						Fields: map[string]StateField{
-							"testKey": {DisableDeepCopy: false},
-						},
-					},
-				},
-			},
-			args: args{key: "testKey"},
-			want: false,
-		},
-		{
-			name: "empty key not found",
-			fields: fields{
-				graph: &Graph{
-					schema: &StateSchema{
-						Fields: map[string]StateField{},
-					},
-				},
-			},
-			args: args{key: ""},
-			want: false,
-		},
-		{
-			name: "empty key with DisableDeepCopy true",
-			fields: fields{
-				graph: &Graph{
-					schema: &StateSchema{
-						Fields: map[string]StateField{
-							"": {DisableDeepCopy: true},
-						},
-					},
-				},
-			},
-			args: args{key: ""},
-			want: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			e := &Executor{
-				graph: tt.fields.graph,
-
-				channelBufferSize:     0,
-				maxSteps:              0,
-				stepTimeout:           0,
-				nodeTimeout:           0,
-				checkpointSaveTimeout: 0,
-				checkpointSaver:       nil,
-				checkpointManager:     nil,
-				defaultRetry:          nil,
-			}
-			if got := e.isDisableDeepCopyKey(tt.args.key); got != tt.want {
-				t.Errorf("isDisableDeepCopyKey() = %v, want %v", got, tt.want)
-			}
-		})
-	}
 }
 
 type testCase struct {

@@ -21,6 +21,7 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
+	isummary "trpc.group/trpc-go/trpc-agent-go/session/internal/summary"
 )
 
 type fakeSummarizer struct {
@@ -32,6 +33,8 @@ func (f *fakeSummarizer) ShouldSummarize(sess *session.Session) bool { return f.
 func (f *fakeSummarizer) Summarize(ctx context.Context, sess *session.Session) (string, error) {
 	return f.out, nil
 }
+func (f *fakeSummarizer) SetPrompt(prompt string)  {}
+func (f *fakeSummarizer) SetModel(m model.Model)   {}
 func (f *fakeSummarizer) Metadata() map[string]any { return map[string]any{} }
 
 func TestRedisService_GetSessionSummaryText_LocalPreferred(t *testing.T) {
@@ -401,16 +404,23 @@ func TestRedisService_EnqueueSummaryJob_QueueFull_FallbackToSync(t *testing.T) {
 	}
 
 	// Now try to enqueue another job - should fall back to sync
-	err = s.EnqueueSummaryJob(context.Background(), sess, "", false)
+	err = s.EnqueueSummaryJob(context.Background(), sess, "user-messages", false)
 	require.NoError(t, err)
 
-	// Verify summary was created immediately in Redis (sync fallback)
+	// Verify both branch summary and full summary were created immediately in Redis (sync fallback with cascade)
 	client := buildRedisClient(t, redisURL)
 	raw, err := client.HGet(context.Background(), getSessionSummaryKey(key), key.SessionID).Bytes()
 	require.NoError(t, err)
 	var m map[string]*session.Summary
 	require.NoError(t, json.Unmarshal(raw, &m))
-	sum, ok := m[""]
+
+	// Check branch summary
+	sum, ok := m["user-messages"]
+	require.True(t, ok)
+	require.Equal(t, "fallback-summary", sum.Summary)
+
+	// Check full summary (should be created by cascade)
+	sum, ok = m[""]
 	require.True(t, ok)
 	require.Equal(t, "fallback-summary", sum.Summary)
 }
@@ -475,6 +485,8 @@ func (f *fakeBlockingSummarizer) Summarize(ctx context.Context, sess *session.Se
 	<-ctx.Done()
 	return "", ctx.Err()
 }
+func (f *fakeBlockingSummarizer) SetPrompt(prompt string)  {}
+func (f *fakeBlockingSummarizer) SetModel(m model.Model)   {}
 func (f *fakeBlockingSummarizer) Metadata() map[string]any { return map[string]any{} }
 
 func TestRedisService_SummaryJobTimeout_CancelsSummarizer(t *testing.T) {
@@ -618,12 +630,122 @@ func TestRedisService_EnqueueSummaryJob_ChannelClosed_AllChannelsClosed(t *testi
 	require.NoError(t, err)
 	require.NotNil(t, summaries)
 
+	// Check branch summary
 	sum, ok := summaries["all-closed-test"]
 	require.True(t, ok)
 	require.Equal(t, "all-channels-closed-summary", sum.Summary)
 
-	// Don't call s.Close() since we manually closed the channels
-	// This simulates a scenario where the service is being shut down
+	// Check full summary (should be created by cascade)
+	sum, ok = summaries[""]
+	require.True(t, ok)
+	require.Equal(t, "all-channels-closed-summary", sum.Summary)
+
+	// Don't call s.Close() since we manually closed the channels.
+	// This simulates a scenario where the service is being shut down.
+}
+
+func TestRedisService_EnqueueSummaryJob_NoAsyncWorkers_FallbackToSyncWithCascade(t *testing.T) {
+	redisURL, cleanup := setupTestRedis(t)
+	defer cleanup()
+
+	// Create service with async workers.
+	s, err := NewService(
+		WithRedisClientURL(redisURL),
+		WithAsyncSummaryNum(1),
+		WithSummarizer(&fakeSummarizer{allow: true, out: "sync-summary"}),
+	)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// Create a session first.
+	key := session.Key{AppName: "app", UserID: "user", SessionID: "sid"}
+	sess, err := s.CreateSession(context.Background(), key, session.StateMap{})
+	require.NoError(t, err)
+
+	// Append an event to make delta non-empty.
+	e := event.New("inv", "author")
+	e.Timestamp = time.Now()
+	e.Response = &model.Response{Choices: []model.Choice{{Message: model.Message{Role: model.RoleUser, Content: "hello"}}}}
+	require.NoError(t, s.AppendEvent(context.Background(), sess, e))
+
+	// Close channels and set to nil to simulate no async workers scenario.
+	for _, ch := range s.summaryJobChans {
+		close(ch)
+	}
+	s.summaryWg.Wait()
+	s.summaryJobChans = nil
+
+	// EnqueueSummaryJob should fall back to sync processing with cascade.
+	err = s.EnqueueSummaryJob(context.Background(), sess, "tool-usage", false)
+	require.NoError(t, err)
+
+	// Verify both branch summary and full summary were created.
+	client := buildRedisClient(t, redisURL)
+	raw, err := client.HGet(context.Background(), getSessionSummaryKey(key), key.SessionID).Bytes()
+	require.NoError(t, err)
+	var m map[string]*session.Summary
+	require.NoError(t, json.Unmarshal(raw, &m))
+
+	// Check branch summary.
+	sum, ok := m["tool-usage"]
+	require.True(t, ok)
+	require.Equal(t, "sync-summary", sum.Summary)
+
+	// Check full summary (should be created by cascade).
+	sum, ok = m[""]
+	require.True(t, ok)
+	require.Equal(t, "sync-summary", sum.Summary)
+}
+
+func TestRedisService_EnqueueSummaryJob_FullSessionKey_NoCascade(t *testing.T) {
+	redisURL, cleanup := setupTestRedis(t)
+	defer cleanup()
+
+	// Create service with async workers.
+	s, err := NewService(
+		WithRedisClientURL(redisURL),
+		WithAsyncSummaryNum(1),
+		WithSummarizer(&fakeSummarizer{allow: true, out: "full-summary"}),
+	)
+	require.NoError(t, err)
+	defer s.Close()
+
+	// Create a session first.
+	key := session.Key{AppName: "app", UserID: "user", SessionID: "sid"}
+	sess, err := s.CreateSession(context.Background(), key, session.StateMap{})
+	require.NoError(t, err)
+
+	// Append an event to make delta non-empty.
+	e := event.New("inv", "author")
+	e.Timestamp = time.Now()
+	e.Response = &model.Response{Choices: []model.Choice{{Message: model.Message{Role: model.RoleUser, Content: "hello"}}}}
+	require.NoError(t, s.AppendEvent(context.Background(), sess, e))
+
+	// Close channels and set to nil to simulate no async workers scenario.
+	for _, ch := range s.summaryJobChans {
+		close(ch)
+	}
+	s.summaryWg.Wait()
+	s.summaryJobChans = nil
+
+	// EnqueueSummaryJob with empty filterKey should not cascade.
+	err = s.EnqueueSummaryJob(context.Background(), sess, "", false)
+	require.NoError(t, err)
+
+	// Verify only full summary was created.
+	client := buildRedisClient(t, redisURL)
+	raw, err := client.HGet(context.Background(), getSessionSummaryKey(key), key.SessionID).Bytes()
+	require.NoError(t, err)
+	var m map[string]*session.Summary
+	require.NoError(t, json.Unmarshal(raw, &m))
+
+	// Check full summary exists.
+	sum, ok := m[""]
+	require.True(t, ok)
+	require.Equal(t, "full-summary", sum.Summary)
+
+	// There should be only one summary (no extra cascade).
+	require.Len(t, m, 1)
 }
 
 func TestRedisService_GetSessionSummaryText_NilSession(t *testing.T) {
@@ -713,20 +835,20 @@ func TestRedisService_PickSummaryText_BranchFallback(t *testing.T) {
 	summaries := map[string]*session.Summary{
 		"branch1": {Summary: "branch-summary", UpdatedAt: time.Now()},
 	}
-	text, ok := pickSummaryText(summaries)
+	text, ok := isummary.PickSummaryText(summaries, "")
 	require.True(t, ok)
 	require.Equal(t, "branch-summary", text)
 }
 
 func TestRedisService_PickSummaryText_EmptySummaries(t *testing.T) {
 	summaries := map[string]*session.Summary{}
-	text, ok := pickSummaryText(summaries)
+	text, ok := isummary.PickSummaryText(summaries, "")
 	require.False(t, ok)
 	require.Empty(t, text)
 }
 
 func TestRedisService_PickSummaryText_NilSummaries(t *testing.T) {
-	text, ok := pickSummaryText(nil)
+	text, ok := isummary.PickSummaryText(nil, "")
 	require.False(t, ok)
 	require.Empty(t, text)
 }
@@ -735,7 +857,7 @@ func TestRedisService_PickSummaryText_EmptyText(t *testing.T) {
 	summaries := map[string]*session.Summary{
 		"branch1": {Summary: "", UpdatedAt: time.Now()},
 	}
-	text, ok := pickSummaryText(summaries)
+	text, ok := isummary.PickSummaryText(summaries, "")
 	require.False(t, ok)
 	require.Empty(t, text)
 }
@@ -744,7 +866,7 @@ func TestRedisService_PickSummaryText_NilEntry(t *testing.T) {
 	summaries := map[string]*session.Summary{
 		"branch1": nil,
 	}
-	text, ok := pickSummaryText(summaries)
+	text, ok := isummary.PickSummaryText(summaries, "")
 	require.False(t, ok)
 	require.Empty(t, text)
 }
@@ -791,10 +913,9 @@ func TestRedisService_ProcessSummaryJob_Panic(t *testing.T) {
 
 	// Process a job with no stored session - should trigger error but not panic.
 	job := &summaryJob{
-		sessionKey: key,
-		filterKey:  "",
-		force:      false,
-		session:    &session.Session{ID: key.SessionID, AppName: key.AppName, UserID: key.UserID},
+		filterKey: "",
+		force:     false,
+		session:   &session.Session{ID: key.SessionID, AppName: key.AppName, UserID: key.UserID},
 	}
 
 	// This should not panic, just log error.
@@ -828,10 +949,9 @@ func TestProcessSummaryJob(t *testing.T) {
 				service.opts.summarizer = &fakeSummarizer{allow: true, out: "test summary"}
 
 				return &summaryJob{
-					sessionKey: key,
-					filterKey:  "",
-					force:      false,
-					session:    sess,
+					filterKey: "",
+					force:     false,
+					session:   sess,
 				}
 			},
 			expectError: false,
@@ -855,10 +975,9 @@ func TestProcessSummaryJob(t *testing.T) {
 				service.opts.summarizer = &fakeSummarizer{allow: true, out: "branch summary"}
 
 				return &summaryJob{
-					sessionKey: key,
-					filterKey:  "branch1",
-					force:      false,
-					session:    sess,
+					filterKey: "branch1",
+					force:     false,
+					session:   sess,
 				}
 			},
 			expectError: false,
@@ -875,10 +994,9 @@ func TestProcessSummaryJob(t *testing.T) {
 				service.opts.summarizer = &fakeSummarizer{allow: false, out: "no update"}
 
 				return &summaryJob{
-					sessionKey: key,
-					filterKey:  "",
-					force:      false,
-					session:    sess,
+					filterKey: "",
+					force:     false,
+					session:   sess,
 				}
 			},
 			expectError: false,
@@ -895,10 +1013,9 @@ func TestProcessSummaryJob(t *testing.T) {
 				service.opts.summarizer = &fakeErrorSummarizer{}
 
 				return &summaryJob{
-					sessionKey: key,
-					filterKey:  "",
-					force:      false,
-					session:    sess,
+					filterKey: "",
+					force:     false,
+					session:   sess,
 				}
 			},
 			expectError: false, // Should not panic or error, just log
@@ -930,6 +1047,8 @@ func (f *fakeErrorSummarizer) ShouldSummarize(sess *session.Session) bool { retu
 func (f *fakeErrorSummarizer) Summarize(ctx context.Context, sess *session.Session) (string, error) {
 	return "", fmt.Errorf("summarizer error")
 }
+func (f *fakeErrorSummarizer) SetPrompt(prompt string)  {}
+func (f *fakeErrorSummarizer) SetModel(m model.Model)   {}
 func (f *fakeErrorSummarizer) Metadata() map[string]any { return map[string]any{} }
 
 func TestTryEnqueueJob(t *testing.T) {
@@ -943,10 +1062,9 @@ func TestTryEnqueueJob(t *testing.T) {
 			setup: func(t *testing.T, service *Service) (context.Context, *summaryJob, bool) {
 				key := session.Key{AppName: "app", UserID: "user", SessionID: "sid"}
 				job := &summaryJob{
-					sessionKey: key,
-					filterKey:  "",
-					force:      false,
-					session:    &session.Session{ID: key.SessionID, AppName: key.AppName, UserID: key.UserID},
+					filterKey: "",
+					force:     false,
+					session:   &session.Session{ID: key.SessionID, AppName: key.AppName, UserID: key.UserID},
 				}
 				return context.Background(), job, true
 			},
@@ -958,10 +1076,9 @@ func TestTryEnqueueJob(t *testing.T) {
 				// Fill up the queue by creating a job that blocks
 				key := session.Key{AppName: "app", UserID: "user", SessionID: "sid3"}
 				job := &summaryJob{
-					sessionKey: key,
-					filterKey:  "",
-					force:      false,
-					session:    &session.Session{ID: key.SessionID, AppName: key.AppName, UserID: key.UserID},
+					filterKey: "",
+					force:     false,
+					session:   &session.Session{ID: key.SessionID, AppName: key.AppName, UserID: key.UserID},
 				}
 
 				// Fill the channel to capacity
@@ -991,6 +1108,7 @@ func TestTryEnqueueJob(t *testing.T) {
 				WithRedisClientURL(redisURL),
 				WithAsyncSummaryNum(1),
 				WithSummaryQueueSize(1),
+				WithSummarizer(&fakeSummarizer{allow: true, out: "test"}),
 			)
 			require.NoError(t, err)
 			defer service.Close()
@@ -1003,10 +1121,69 @@ func TestTryEnqueueJob(t *testing.T) {
 	}
 }
 
+func TestTryEnqueueJob_ContextCancelledBranch(t *testing.T) {
+	redisURL, cleanup := setupTestRedis(t)
+	defer cleanup()
+
+	service, err := NewService(
+		WithRedisClientURL(redisURL),
+		WithAsyncSummaryNum(1),
+		WithSummaryQueueSize(1),
+		WithSummarizer(&fakeSummarizer{allow: true, out: "test"}),
+	)
+	require.NoError(t, err)
+	defer service.Close()
+
+	sess := session.NewSession("app", "user", "sid")
+	job := &summaryJob{
+		filterKey: "",
+		force:     false,
+		session:   sess,
+	}
+	idx := sess.Hash % len(service.summaryJobChans)
+	service.summaryJobChans[idx] <- job
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	result := service.tryEnqueueJob(ctx, job)
+	assert.False(t, result)
+}
+
+func TestProcessSummaryJob_NilJob_Recovers(t *testing.T) {
+	service := &Service{
+		opts: ServiceOpts{
+			summarizer: &fakeSummarizer{allow: true, out: "test"},
+		},
+	}
+
+	require.NotPanics(t, func() {
+		service.processSummaryJob(nil)
+	})
+}
+
+func TestProcessSummaryJob_NilSession_LogsWarning(t *testing.T) {
+	service := &Service{
+		opts: ServiceOpts{
+			summarizer: &fakeSummarizer{allow: true, out: "test"},
+		},
+	}
+
+	job := &summaryJob{
+		filterKey: "",
+		force:     false,
+		session:   nil,
+	}
+	require.NotPanics(t, func() {
+		service.processSummaryJob(job)
+	})
+}
+
 func TestStartAsyncSummaryWorker_Initialization(t *testing.T) {
 	redisURL, cleanup := setupTestRedis(t)
 	defer cleanup()
 
+	// Test without summarizer - channels should not be initialized
 	service, err := NewService(
 		WithRedisClientURL(redisURL),
 		WithAsyncSummaryNum(3),
@@ -1015,7 +1192,24 @@ func TestStartAsyncSummaryWorker_Initialization(t *testing.T) {
 	require.NoError(t, err)
 	defer service.Close()
 
-	// Verify channels are properly initialized
+	// Verify channels are not initialized when no summarizer is provided
+	assert.Len(t, service.summaryJobChans, 0)
+}
+
+func TestStartAsyncSummaryWorker_InitializationWithSummarizer(t *testing.T) {
+	redisURL, cleanup := setupTestRedis(t)
+	defer cleanup()
+
+	service, err := NewService(
+		WithRedisClientURL(redisURL),
+		WithAsyncSummaryNum(3),
+		WithSummaryQueueSize(100),
+		WithSummarizer(&fakeSummarizer{allow: true, out: "test"}),
+	)
+	require.NoError(t, err)
+	defer service.Close()
+
+	// Verify channels are properly initialized when summarizer is provided
 	assert.Len(t, service.summaryJobChans, 3)
 	for i, ch := range service.summaryJobChans {
 		assert.NotNil(t, ch, "Channel %d should not be nil", i)
@@ -1139,10 +1333,9 @@ func TestProcessSummaryJob_WithSessionTTL(t *testing.T) {
 
 			// Create summary job and process it.
 			job := &summaryJob{
-				sessionKey: key,
-				filterKey:  "",
-				force:      false,
-				session:    sess,
+				filterKey: "",
+				force:     false,
+				session:   sess,
 			}
 
 			// This should not panic and should set TTL if sessionTTL > 0.

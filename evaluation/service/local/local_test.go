@@ -16,7 +16,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"google.golang.org/genai"
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/evalresult"
@@ -57,6 +56,10 @@ func (f *fakeRunner) Run(ctx context.Context, userID string, sessionID string, m
 	return ch, nil
 }
 
+func (f *fakeRunner) Close() error {
+	return nil
+}
+
 type fakeEvaluator struct {
 	name   string
 	result *evaluator.EvaluateResult
@@ -95,18 +98,18 @@ func makeFinalEvent(text string) *event.Event {
 func makeInvocation(id, prompt string) *evalset.Invocation {
 	return &evalset.Invocation{
 		InvocationID: id,
-		UserContent: &genai.Content{
-			Role:  "user",
-			Parts: []*genai.Part{{Text: prompt}},
+		UserContent: &model.Message{
+			Role:    model.RoleUser,
+			Content: prompt,
 		},
 	}
 }
 
 func makeActualInvocation(id, prompt, response string) *evalset.Invocation {
 	inv := makeInvocation(id, prompt)
-	inv.FinalResponse = &genai.Content{
-		Role:  "assistant",
-		Parts: []*genai.Part{{Text: response}},
+	inv.FinalResponse = &model.Message{
+		Role:    model.RoleAssistant,
+		Content: response,
 	}
 	return inv
 }
@@ -201,7 +204,7 @@ func TestLocalInferenceFiltersCases(t *testing.T) {
 	assert.Equal(t, status.EvalStatusPassed, results[0].Status)
 	assert.Len(t, results[0].Inferences, 1)
 	assert.NotNil(t, results[0].Inferences[0].FinalResponse)
-	assert.Equal(t, "calc result: 3", results[0].Inferences[0].FinalResponse.Parts[0].Text)
+	assert.Equal(t, "calc result: 3", results[0].Inferences[0].FinalResponse.Content)
 
 	runnerStub.mu.Lock()
 	callCount := len(runnerStub.calls)
@@ -372,18 +375,21 @@ func TestLocalEvaluatePerCaseErrors(t *testing.T) {
 	}
 
 	tests := []struct {
-		name  string
-		setup func(t *testing.T) (*local, *service.InferenceResult, *service.EvaluateConfig)
+		name      string
+		expectErr bool
+		setup     func(t *testing.T) (*local, *service.InferenceResult, *service.EvaluateConfig)
 	}{
 		{
-			name: "nil inference result",
+			name:      "nil inference result",
+			expectErr: true,
 			setup: func(t *testing.T) (*local, *service.InferenceResult, *service.EvaluateConfig) {
 				svc, _, _ := prepare(t)
 				return svc, nil, &service.EvaluateConfig{}
 			},
 		},
 		{
-			name: "nil evaluate config",
+			name:      "nil evaluate config",
+			expectErr: true,
 			setup: func(t *testing.T) (*local, *service.InferenceResult, *service.EvaluateConfig) {
 				svc, _, _ := prepare(t)
 				inference := makeInferenceResult(appName, evalSetID, "case", "session", nil)
@@ -391,7 +397,8 @@ func TestLocalEvaluatePerCaseErrors(t *testing.T) {
 			},
 		},
 		{
-			name: "missing eval case",
+			name:      "missing eval case",
+			expectErr: true,
 			setup: func(t *testing.T) (*local, *service.InferenceResult, *service.EvaluateConfig) {
 				svc, _, _ := prepare(t)
 				inference := makeInferenceResult(appName, evalSetID, "missing", "session", []*evalset.Invocation{})
@@ -400,7 +407,8 @@ func TestLocalEvaluatePerCaseErrors(t *testing.T) {
 			},
 		},
 		{
-			name: "invalid eval case",
+			name:      "invalid eval case",
+			expectErr: true,
 			setup: func(t *testing.T) (*local, *service.InferenceResult, *service.EvaluateConfig) {
 				svc, mgr, _ := prepare(t)
 				_, err := mgr.Create(ctx, appName, evalSetID)
@@ -418,7 +426,8 @@ func TestLocalEvaluatePerCaseErrors(t *testing.T) {
 			},
 		},
 		{
-			name: "mismatched inference count",
+			name:      "mismatched inference count",
+			expectErr: true,
 			setup: func(t *testing.T) (*local, *service.InferenceResult, *service.EvaluateConfig) {
 				svc, mgr, _ := prepare(t)
 				_, err := mgr.Create(ctx, appName, evalSetID)
@@ -430,7 +439,8 @@ func TestLocalEvaluatePerCaseErrors(t *testing.T) {
 			},
 		},
 		{
-			name: "missing evaluator",
+			name:      "missing evaluator",
+			expectErr: false,
 			setup: func(t *testing.T) (*local, *service.InferenceResult, *service.EvaluateConfig) {
 				svc, mgr, _ := prepare(t)
 				_, err := mgr.Create(ctx, appName, evalSetID)
@@ -443,7 +453,8 @@ func TestLocalEvaluatePerCaseErrors(t *testing.T) {
 			},
 		},
 		{
-			name: "per invocation mismatch",
+			name:      "per invocation mismatch",
+			expectErr: true,
 			setup: func(t *testing.T) (*local, *service.InferenceResult, *service.EvaluateConfig) {
 				svc, mgr, reg := prepare(t)
 				_, err := mgr.Create(ctx, appName, evalSetID)
@@ -466,7 +477,8 @@ func TestLocalEvaluatePerCaseErrors(t *testing.T) {
 			},
 		},
 		{
-			name: "summarize failure",
+			name:      "summarize failure",
+			expectErr: true,
 			setup: func(t *testing.T) (*local, *service.InferenceResult, *service.EvaluateConfig) {
 				svc, mgr, reg := prepare(t)
 				_, err := mgr.Create(ctx, appName, evalSetID)
@@ -489,7 +501,8 @@ func TestLocalEvaluatePerCaseErrors(t *testing.T) {
 			},
 		},
 		{
-			name: "evaluator error",
+			name:      "evaluator error",
+			expectErr: true,
 			setup: func(t *testing.T) (*local, *service.InferenceResult, *service.EvaluateConfig) {
 				svc, mgr, reg := prepare(t)
 				_, err := mgr.Create(ctx, appName, evalSetID)
@@ -510,7 +523,11 @@ func TestLocalEvaluatePerCaseErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			svc, inference, config := tc.setup(t)
 			_, err := svc.evaluatePerCase(ctx, inference, config)
-			assert.Error(t, err)
+			if tc.expectErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
 		})
 	}
 }

@@ -73,6 +73,9 @@ func run() error {
 	sessSvc := inmemory.NewSessionService()
 	r := runner.NewRunner("retry-demo", ga, runner.WithSessionService(sessSvc))
 
+	// Ensure runner resources are cleaned up (trpc-agent-go >= v0.5.0)
+	defer r.Close()
+
 	user := "user"
 	session := fmt.Sprintf("retry-session-%d", time.Now().Unix())
 
@@ -211,10 +214,6 @@ func handleStreaming(ch <-chan *event.Event) error {
 		started bool
 	)
 	for ev := range ch {
-		if ev.Error != nil {
-			fmt.Printf("❌ Error: %s\n", ev.Error.Message)
-			continue
-		}
 		// Show retry metadata when verbose
 		if *verbose && ev.StateDelta != nil {
 			if b, ok := ev.StateDelta[graph.MetadataKeyNode]; ok {
@@ -231,6 +230,10 @@ func handleStreaming(ch <-chan *event.Event) error {
 					}
 				}
 			}
+		}
+		if ev.Error != nil {
+			fmt.Printf("❌ Error: %s\n", ev.Error.Message)
+			continue
 		}
 		// Stream model deltas
 		if len(ev.Response.Choices) > 0 {

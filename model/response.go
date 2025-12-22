@@ -18,6 +18,7 @@ const (
 	ErrorTypeStreamError = "stream_error"
 	ErrorTypeAPIError    = "api_error"
 	ErrorTypeFlowError   = "flow_error"
+	ErrorTypeRunError    = "run_error"
 )
 
 // Object type constants for Response.Object field.
@@ -37,7 +38,7 @@ const (
 	ObjectTypePreprocessingPlanning = "preprocessing.planning"
 	// ObjectTypePostprocessingPlanning is the object type for planning postprocessing events.
 	ObjectTypePostprocessingPlanning = "postprocessing.planning"
-
+	// ObjectTypePostprocessingCodeExecution is the object type for code execution postprocessing events.
 	ObjectTypePostprocessingCodeExecution = "postprocessing.code_execution"
 	// ObjectTypeTransfer is the object type for agent transfer events.
 	ObjectTypeTransfer = "agent.transfer"
@@ -68,6 +69,21 @@ type Choice struct {
 	FinishReason *string `json:"finish_reason,omitempty"`
 }
 
+// TimingInfo represents timing information for token generation.
+// It accumulates durations across multiple LLM calls within a flow.
+type TimingInfo struct {
+
+	// FirstTokenDuration is the accumulated duration from request start to the first meaningful token.
+	// A "meaningful token" is defined as the first chunk containing reasoning content, regular content, or tool calls.
+	// Empty chunks are skipped. For multiple LLM calls (e.g., tool calls), this accumulates the duration of each call.
+	FirstTokenDuration time.Duration `json:"time_to_first_token,omitempty"`
+
+	// ReasoningDuration is the accumulated duration of reasoning phases (streaming mode only).
+	// Measured from the first reasoning chunk to the last reasoning chunk in each LLM call.
+	// For non-streaming requests, this field will remain 0 as reasoning duration cannot be measured precisely.
+	ReasoningDuration time.Duration `json:"reasoning_duration,omitempty"`
+}
+
 // Usage represents token usage information.
 type Usage struct {
 	// PromptTokens is the number of tokens in the prompt.
@@ -81,6 +97,9 @@ type Usage struct {
 
 	// PromptTokensDetails is the details of the prompt tokens.
 	PromptTokensDetails PromptTokensDetails `json:"prompt_tokens_details"`
+
+	// TimingInfo contains detailed timing information for token generation.
+	TimingInfo *TimingInfo `json:"timing_info,omitempty"`
 }
 
 // PromptTokensDetails is the details of the prompt tokens.
@@ -154,9 +173,17 @@ func (rsp *Response) Clone() *Response {
 	copy(clone.Choices, rsp.Choices)
 	if rsp.Usage != nil {
 		clone.Usage = &Usage{
-			PromptTokens:     rsp.Usage.PromptTokens,
-			CompletionTokens: rsp.Usage.CompletionTokens,
-			TotalTokens:      rsp.Usage.TotalTokens,
+			PromptTokens:        rsp.Usage.PromptTokens,
+			CompletionTokens:    rsp.Usage.CompletionTokens,
+			TotalTokens:         rsp.Usage.TotalTokens,
+			PromptTokensDetails: rsp.Usage.PromptTokensDetails,
+		}
+		// Deep copy TimingInfo if present
+		if rsp.Usage.TimingInfo != nil {
+			clone.Usage.TimingInfo = &TimingInfo{
+				FirstTokenDuration: rsp.Usage.TimingInfo.FirstTokenDuration,
+				ReasoningDuration:  rsp.Usage.TimingInfo.ReasoningDuration,
+			}
 		}
 	}
 	// Deep copy Error if present.
@@ -197,14 +224,27 @@ func (rsp *Response) IsValidContent() bool {
 	return false
 }
 
+// IsUserMessage checks if the response is a user message.
+func (rsp *Response) IsUserMessage() bool {
+	if rsp == nil || len(rsp.Choices) == 0 {
+		return false
+	}
+	for _, choice := range rsp.Choices {
+		if choice.Message.Role == RoleUser || choice.Delta.Role == RoleUser {
+			return true
+		}
+	}
+	return false
+}
+
 // IsToolResultResponse  checks if the response is a tool call result response.
 func (rsp *Response) IsToolResultResponse() bool {
-	return rsp != nil && len(rsp.Choices) > 0 && rsp.Choices[0].Message.ToolID != ""
+	return rsp != nil && len(rsp.Choices) > 0 && (rsp.Choices[0].Message.ToolID != "" || rsp.Choices[0].Delta.ToolID != "")
 }
 
 // IsToolCallResponse checks if the response is related to tool calls.
 func (rsp *Response) IsToolCallResponse() bool {
-	return rsp != nil && len(rsp.Choices) > 0 && len(rsp.Choices[0].Message.ToolCalls) > 0
+	return rsp != nil && len(rsp.Choices) > 0 && (len(rsp.Choices[0].Message.ToolCalls) > 0 || len(rsp.Choices[0].Delta.ToolCalls) > 0)
 }
 
 // GetToolCallIDs gets the IDs of tool calls from the response.
@@ -215,6 +255,9 @@ func (rsp *Response) GetToolCallIDs() []string {
 	}
 	for _, choice := range rsp.Choices {
 		for _, toolCall := range choice.Message.ToolCalls {
+			ids = append(ids, toolCall.ID)
+		}
+		for _, toolCall := range choice.Delta.ToolCalls {
 			ids = append(ids, toolCall.ID)
 		}
 	}
@@ -230,6 +273,9 @@ func (rsp *Response) GetToolResultIDs() []string {
 	for _, choice := range rsp.Choices {
 		if choice.Message.ToolID != "" {
 			ids = append(ids, choice.Message.ToolID)
+		}
+		if choice.Delta.ToolID != "" {
+			ids = append(ids, choice.Delta.ToolID)
 		}
 	}
 	return ids

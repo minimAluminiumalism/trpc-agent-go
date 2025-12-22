@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"sync"
 
+	"trpc.group/trpc-go/trpc-agent-go/internal/util"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 )
 
@@ -33,6 +34,8 @@ const (
 	// StateKeyMessages is the key of the messages.
 	// Typically it is used and updated by the LLM node.
 	StateKeyMessages = "messages"
+	// StateKeyLastResponseID stores the ID of the last model response.
+	StateKeyLastResponseID = "last_response_id"
 	// StateKeyMetadata is the key of the metadata.
 	StateKeyMetadata = "metadata"
 	// StateKeyExecContext is the key of the execution context.
@@ -53,13 +56,66 @@ const (
 // This is the shared data structure that flows between nodes.
 type State map[string]any
 
+// GetStateValue retrieves a typed value from the state.
+//
+// Returns the typed value and true if the key exists and the type matches,
+// or the zero value and false otherwise.
+//
+// Example:
+//
+//	if messages, ok := GetStateValue[[]model.Message](state, StateKeyMessages); ok {
+//	    // use messages
+//	}
+//	if userInput, ok := GetStateValue[string](state, StateKeyUserInput); ok {
+//	    // use userInput
+//	}
+func GetStateValue[T any](s State, key string) (T, bool) {
+	return util.GetMapValue[string, T](s, key)
+}
+
 // Clone creates a deep copy of the state.
 func (s State) Clone() State {
-	clone := make(State)
+	clone := make(State, len(s))
 	for k, v := range s {
 		clone[k] = v
 	}
 	return clone
+}
+
+func (s State) safeClone() State {
+	clone := make(State, len(s))
+	for k, v := range s {
+		if isUnsafeStateKey(k) {
+			continue
+		}
+		clone[k] = v
+	}
+	return clone
+}
+
+func (s State) deepCopy(retainUnsafeKey bool, fields map[string]StateField) State {
+	isDisableDeepCopyKey := func(key string) bool {
+		if field, ok := fields[key]; ok {
+			return field.DisableDeepCopy
+		}
+		return false
+	}
+
+	tmp := make(State, len(s))
+	for k, v := range s {
+		unsafeKey := isUnsafeStateKey(k)
+		if unsafeKey && !retainUnsafeKey {
+			continue
+		}
+
+		if unsafeKey || isDisableDeepCopyKey(k) {
+			tmp[k] = v
+			continue
+		}
+		tmp[k] = deepCopyAny(v)
+	}
+
+	return tmp
 }
 
 // StateReducer is a function that determines how state updates are merged.
@@ -124,6 +180,12 @@ func (s *StateSchema) ApplyUpdate(currentState State, update State) State {
 		if !hasCurrentValue && field.Default != nil {
 			currentValue = field.Default()
 		}
+
+		if field.DisableDeepCopy {
+			result[key] = field.Reducer(currentValue, updateValue)
+			continue
+		}
+
 		// Apply reducer with deep-copied update to prevent reference sharing.
 		safeUpdate := deepCopyAny(updateValue)
 		merged := field.Reducer(currentValue, safeUpdate)

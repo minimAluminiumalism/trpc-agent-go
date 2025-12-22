@@ -81,6 +81,8 @@ func run() error {
 
 	sessSvc := inmemory.NewSessionService()
 	r := runner.NewRunner("io-tools-app", ga, runner.WithSessionService(sessSvc))
+	// Ensure runner resources are cleaned up (trpc-agent-go >= v0.5.0)
+	defer r.Close()
 
 	user := "user"
 	session := fmt.Sprintf("sess-%d", time.Now().Unix())
@@ -269,10 +271,6 @@ func stream(ch <-chan *event.Event, verbose bool) error {
 		if e == nil {
 			continue
 		}
-		if e.Error != nil {
-			fmt.Printf("❌ %s\n", e.Error.Message)
-			continue
-		}
 		if verbose && e.StateDelta != nil {
 			if b, ok := e.StateDelta[graph.MetadataKeyModel]; ok && len(b) > 0 {
 				var md graph.ModelExecutionMetadata
@@ -296,6 +294,10 @@ func stream(ch <-chan *event.Event, verbose bool) error {
 					}
 				}
 			}
+		}
+		if e.Error != nil {
+			fmt.Printf("❌ %s\n", e.Error.Message)
+			continue
 		}
 		if len(e.Choices) > 0 {
 			c := e.Choices[0]

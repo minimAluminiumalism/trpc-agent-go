@@ -77,6 +77,9 @@ func (w *perNodeCallbacksWorkflow) run() error {
 		return fmt.Errorf("setup failed: %w", err)
 	}
 
+	// Ensure runner resources are cleaned up (trpc-agent-go >= v0.5.0)
+	defer w.runner.Close()
+
 	if *interactive {
 		return w.startInteractiveMode(ctx)
 	}
@@ -382,12 +385,6 @@ func (w *perNodeCallbacksWorkflow) processStreamingResponse(eventChan <-chan *ev
 	)
 
 	for event := range eventChan {
-		// Handle errors.
-		if event.Error != nil {
-			fmt.Printf("❌ Error: %s\n", event.Error.Message)
-			continue
-		}
-
 		// Track node execution events via metadata regardless of author.
 		if event.StateDelta != nil {
 			if nodeData, exists := event.StateDelta[graph.MetadataKeyNode]; exists {
@@ -403,6 +400,13 @@ func (w *perNodeCallbacksWorkflow) processStreamingResponse(eventChan <-chan *ev
 					}
 				}
 			}
+		}
+
+		// Handle errors after metadata so per-node error callbacks
+		// can be observed via metadata.
+		if event.Error != nil {
+			fmt.Printf("❌ Error: %s\n", event.Error.Message)
+			continue
 		}
 
 		// Process streaming content from LLM nodes.

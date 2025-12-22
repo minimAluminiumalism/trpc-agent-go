@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -29,6 +30,15 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/model/openai"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
+)
+
+const (
+	testSimpleSubAgentName   = "sub"
+	testSubAgentsMainName    = "main"
+	testSubAgentDescription  = "subdesc"
+	testSubAgentNameOne      = "sub1"
+	testSubAgentNameTwo      = "sub2"
+	testSubAgentNotFoundName = "notfound"
 )
 
 func newDummyModel() model.Model {
@@ -57,17 +67,80 @@ func (m *mockModelWithResponse) Info() model.Info {
 }
 
 func TestLLMAgent_SubAgents(t *testing.T) {
-	sub := New("sub", WithDescription("subdesc"))
-	agt := New("main", WithSubAgents([]agent.Agent{sub}))
+	sub := New(
+		testSimpleSubAgentName,
+		WithDescription(testSubAgentDescription),
+	)
+	agt := New(
+		testSubAgentsMainName,
+		WithSubAgents([]agent.Agent{sub}),
+	)
 	if len(agt.SubAgents()) != 1 {
 		t.Errorf("expected 1 subagent")
 	}
-	if agt.FindSubAgent("sub") == nil {
+	if agt.FindSubAgent(testSimpleSubAgentName) == nil {
 		t.Errorf("FindSubAgent failed")
 	}
-	if agt.FindSubAgent("notfound") != nil {
+	if agt.FindSubAgent(testSubAgentNotFoundName) != nil {
 		t.Errorf("FindSubAgent should return nil for missing")
 	}
+}
+
+// TestLLMAgent_SubAgentsEmpty verifies that SubAgents returns nil when
+// no sub-agents are configured.
+func TestLLMAgent_SubAgentsEmpty(t *testing.T) {
+	agt := New(testSubAgentsMainName)
+
+	subAgents := agt.SubAgents()
+	require.Nil(t, subAgents)
+}
+
+// TestLLMAgent_SetSubAgents verifies that SetSubAgents replaces the
+// sub-agent list and updates FindSubAgent results.
+func TestLLMAgent_SetSubAgents(t *testing.T) {
+	sub1 := &mockAgent{name: testSubAgentNameOne}
+	sub2 := &mockAgent{name: testSubAgentNameTwo}
+
+	agt := New(
+		testSubAgentsMainName,
+		WithSubAgents([]agent.Agent{sub1}),
+	)
+
+	require.Equal(t, 1, len(agt.SubAgents()))
+	require.NotNil(t, agt.FindSubAgent(testSubAgentNameOne))
+	require.Nil(t, agt.FindSubAgent(testSubAgentNameTwo))
+
+	agt.SetSubAgents([]agent.Agent{sub2})
+
+	subAgents := agt.SubAgents()
+	require.Equal(t, 1, len(subAgents))
+	require.Equal(t, testSubAgentNameTwo, subAgents[0].Info().Name)
+	require.Nil(t, agt.FindSubAgent(testSubAgentNameOne))
+	found := agt.FindSubAgent(testSubAgentNameTwo)
+	require.NotNil(t, found)
+	require.Equal(t, testSubAgentNameTwo, found.Info().Name)
+}
+
+// TestLLMAgent_SubAgentsReturnsCopy ensures that callers cannot mutate
+// the internal sub-agent slice through the returned value.
+func TestLLMAgent_SubAgentsReturnsCopy(t *testing.T) {
+	sub := &mockAgent{name: testSimpleSubAgentName}
+	agt := New(
+		testSubAgentsMainName,
+		WithSubAgents([]agent.Agent{sub}),
+	)
+
+	subAgents := agt.SubAgents()
+	require.Equal(t, 1, len(subAgents))
+	require.NotNil(t, subAgents[0])
+
+	// Mutate the returned slice.
+	subAgents[0] = nil
+
+	// Fetch again and ensure internal state is intact.
+	subAgents2 := agt.SubAgents()
+	require.Equal(t, 1, len(subAgents2))
+	require.NotNil(t, subAgents2[0])
 }
 
 // Test that buildRequestProcessors wires AddSessionSummary into
@@ -293,6 +366,88 @@ func TestLLMAgent_Run_AfterAgentCbErr(t *testing.T) {
 	}
 	if !foundErr {
 		t.Errorf("expected error event from after agent callback")
+	}
+}
+
+func TestLLMAgent_Run_AfterAgentReceivesResponseError(t *testing.T) {
+	// Test that AfterAgent callback receives error from response.Error field.
+	var receivedErr error
+	agentCallbacks := agent.NewCallbacks()
+	agentCallbacks.RegisterAfterAgent(func(ctx context.Context, inv *agent.Invocation, runErr error) (*model.Response, error) {
+		receivedErr = runErr
+		return nil, nil
+	})
+
+	// Mock model that returns error in response.Error (like Taiji rate limit).
+	mockModel := &mockModelWithResponse{
+		response: &model.Response{
+			Error: &model.ResponseError{
+				Type:    "rate_limit_exceeded",
+				Message: "Rate limit exceeded",
+			},
+			Done: true,
+		},
+	}
+
+	agt := New("test", WithModel(mockModel), WithAgentCallbacks(agentCallbacks))
+	inv := &agent.Invocation{Message: model.NewUserMessage("hi"), InvocationID: "test-invocation", Session: &session.Session{ID: "test-session"}}
+	events, err := agt.Run(context.Background(), inv)
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	// Consume all events.
+	for range events {
+	}
+
+	// Verify callback received the error.
+	if receivedErr == nil {
+		t.Errorf("expected AfterAgent callback to receive error")
+	}
+	if !strings.Contains(receivedErr.Error(), "rate_limit_exceeded") {
+		t.Errorf("expected error to contain 'rate_limit_exceeded', got: %v", receivedErr)
+	}
+	if !strings.Contains(receivedErr.Error(), "Rate limit exceeded") {
+		t.Errorf("expected error to contain 'Rate limit exceeded', got: %v", receivedErr)
+	}
+}
+
+func TestLLMAgent_Run_AfterAgentNoErrorOnSuccess(t *testing.T) {
+	// Test that AfterAgent callback receives nil error when response is successful.
+	var receivedErr error
+	agentCallbacks := agent.NewCallbacks()
+	agentCallbacks.RegisterAfterAgent(func(ctx context.Context, inv *agent.Invocation, runErr error) (*model.Response, error) {
+		receivedErr = runErr
+		return nil, nil
+	})
+
+	// Mock model that returns successful response.
+	mockModel := &mockModelWithResponse{
+		response: &model.Response{
+			Choices: []model.Choice{{
+				Message: model.Message{
+					Role:    model.RoleAssistant,
+					Content: "Success",
+				},
+			}},
+			Done: true,
+		},
+	}
+
+	agt := New("test", WithModel(mockModel), WithAgentCallbacks(agentCallbacks))
+	inv := &agent.Invocation{Message: model.NewUserMessage("hi"), InvocationID: "test-invocation", Session: &session.Session{ID: "test-session"}}
+	events, err := agt.Run(context.Background(), inv)
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	// Consume all events.
+	for range events {
+	}
+
+	// Verify callback received nil error.
+	if receivedErr != nil {
+		t.Errorf("expected AfterAgent callback to receive nil error, got: %v", receivedErr)
 	}
 }
 
@@ -812,6 +967,55 @@ func (m *mockCodeExecutor) CodeBlockDelimiter() codeexecutor.CodeBlockDelimiter 
 	}
 }
 
+func (m *mockCodeExecutor) CreateWorkspace(
+	ctx context.Context, id string,
+	pol codeexecutor.WorkspacePolicy,
+) (codeexecutor.Workspace, error) {
+	return codeexecutor.Workspace{ID: id, Path: "/tmp/mock"}, nil
+}
+
+func (m *mockCodeExecutor) Cleanup(
+	ctx context.Context, ws codeexecutor.Workspace,
+) error {
+	return nil
+}
+
+func (m *mockCodeExecutor) PutFiles(
+	ctx context.Context, ws codeexecutor.Workspace,
+	files []codeexecutor.PutFile,
+) error {
+	return nil
+}
+
+func (m *mockCodeExecutor) PutDirectory(
+	ctx context.Context, ws codeexecutor.Workspace,
+	hostPath, to string,
+) error {
+	return nil
+}
+
+func (m *mockCodeExecutor) RunProgram(
+	ctx context.Context, ws codeexecutor.Workspace,
+	spec codeexecutor.RunProgramSpec,
+) (codeexecutor.RunResult, error) {
+	return codeexecutor.RunResult{}, nil
+}
+
+func (m *mockCodeExecutor) Collect(
+	ctx context.Context, ws codeexecutor.Workspace,
+	patterns []string,
+) ([]codeexecutor.File, error) {
+	return nil, nil
+}
+
+func (m *mockCodeExecutor) ExecuteInline(
+	ctx context.Context, id string,
+	blocks []codeexecutor.CodeBlock,
+	timeout time.Duration,
+) (codeexecutor.RunResult, error) {
+	return codeexecutor.RunResult{}, nil
+}
+
 // TestWithModels tests the WithModels option.
 func TestWithModels(t *testing.T) {
 	model1 := newDummyModel()
@@ -1275,6 +1479,47 @@ func TestLLMAgent_RunWithModel_Priority(t *testing.T) {
 
 	llmAgent.setupInvocation(inv)
 	require.Equal(t, modelFromWithModel, inv.Model)
+}
+
+// TestLLMAgent_SetupInvocation_PropagatesMaxLimits verifies that per-agent
+// safety limits (MaxLLMCalls / MaxToolIterations) are copied into each
+// Invocation during setupInvocation. When the agent is created without limits,
+// the invocation should see zero values, which are treated as "no limit" by
+// the Invocation helpers.
+func TestLLMAgent_SetupInvocation_PropagatesMaxLimits(t *testing.T) {
+	// Agent configured with explicit limits.
+	llmWithLimits := New(
+		"limits-agent",
+		WithModel(newDummyModel()),
+		WithMaxLLMCalls(3),
+		WithMaxToolIterations(5),
+	)
+
+	invWithLimits := &agent.Invocation{
+		InvocationID: "inv-with-limits",
+		AgentName:    "limits-agent",
+		Message:      model.NewUserMessage("hello"),
+	}
+
+	llmWithLimits.setupInvocation(invWithLimits)
+	require.Equal(t, 3, invWithLimits.MaxLLMCalls)
+	require.Equal(t, 5, invWithLimits.MaxToolIterations)
+
+	// Agent without limits should leave invocation limits at zero.
+	llmNoLimits := New(
+		"no-limits-agent",
+		WithModel(newDummyModel()),
+	)
+
+	invNoLimits := &agent.Invocation{
+		InvocationID: "inv-no-limits",
+		AgentName:    "no-limits-agent",
+		Message:      model.NewUserMessage("hello"),
+	}
+
+	llmNoLimits.setupInvocation(invNoLimits)
+	require.Equal(t, 0, invNoLimits.MaxLLMCalls)
+	require.Equal(t, 0, invNoLimits.MaxToolIterations)
 }
 
 func TestLLMAgent_MessageFilterMode(t *testing.T) {

@@ -3,16 +3,19 @@
 ## 概述
 
 Graph 将可控的工作流编排与可扩展的 Agent 能力结合，适用于：
+
 - 类型安全的状态管理与可预测路由；
 - LLM 决策、工具调用循环、可选的 Human in the Loop（HITL）；
 - 可复用的组件，既可独立运行，也可作为子 Agent 组合。
 
 特点：
+
 - Schema 驱动的 State 与 Reducer，避免并发分支写入同一字段时的数据竞争；
 - BSP 风格（计划/执行/合并）的确定性并行；
 - 内置节点类型封装 LLM、工具与 Agent，减少重复代码；
 - 流式事件、检查点与中断，便于观测与恢复。
 - 节点级重试/退避（指数退避与抖动），支持执行器默认重试策略与带重试元数据的事件观测。
+- 节点主动外抛事件（EventEmitter），支持在 NodeFunc 中发射自定义事件、进度更新和流式文本。
 
 ## 快速开始
 
@@ -131,7 +134,7 @@ node := &graph.Node{
 
 ```go
 import (
-	"trpc.group/trpc-go/trpc-agent-go/graph"
+    "trpc.group/trpc-go/trpc-agent-go/graph"
 )
 
 // 状态是一个键值对映射
@@ -139,10 +142,10 @@ type State map[string]any
 
 // 用户自定义的状态键
 const (
-	StateKeyInput         = "input"          // 输入数据
-	StateKeyResult        = "result"         // 处理结果
-	StateKeyProcessedData = "processed_data" // 处理后的数据
-	StateKeyStatus        = "status"         // 处理状态
+    StateKeyInput         = "input"          // 输入数据
+    StateKeyResult        = "result"         // 处理结果
+    StateKeyProcessedData = "processed_data" // 处理后的数据
+    StateKeyStatus        = "status"         // 处理状态
 )
 ```
 
@@ -200,6 +203,7 @@ schema.AddField("counter", graph.StateField{
 节点之间仅通过共享状态 State 传递数据。每个节点返回一个 state delta，按 Schema 的 Reducer 合并到全局 State，下游节点从 State 读取上游产出。
 
 - 常用内置键（对用户可见）
+
   - `user_input`：一次性用户输入，被下一个 LLM/Agent 节点消费后清空
   - `one_shot_messages`：一次性完整消息覆盖，用于下一次 LLM 调用，执行后清空
   - `messages`：持久化的消息历史（LLM/Tools 会追加），支持 MessageOp 补丁
@@ -207,10 +211,12 @@ schema.AddField("counter", graph.StateField{
   - `node_responses`：map[nodeID]any，按节点保存最终文本回复。最近结果用 `last_response`
 
 - 函数节点（Function node）
+
   - 输入：完整 State
   - 输出：返回 `graph.State` 增量，写入自定义键（需在 Schema 中声明），如 `{"parsed_time":"..."}`
 
 - LLM 节点
+
   - 输入优先级：`one_shot_messages` → `user_input` → `messages`
   - 输出：
     - 向 `messages` 追加助手消息
@@ -218,6 +224,7 @@ schema.AddField("counter", graph.StateField{
     - 设置 `node_responses[<llm_node_id>]`
 
 - Tools 节点
+
   - 输入：从 `messages` 中寻找最新的带 `tool_calls` 的助手消息
   - 输出：向 `messages` 追加工具返回消息
 
@@ -247,6 +254,7 @@ schema.AddField("counter", graph.StateField{
 - 常量定义位置：`graph/state.go`
 
 - 用户可见、常用键
+
   - `user_input` → 常量 `graph.StateKeyUserInput`
   - `one_shot_messages` → 常量 `graph.StateKeyOneShotMessages`
   - `messages` → 常量 `graph.StateKeyMessages`
@@ -297,6 +305,130 @@ if b, ok := event.StateDelta[graph.MetadataKeyModel]; ok {
 }
 ```
 
+#### 节点主动外抛事件（EventEmitter）
+
+在 NodeFunc 执行过程中，节点可以通过 `EventEmitter` 主动向外部发射自定义事件，用于实时传递进度、中间结果或自定义业务数据。
+
+**获取 EventEmitter**
+
+```go
+func myNode(ctx context.Context, state graph.State) (any, error) {
+    // 从 State 中获取 EventEmitter
+    emitter := graph.GetEventEmitterWithContext(ctx, state)
+    // 或直接调用 emitter := graph.GetEventEmitter(state)
+    return state, nil
+}
+```
+
+**EventEmitter 接口**
+
+```go
+type EventEmitter interface {
+    // Emit 发射任意事件
+    Emit(evt *event.Event) error
+    // EmitCustom 发射自定义事件
+    EmitCustom(eventType string, payload any) error
+    // EmitProgress 发射进度事件（progress: 0-100）
+    EmitProgress(progress float64, message string) error
+    // EmitText 发射流式文本事件
+    EmitText(text string) error
+    // Context 返回关联的 context
+    Context() context.Context
+}
+```
+
+**使用示例**
+
+```go
+func dataProcessNode(ctx context.Context, state graph.State) (any, error) {
+    emitter := graph.GetEventEmitter(state)
+    
+    // 1. 发射自定义事件
+    emitter.EmitCustom("data.loaded", map[string]any{
+        "recordCount": 1000,
+        "source":      "database",
+    })
+    
+    // 2. 发射进度事件
+    total := 100
+    for i := 0; i < total; i++ {
+        processItem(i)
+        progress := float64(i+1) / float64(total) * 100
+        emitter.EmitProgress(progress, fmt.Sprintf("Processing %d/%d", i+1, total))
+    }
+    
+    // 3. 发射流式文本
+    emitter.EmitText("Processing complete.\n")
+    emitter.EmitText("Results: 100 items processed successfully.")
+    
+    return state, nil
+}
+```
+
+**事件流转流程**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant NF as NodeFunc
+    participant EE as EventEmitter
+    participant EC as EventChan
+    participant EX as Executor
+    participant TR as AGUI Translator
+    participant FE as 客户端
+
+    Note over NF,FE: 事件发射阶段
+    NF->>EE: GetEventEmitter(state)
+    EE-->>NF: 返回 EventEmitter 实例
+    
+    alt 发射自定义事件
+        NF->>EE: EmitCustom(eventType, payload)
+    else 发射进度事件
+        NF->>EE: EmitProgress(progress, message)
+    else 发射文本事件
+        NF->>EE: EmitText(text)
+    end
+    
+    Note over EE: 构建 NodeCustomEventMetadata
+    EE->>EE: 注入 NodeID, InvocationID, Timestamp
+    EE->>EC: 发送 Event 到 Chan
+    
+    Note over EC,FE: 事件消费阶段
+    EC->>EX: Executor 接收事件
+    EX->>TR: 传递事件给 Translator
+    
+    alt Custom 类型事件
+        TR->>TR: 转换为 AG-UI CustomEvent
+    else Progress 类型事件
+        TR->>TR: 转换为 AG-UI CustomEvent (含进度信息)
+    else Text 类型事件 (消息上下文)
+        TR->>TR: 转换为 TextMessageContentEvent
+    else Text 类型事件 (非消息上下)
+        TR->>TR: 转换为 AG-UI CustomEvent
+    end
+    
+    TR->>FE: SSE 推送 AG-UI 事件
+    FE->>FE: 处理并更新 UI
+```
+
+**AGUI 事件转换**
+
+当使用 AGUI Server 时，节点发射的事件会自动转换为 AG-UI 协议事件：
+
+| 节点事件类型 | AG-UI 事件类型 | 说明 |
+|-------------|--------------|------|
+| Custom | CustomEvent | 自定义事件，payload 在 `value` 字段 |
+| Progress | CustomEvent | 进度事件，包含 `progress` 和 `message` |
+| Text（消息上下文中）| TextMessageContentEvent | 流式文本追加到当前消息 |
+| Text（非消息上下文）| CustomEvent | 包含 `nodeId` 和 `content` 字段 |
+
+**注意事项**
+
+- **线程安全**：EventEmitter 是线程安全的，可在并发环境中使用
+- **优雅降级**：若 State 中无有效的 ExecutionContext 或 EventChan，`GetEventEmitter` 返回 no-op emitter，所有操作静默成功
+- **错误处理**：业务实践中建议事件发射失败不要中断节点执行，仅记录警告日志，忽略异常
+- **自定义事件元数据**：`_node_custom_metadata` → `graph.MetadataKeyNodeCustom`（结构体 `graph.NodeCustomEventMetadata`）
+
 ### 1. 创建 GraphAgent 和 Runner
 
 用户主要通过创建 GraphAgent 然后通过 Runner 来使用 Graph 包。这是推荐的使用模式：
@@ -310,7 +442,6 @@ import (
     "time"
 
     "trpc.group/trpc-go/trpc-agent-go/agent/graphagent"
-    "trpc.group/trpc-go/trpc-agent-go/event"
     "trpc.group/trpc-go/trpc-agent-go/graph"
     "trpc.group/trpc-go/trpc-agent-go/model"
     "trpc.group/trpc-go/trpc-agent-go/runner"
@@ -347,22 +478,21 @@ func main() {
     graphAgent, err := graphagent.New("simple-workflow", compiledGraph,
         graphagent.WithDescription("简单的工作流示例"),
         graphagent.WithInitialState(graph.State{}),
-        graphagent.WithSubAgents([]agent.Agent{subAgent}), // 配置子 Agent
         // 设置传给模型的消息过滤模式，最终传给模型的消息需同时满足WithMessageTimelineFilterMode与WithMessageBranchFilterMode条件
         // 时间维度过滤条件
         // 默认值: graphagent.TimelineFilterAll
-        // 可选值: 
+        // 可选值:
         //  - graphagent.TimelineFilterAll: 包含历史消息以及当前请求中所生成的消息
         //  - graphagent.TimelineFilterCurrentRequest: 仅包含当前请求中所生成的消息
         //  - graphagent.TimelineFilterCurrentInvocation: 仅包含当前invocation上下文中生成的消息
-        graphagent.WithMessageTimelineFilterMode(llmagent.BranchFilterModeAll),
+        graphagent.WithMessageTimelineFilterMode(graphagent.TimelineFilterAll),
         // 分支维度过滤条件
         // 默认值: graphagent.BranchFilterModePrefix
-        // 可选值: 
+        // 可选值:
         //  - graphagent.BranchFilterModeAll: 包含所有agent的消息, 当前agent与模型交互时,如需将所有agent生成的有效内容消息同步给模型时可设置该值
         //  - graphagent.BranchFilterModePrefix: 通过Event.FilterKey与Invocation.eventFilterKey做前缀匹配过滤消息, 期望将与当前agent以及相关上下游agent生成的消息传递给模型时，可设置该值
         //  - graphagent.BranchFilterModeExact: 通过Event.FilterKey==Invocation.eventFilterKey过滤消息，当前agent与模型交互时,仅需使用当前agent生成的消息时可设置该值
-        graphagent.WithMessageBranchFilterMode(llmagent.TimelineFilterAll),
+        graphagent.WithMessageBranchFilterMode(graphagent.BranchFilterModeAll),
     )
     if err != nil {
         panic(err)
@@ -413,24 +543,30 @@ func main() {
     }
 }
 
-// 节点函数实现
+const (
+    stateKeyProcessedData = "processed_data"
+    stateKeyResult        = "result"
+)
+
+// 起始节点函数实现
 func startNodeFunc(ctx context.Context, state graph.State) (any, error) {
     // 从内置的 StateKeyUserInput 获取用户输入（由 Runner 自动设置）
     input := state[graph.StateKeyUserInput].(string)
     return graph.State{
-        StateKeyProcessedData: fmt.Sprintf("处理后的: %s", input),
+        stateKeyProcessedData: fmt.Sprintf("处理后的: %s", input),
     }, nil
 }
 
+// 处理节点函数实现
 func processNodeFunc(ctx context.Context, state graph.State) (any, error) {
-    processed := state[StateKeyProcessedData].(string)
+    processed := state[stateKeyProcessedData].(string)
     result := fmt.Sprintf("结果: %s", processed)
     return graph.State{
-        StateKeyResult: result,
-        // 使用内置的 StateKeyLastResponse 来设置最终输出
+        stateKeyResult:             result,
         graph.StateKeyLastResponse: fmt.Sprintf("最终结果: %s", result),
     }, nil
 }
+
 ```
 
 ### 2. 使用 LLM 节点
@@ -575,6 +711,39 @@ stateGraph.
     SetFinishPoint("ask")
 ```
 
+#### 使用 RemoveAllMessages 清除消息历史
+
+当多个 LLM 节点串联时，`MessageReducer` 会累积消息。如果每个 LLM 节点
+需要独立的消息上下文（不继承前序节点的对话历史），可以使用
+`RemoveAllMessages` 操作清除之前的消息：
+
+```go
+// 在准备 prompt 的节点中，先清除消息再设置新的 UserInput.
+func preparePromptNode(ctx context.Context, state graph.State) (any, error) {
+    userMessage := buildUserMessage(...)
+    return graph.State{
+        // 关键：先清除之前的消息，避免累积.
+        graph.StateKeyMessages:  graph.RemoveAllMessages{},
+        graph.StateKeyUserInput: userMessage,
+    }, nil
+}
+```
+
+**适用场景**：
+
+- 同一个 Graph 内有多个独立的 LLM 节点，每个节点不需要前序节点的对话历史
+- 循环结构中，每次迭代需要全新的消息上下文
+- 需要完全重建消息列表的场景
+
+**注意**：
+
+- `RemoveAllMessages{}` 是一个特殊的 `MessageOp`，`MessageReducer` 会
+  识别它并清空消息列表
+- 必须在设置 `StateKeyUserInput` **之前**先设置 `RemoveAllMessages{}`
+- `WithSubgraphIsolatedMessages(true)` 只对 `AddSubgraphNode` 有效，
+  对 `AddLLMNode` 无效；如需在 LLM 节点间隔离消息，请使用
+  `RemoveAllMessages`
+
 ### 3. GraphAgent 配置选项
 
 GraphAgent 支持多种配置选项：
@@ -582,38 +751,85 @@ GraphAgent 支持多种配置选项：
 ```go
 // 创建 GraphAgent 时可以使用多种选项
 graphAgent, err := graphagent.New(
-    "workflow-name",
-    compiledGraph,
-    graphagent.WithDescription("工作流描述"),
-    graphagent.WithInitialState(graph.State{
-        "initial_data": "初始数据",
-    }),
-    graphagent.WithChannelBufferSize(1024),           // 调整事件通道缓冲区
-    graphagent.WithCheckpointSaver(memorySaver),      // 使用持久化检查点
-    graphagent.WithSubAgents([]agent.Agent{subAgent}), // 配置子 Agent
-    // 设置传给模型的消息过滤模式，最终传给模型的消息需同时满足WithMessageTimelineFilterMode与WithMessageBranchFilterMode条件
-    // 时间维度过滤条件
-    // 默认值: graphagent.TimelineFilterAll
-    // 可选值: 
-    //  - graphagent.TimelineFilterAll: 包含历史消息以及当前请求中所生成的消息
-    //  - graphagent.TimelineFilterCurrentRequest: 仅包含当前请求中所生成的消息
-    //  - graphagent.TimelineFilterCurrentInvocation: 仅包含当前invocation上下文中生成的消息
-    graphagent.WithMessageTimelineFilterMode(llmagent.BranchFilterModeAll),
-    // 分支维度过滤条件
-    // 默认值: graphagent.BranchFilterModePrefix
-    // 可选值: 
-    //  - graphagent.BranchFilterModeAll: 包含所有agent的消息, 当前agent与模型交互时,如需将所有agent生成的有效内容消息同步给模型时可设置该值
-    //  - graphagent.BranchFilterModePrefix: 通过Event.FilterKey与Invocation.eventFilterKey做前缀匹配过滤消息, 期望将与当前agent以及相关上下游agent生成的消息传递给模型时，可设置该值
-    //  - graphagent.BranchFilterModeExact: 通过Event.FilterKey==Invocation.eventFilterKey过滤消息，当前agent与模型交互时,仅需使用当前agent生成的消息时可设置该值
-    graphagent.WithMessageBranchFilterMode(llmagent.TimelineFilterAll),
-    graphagent.WithAgentCallbacks(&agent.Callbacks{
-        // Agent 级回调配置
-    }),
+	"workflow-name",
+	compiledGraph,
+	graphagent.WithDescription("工作流描述"),
+	graphagent.WithInitialState(graph.State{
+		"initial_data": "初始数据",
+	}),
+	graphagent.WithChannelBufferSize(1024),            // 调整事件通道缓冲区
+	graphagent.WithCheckpointSaver(memorySaver),       // 使用持久化检查点
+	graphagent.WithSubAgents([]agent.Agent{subAgent}), // 配置子 Agent
+	graphagent.WithAddSessionSummary(true),            // 将会话摘要注入 system 消息
+	graphagent.WithMaxHistoryRuns(5),                  // 未开启摘要时截断历史轮次
+	// 设置传给模型的消息过滤模式，最终传给模型的消息需同时满足WithMessageTimelineFilterMode与WithMessageBranchFilterMode条件
+	// 时间维度过滤条件
+	// 默认值: graphagent.TimelineFilterAll
+	// 可选值:
+	//  - graphagent.TimelineFilterAll: 包含历史消息以及当前请求中所生成的消息
+	//  - graphagent.TimelineFilterCurrentRequest: 仅包含当前请求中所生成的消息
+	//  - graphagent.TimelineFilterCurrentInvocation: 仅包含当前invocation上下文中生成的消息
+	graphagent.WithMessageTimelineFilterMode(graphagent.BranchFilterModeAll),
+	// 分支维度过滤条件
+	// 默认值: graphagent.BranchFilterModePrefix
+	// 可选值:
+	//  - graphagent.BranchFilterModeAll: 包含所有agent的消息, 当前agent与模型交互时,如需将所有agent生成的有效内容消息同步给模型时可设置该值
+	//  - graphagent.BranchFilterModePrefix: 通过Event.FilterKey与Invocation.eventFilterKey做前缀匹配过滤消息, 期望将与当前agent以及相关上下游agent生成的消息传递给模型时，可设置该值
+	//  - graphagent.BranchFilterModeExact: 通过Event.FilterKey==Invocation.eventFilterKey过滤消息，当前agent与模型交互时,仅需使用当前agent生成的消息时可设置该值
+	graphagent.WithMessageBranchFilterMode(graphagent.TimelineFilterAll),
+	// 推理内容模式（DeepSeek 思考模式）
+	// 默认值: graphagent.ReasoningContentModeDiscardPreviousTurns
+	// 可选值:
+	//  - graphagent.ReasoningContentModeDiscardPreviousTurns: 丢弃之前请求轮次的
+	//    reasoning_content（默认，推荐）
+	//  - graphagent.ReasoningContentModeKeepAll: 保留所有 reasoning_content
+	//  - graphagent.ReasoningContentModeDiscardAll: 丢弃所有 reasoning_content
+	graphagent.WithReasoningContentMode(graphagent.ReasoningContentModeDiscardPreviousTurns),
+	graphagent.WithAgentCallbacks(&agent.Callbacks{
+		// Agent 级回调配置
+	}),
 )
 ```
 
 > 模型/工具回调需要在节点级配置，例如 `AddLLMNode(..., graph.WithModelCallbacks(...))`
 > 或 `AddToolsNode(..., graph.WithToolCallbacks(...))`。
+
+使用会话摘要的注意事项：
+
+- `WithAddSessionSummary(true)` 仅在 `Session.Summaries` 中已有对应 `FilterKey` 的摘要时生效。摘要通常由 SessionService + SessionSummarizer 生成，Runner 在落库事件后会自动触发 `EnqueueSummaryJob`。
+- GraphAgent 只读取摘要，不生成摘要。如果绕过 Runner，需在写入事件后自行调用 `sessionService.CreateSessionSummary` 或 `EnqueueSummaryJob`。
+- 摘要仅在 `TimelineFilterAll` 下生效。
+
+#### 并发使用注意事项
+
+在服务端将 Graph + GraphAgent 部署为长期运行、可并发复用的组件时（例如单个进程内同时处理多路请求），需要注意以下几点：
+
+- 自定义 CheckpointSaver / Cache 必须具备并发安全能力  
+  `CheckpointSaver` 与 `Cache` 接口本身是存储无关、线程无状态的抽象，同一个 `Executor` / `GraphAgent` 实例在并发执行多次时，会从多个 goroutine 调用它们的方法。如果你提供自定义实现，需要确保：
+  - `CheckpointSaver` 的 `Get` / `GetTuple` / `List` / `Put` / `PutWrites` / `PutFull` / `DeleteLineage` 等方法在并发场景下是安全的；
+  - `Cache` 的 `Get` / `Set` / `Clear` 等方法在并发场景下是安全的；
+  - 内部使用的 map、连接池、内存缓冲区等都经过适当加锁或使用其它并发原语保护。
+
+- NodeFunc / 工具 / 回调应把传入状态视为“本次调用本节点的局部数据”  
+  每个节点在执行时会拿到一份针对当前任务的状态副本，这份副本在当前 goroutine 内修改是安全的，但是不建议：
+  - 将该副本（或其中的 map / slice）保存到全局变量，再由其它 goroutine 后续修改；
+  - 从状态中取出 `StateKeyExecContext`（`*graph.ExecutionContext`）后，绕过内部锁直接读写 `execCtx.State` 或 `execCtx.pendingTasks` 等字段。
+  如果确实需要跨节点或跨调用共享可变数据，请使用你自己的同步手段（例如 `sync.Mutex` / `sync.RWMutex`），或者使用外部服务（数据库、缓存等）承载共享状态。
+
+- 不要在多个 goroutine 中复用同一个 *agent.Invocation  
+  框架设计假定每次调用 `Run`（无论是 GraphAgent、Runner 还是其它 Agent 实现）都使用独立的 `*agent.Invocation` 实例。如果在多个 goroutine 中复用同一个 `*agent.Invocation` 并并行调用 `Run`，会在 `Branch`、`RunOptions`、回调状态等字段上产生数据竞争。推荐的做法是：
+  - 每个请求构造一份新的 `*agent.Invocation`，或者
+  - 在需要保持关联时使用 `invocation.Clone(...)` 从父调用上克隆一份新的 Invocation。
+
+- 并行工具调用要求具体工具实现本身支持并发  
+  当某个 Tools 节点使用 `WithEnableParallelTools(true)` 配置为“并行工具执行”时，在同一轮 step 内该节点会为每个工具调用起一个 goroutine 并行执行：
+  - 框架保证 `tools` 映射在执行期间只读访问；
+  - 框架也保证传入工具的图状态在工具内部只读使用，状态更新由节点返回的 `State` 合并完成。
+  但每个具体的 `tool.Tool` 实现以及对应的 `tool.Callbacks` 可能会被多个 goroutine 同时调用，因此需要确保：
+  - 工具实现不会在没有加锁的情况下修改共享的全局变量或共享数据结构；
+  - 工具内部使用的缓存、HTTP 客户端、连接池等组件本身支持并发访问。
+
+这些约束在单进程多请求的高并发场景下尤为重要，可以帮助你安全地复用同一个 `Graph` / `Executor` / `GraphAgent` 实例。
 
 配置了子 Agent 后，可以在图中使用 Agent 节点委托执行：
 
@@ -654,6 +870,7 @@ stateGraph.AddConditionalEdges("analyze", complexityCondition, map[string]string
 当一个节点需要把“业务结论”（例如 `approve`/`reject`/`manual_review`）路由到具体的下游节点时，建议在该节点上声明命名分支（Ends）。
 
 作用与优势：
+
 - 在节点本地集中声明“符号名 → 具体目标”的映射，更直观、更易重构；
 - 编译期校验：`Compile()` 会检查映射中的目标是否存在（或为常量 `graph.End`）；
 - 路由统一：命令式路由（`Command.GoTo`）与条件路由都可复用同一份映射；
@@ -694,15 +911,18 @@ func decideNode(ctx context.Context, s graph.State) (any, error) {
 条件路由复用 Ends：当 `AddConditionalEdges(from, condition, pathMap)` 的 `pathMap` 为 `nil` 或未匹配到键时，执行器会继续使用该节点的 Ends 解析返回值；若仍未匹配，则把返回值当作具体节点 ID。
 
 解析优先级：
+
 1. 条件边 `pathMap` 的显式映射；
 2. 当前节点的 Ends 映射（符号名 → 具体目标）；
 3. 直接把返回值当作节点 ID。
 
 编译期校验：
+
 - `WithEndsMap/WithEnds` 中声明的目标会在 `Compile()` 阶段校验；
 - 目标必须存在于图中或为特殊常量 `graph.End`。
 
 注意：
+
 - 请使用常量 `graph.End` 表示“终点”，不要使用字符串 "END"；
 - 当通过 `Command.GoTo` 进行路由时，无需额外添加 `AddEdge(from, to)`；只需保证目标节点存在，若为终点需设置 `SetFinishPoint(target)`。
 
@@ -729,9 +949,10 @@ sg.AddMultiConditionalEdges(
 ```
 
 说明：
+
 - 返回结果会先去重，同一分支键在同一步内只触发一次；
 - 每个分支键的解析优先级与单条件路由一致：
-  1) 条件边 `pathMap`；2) 节点 Ends；3) 直接当作节点 ID；
+  1. 条件边 `pathMap`；2) 节点 Ends；3) 直接当作节点 ID；
 - 可视化：当未提供 `pathMap` 时，DOT 会回退使用该节点的 Ends 来渲染虚线
   条件边（仅用于可视化，方便理解流程）。
 
@@ -806,6 +1027,7 @@ exec, _ := graph.NewExecutor(compiled,
 ```
 
 注意事项
+
 - 中断（interrupt）不参与重试。
 - 当设置了步骤超时（`WithStepTimeout`）时，退避时间会被当前步骤的截止时间钳制。
 - 事件会携带重试元数据，便于 CLI/UI 展示进度：
@@ -949,7 +1171,6 @@ b.AddNode("approval_node", func(ctx context.Context, s graph.State) (any, error)
     }
 })
 ```
- 
 
 用代码把这个图变成可运行的工作流：
 
@@ -1085,6 +1306,7 @@ for ev := range events { /* 处理事件 */ }
 ```
 
 Runner 会话后端可选项：
+
 - 内存：`session/inmemory`（默认示例使用）
 - Redis：`session/redis`（生产更常用）
 
@@ -1107,24 +1329,23 @@ ga, err := graphagent.New(
     graphagent.WithInitialState(graph.State{"init": 1}),
     graphagent.WithChannelBufferSize(512),
     graphagent.WithCheckpointSaver(saver),
-    graphagent.WithSubAgents([]agent.Agent{subAgent}),
-    graphagent.WithAgentCallbacks(agent.NewCallbacks()),
     graphagent.WithSubAgents([]agent.Agent{subAgent}), // 配置子 Agent
+    graphagent.WithAgentCallbacks(agent.NewCallbacks()), // 注意：结构化回调 API 需要 trpc-agent-go >= 0.6.0
     // 设置传给模型的消息过滤模式，最终传给模型的消息需同时满足WithMessageTimelineFilterMode与WithMessageBranchFilterMode条件
     // 时间维度过滤条件
     // 默认值: graphagent.TimelineFilterAll
-    // 可选值: 
+    // 可选值:
     //  - graphagent.TimelineFilterAll: 包含历史消息以及当前请求中所生成的消息
     //  - graphagent.TimelineFilterCurrentRequest: 仅包含当前请求中所生成的消息
     //  - graphagent.TimelineFilterCurrentInvocation: 仅包含当前invocation上下文中生成的消息
-    graphagent.WithMessageTimelineFilterMode(llmagent.BranchFilterModeAll),
+    graphagent.WithMessageTimelineFilterMode(graphagent.BranchFilterModeAll),
     // 分支维度过滤条件
     // 默认值: graphagent.BranchFilterModePrefix
-    // 可选值: 
+    // 可选值:
     //  - graphagent.BranchFilterModeAll: 包含所有agent的消息, 当前agent与模型交互时,如需将所有agent生成的有效内容消息同步给模型时可设置该值
     //  - graphagent.BranchFilterModePrefix: 通过Event.FilterKey与Invocation.eventFilterKey做前缀匹配过滤消息, 期望将与当前agent以及相关上下游agent生成的消息传递给模型时，可设置该值
     //  - graphagent.BranchFilterModeExact: 通过Event.FilterKey==Invocation.eventFilterKey过滤消息，当前agent与模型交互时,仅需使用当前agent生成的消息时可设置该值
-    graphagent.WithMessageBranchFilterMode(llmagent.TimelineFilterAll),
+    graphagent.WithMessageBranchFilterMode(graphagent.TimelineFilterAll),
 )
 ```
 
@@ -1192,6 +1413,7 @@ Reducer 机制确保状态字段按预定义规则安全合并，这在并发执
 GraphAgent 提供了四种内置节点类型：
 
 #### Function 节点
+
 最基础的节点，执行自定义逻辑：
 
 ```go
@@ -1216,6 +1438,7 @@ sg.AddNode(nodeProcess, func(ctx context.Context, state graph.State) (any, error
 ```
 
 #### LLM 节点
+
 集成语言模型，自动管理对话历史：
 
 ```go
@@ -1249,6 +1472,7 @@ sg.AddLLMNode(llmNodeAssistant, model, llmSystemPrompt, tools)
 - 清理：`ClearCache(nodes ...string)` 按节点清理缓存命名空间
 
 参考：
+
 - Graph 接口（缓存与策略的访问/设置）：[graph/graph.go](https://github.com/trpc-group/trpc-agent-go/blob/main/graph/graph.go)
 - 默认策略与内存后端实现：
   - 接口/策略与默认键函数（规范化 JSON + SHA‑256）：[graph/cache.go](https://github.com/trpc-group/trpc-agent-go/blob/main/graph/cache.go)
@@ -1276,6 +1500,7 @@ compiled, _ := sg.Compile()
 ```
 
 进阶用法：
+
 - 仅使用部分字段作为键（推荐）
 
 ```go
@@ -1409,7 +1634,7 @@ func clear(sg *graph.StateGraph) {
 }
 ```
 
-- 读取缓存命中标记（_cache_hit）
+- 读取缓存命中标记（\_cache_hit）
 
 ```go
 package main
@@ -1441,7 +1666,8 @@ func runAndReadHits(executor *graph.Executor, initial graph.State) error {
 ```
 
 注意事项：
-- 仅对“纯函数（相同输入→相同输出，无外部副作用）”节点开启缓存，避免语义错误。
+
+- 仅对“纯函数（相同输入 → 相同输出，无外部副作用）”节点开启缓存，避免语义错误。
 - TTL（Time To Live）为 0 表示不过期，需防止内存增长；生产建议使用持久化后端（如 Redis/SQLite）与定期清理。
 - 键函数会“净化输入”后再规范化序列化，避免把会话、执行上下文等“易变/不可序列化”值纳入键，提升命中率、避免错误（见 [graph/cache_key.go](https://github.com/trpc-group/trpc-agent-go/blob/main/graph/cache_key.go)）。
 - 代码更新后可调用 `ClearCache("nodeID")` 清理旧缓存，或在键/命名空间中引入“函数标识符/版本”维度。
@@ -1520,9 +1746,11 @@ func atoi(s string) int { var n int; fmt.Sscanf(s, "%d", &n); return n }
 ```
 
 示例：
+
 - 交互式（Interactive）+ Runner + GraphAgent 演示：`examples/graph/nodecache`，入口 [examples/graph/nodecache/main.go](https://github.com/trpc-group/trpc-agent-go/blob/main/examples/graph/nodecache/main.go)
 
 #### Tools 节点
+
 执行工具调用，注意是**顺序执行**：
 
 ```go
@@ -1577,7 +1805,8 @@ sg.AddNode("collect_tool_results", func(ctx context.Context, s graph.State) (any
 ```
 
 参考示例：`examples/graph/io_conventions_tools`。
-```
+
+````
 
 #### Agent 节点
 嵌入子 Agent，实现多 Agent 协作：
@@ -1600,7 +1829,7 @@ sg.AddAgentNode(subAgentNameAnalyzer)
 analyzer := createAnalyzer()  // 内部 Agent 名称必须是 "analyzer"
 graphAgent, _ := graphagent.New(graphAgentNameMain, g,
     graphagent.WithSubAgents([]agent.Agent{analyzer}))
-```
+````
 
 ### 边与路由
 
@@ -1633,7 +1862,7 @@ sg.AddEdge(nodeA, nodeB)
 sg.AddNode(nodePathA, handlerA)
 sg.AddNode(nodePathB, handlerB)
 // 再添加条件路由
-sg.AddConditionalEdges(nodeDecision, 
+sg.AddConditionalEdges(nodeDecision,
     func(ctx context.Context, s graph.State) (string, error) {
         if s[stateKeyFlag].(bool) {
             return routeToPathA, nil
@@ -1663,11 +1892,187 @@ sg.AddEdge(nodeSplit, nodeBranch2)  // branch1 和 branch2 会并行执行
 ```
 
 提示：设置入口与结束点时，会隐式连接到虚拟的 Start/End 节点：
+
 - `SetEntryPoint("first")` 等效于创建 `Start -> first` 的连边；
 - `SetFinishPoint("last")` 等效于创建 `last -> End` 的连边。
-无需显式添加这两条边。
+  无需显式添加这两条边。
 
 常量名：`graph.Start == "__start__"`，`graph.End == "__end__"`。
+
+### 消息可见性选项
+当前Agent可在需要时根据不同场景控制其对其他Agent生成的消息以及历史会话消息的可见性进行管理，可通过相关选项配置进行管理。
+在与model交互时仅将可见的内容输入给模型。 
+
+TIPS:
+ - 不同sessionID的消息在任何场景下都是互不可见的，以下管控策略均针对同一个sessionID的消息
+ - Invocation.Message在任何场景下均可见
+ - 相关配置仅控制State[graph.StateKeyMessages]的初始值
+ - Agent node生成的消息filterKey为subAgent name, 因此使用`IsolatedRequest`或`IsolatedInvocation`过滤时对当前graphAgent不可见
+ - 未配置选项时，默认值为FullContext
+
+配置:
+- `graphagent.WithMessageFilterMode(MessageFilterMode)`:
+  - `FullContext`: 所有能通过filterKey做前缀匹配的消息
+  - `RequestContext`: 仅包含当前请求周期内通过filterKey前缀匹配的消息
+  - `IsolatedRequest`: 仅包含当前请求周期内通过filterKey完全匹配的消息
+  - `IsolatedInvocation`: 仅包含当前invocation周期内通过filterKey完全匹配的消息
+
+推荐用法示例（该用法仅基于高阶用法基础之上做了配置简化）: 
+
+案例1: 对graphAgent消息可见性控制
+```go
+subgraphAgentA := graphagent.New(
+    "subgraphA", subgraph,
+    // 对parentAgent、subgraphAgentA、subgraphAgentB(包含task1、task2分别生成的消息) 生成的所有消息可见（包含同一sessionID的历史会话消息）
+    graphagent.WithMessageFilterMode(graphagent.FullContext),
+    // 对parentAgent、subgraphAgentA、subgraphAgentB(包含task1、task2分别生成的消息) 当前runner.Run期间生成的所有消息可见（不包含历史会话消息）
+    graphagent.WithMessageFilterMode(graphagent.RequestContext),
+    // 仅对subgraphAgentA 当前runner.Run期间生成的消息可见（不包含自己的历史会话消息）
+    graphagent.WithMessageFilterMode(graphagent.IsolatedRequest),
+    // 仅对subgraphAgentA当前invocation期间生成的消息可见(此示例中subgraphAgentA仅执行一次， 效果等价于graphagent.IsolatedRequest)
+    graphagent.WithMessageFilterMode(graphagent.IsolatedInvocation),
+)
+
+subgraphAgentB := graphagent.New(
+    "subgraphB", subgraph,
+    // 对parentAgent、subgraphAgentA、subgraphAgentB(包含task1、task2分别生成的消息) 生成的所有消息可见（包含同一sessionID的历史会话消息）
+    graphagent.WithMessageFilterMode(graphagent.FullContext),
+    // 对parentAgent、subgraphAgentA、subgraphAgentB(包含task1、task2分别生成的消息) 当前runner.Run期间生成的所有消息可见（不包含历史会话消息）
+    graphagent.WithMessageFilterMode(graphagent.RequestContext),
+    // 仅对subgraphAgentB（包含task1、task2分别生成的消息）当前runner.Run期间生成的消息可见（不包含自己的历史会话消息）
+    graphagent.WithMessageFilterMode(graphagent.IsolatedRequest),
+    // 仅对subgraphAgentB 当前Invocation中生成的消息可见，不包含历史消息（task1与task2执行期间生成的消息互不可见）。
+    graphagent.WithMessageFilterMode(graphagent.IsolatedInvocation),
+)
+
+sg.AddAgentNode("subgraphA")
+sg.AddNode("fanout", func(ctx context.Context, state graph.State) (any, error) {
+    return []*graph.Command{
+        {
+            GoTo: "subgraph",
+            Update: graph.State{
+                "task": "task 1"
+            },
+        },
+        {
+            GoTo: "subgraph",
+            Update: graph.State{
+                "task": "task 2"
+            },
+        },
+    }, nil
+})
+sg.AddAgentNode("subgraphB")
+sg.AddEdge("subgraphA", "fanout")
+sg.SetEntryPoint(subgraphA)
+graph, err := sg.Compile()
+if err != nil {
+    log.Fatalf("Failed to Compile state graph, err: %w", err)
+}
+parentAgent := graphagent.New(
+    "subgraph", graph,
+    // subagent
+    graphagent.WithSubAgents(subgraphAgent)
+)
+```
+
+案例2: 对节点Agent消息可见性控制
+```go
+taskagentA := llmagent.New(
+  "taskagentA",
+  llmagent.WithModel(modelInstance),
+  // 对taskagentA、taskagentB生成的所有消息可见（包含同一sessionID的历史会话消息）
+  llmagent.WithMessageFilterMode(llmagent.FullContext),
+  // 对taskagentA、taskagentB当前runner.Run期间生成的所有消息可见（不包含历史会话消息）
+  llmagent.WithMessageFilterMode(llmagent.RequestContext),
+  // 仅对taskagentA当前runner.Run期间生成的消息可见（不包含自己的历史会话消息）
+  llmagent.WithMessageFilterMode(llmagent.IsolatedRequest),
+  // agent执性顺序：taskagentA-invocation1 -> taskagentB-invocation2 -> taskagentA-invocation3(当前执行阶段)
+  // 仅对taskagentA当前taskagentA-invocation3期间生成的消息可见（不包含自己的历史会话消息以及taskagentA-invocation1期间生成的消息）
+  llmagent.WithMessageFilterMode(llmagent.IsolatedInvocation),
+)
+
+taskagentB := llmagent.New(
+  "taskagentB",
+  llmagent.WithModel(modelInstance),
+  // 对taskagentA、taskagentB生成的所有消息可见（包含同一sessionID的历史会话消息）
+  llmagent.WithMessageFilterMode(llmagent.FullContext),
+  // 对taskagentA、taskagentB当前runner.Run期间生成的所有消息可见（不包含历史会话消息）
+  llmagent.WithMessageFilterMode(llmagent.RequestContext),
+  // 仅对taskagentB当前runner.Run期间生成的消息可见（不包含自己的历史会话消息）
+  llmagent.WithMessageFilterMode(llmagent.IsolatedRequest),
+  // agent执性顺序：taskagentA-invocation1 -> taskagentB-invocation2 -> taskagentA-invocation3 -> taskagentB-invocation4(当前执行阶段)
+  // 仅对taskagentB当前taskagentB-invocation4期间生成的消息可见（不包含自己的历史会话消息以及taskagentB-invocation2期间生成的消息）
+  llmagent.WithMessageFilterMode(llmagent.IsolatedInvocation),
+)
+
+sg.AddAgentNode("taskagentA")
+// 同一个并行执行多个任务
+sg.AddNode("fanout", func(ctx context.Context, state graph.State) (any, error) {
+    return []*graph.Command{
+        {
+            GoTo: "taskB",
+            Update: graph.State{
+                "task": "task 1"
+            },
+        },
+        {
+            GoTo: "taskB",
+            Update: graph.State{
+                "task": "task 2"
+            },
+        },
+    }, nil
+})
+// 可将taskagentB的消息过滤模式设置为llmagent.IsolatedInvocation 以此来隔离多任务的上下文会话信息
+sg.AddNode("taskB", func(ctx context.Context, state graph.State) (any, error){
+    task := state["task-id"]
+    inv, _ := agent.InvocationFromContext(ctx)
+    inv.Message = model.NewUserMessage(task)
+    chan, err := taskagentB.Run(ctx, inv)
+    // do any thing
+})
+```
+
+高阶用法示例：
+可以单独通过 `WithMessageTimelineFilterMode`、`WithMessageBranchFilterMode`控制当前agent对历史消息与其他agent生成的消息可见性。
+当前agent在与模型交互时，最终将同时满足两个条件的消息输入给模型。
+
+`配置:`
+- `WithMessageTimelineFilterMode`: 时间维度可见性控制
+  - `TimelineFilterAll`: 包含历史消息以及当前请求中所生成的消息
+  - `TimelineFilterCurrentRequest`: 仅包含当前请求(一次runner.Run为一次请求)中所生成的消息
+  - `TimelineFilterCurrentInvocation`: 仅包含当前invocation上下文中生成的消息
+- `WithMessageBranchFilterMode`: 分支维度可见性控制（用于控制对其他agent生成消息的可见性）
+  - `BranchFilterModePrefix`: 通过Event.FilterKey与Invocation.eventFilterKey做前缀匹配
+  - `BranchFilterModeAll`: 所有agent的均消息
+  - `BranchFilterModeExact`: 仅自己生成的消息可见
+  
+```go
+llmAgent := llmagent.New(
+    "demo-agent",                      // Agent 名称
+    llmagent.WithModel(modelInstance), // 设置模型
+    llmagent.WithDescription("A helpful AI assistant for demonstrations"),              // 设置描述
+    llmagent.WithInstruction("Be helpful, concise, and informative in your responses"), // 设置指令
+    llmagent.WithGenerationConfig(genConfig),                                           // 设置生成参数
+
+    // 设置传给模型的消息过滤模式，最终传给模型的消息需同时满足WithMessageTimelineFilterMode与WithMessageBranchFilterMode条件
+    // 时间维度过滤条件
+    // 默认值: llmagent.TimelineFilterAll
+    // 可选值:
+    //  - llmagent.TimelineFilterAll: 包含历史消息以及当前请求中所生成的消息
+    //  - llmagent.TimelineFilterCurrentRequest: 仅包含当前请求中所生成的消息
+    //  - llmagent.TimelineFilterCurrentInvocation: 仅包含当前invocation上下文中生成的消息
+    llmagent.WithMessageTimelineFilterMode(llmagent.BranchFilterModeAll),
+    // 分支维度过滤条件
+    // 默认值: llmagent.BranchFilterModePrefix
+    // 可选值:
+    //  - llmagent.BranchFilterModeAll: 包含所有agent的消息, 当前agent与模型交互时,如需将所有agent生成的有效内容消息同步给模型时可设置该值
+    //  - llmagent.BranchFilterModePrefix: 通过Event.FilterKey与Invocation.eventFilterKey做前缀匹配过滤消息, 期望将与当前agent以及相关上下游agent生成的消息传递给模型时，可设置该值
+    //  - llmagent.BranchFilterModeExact: 通过Event.FilterKey==Invocation.eventFilterKey过滤消息，当前agent与模型交互时,仅需使用当前agent生成的消息时可设置该值
+    llmagent.WithMessageBranchFilterMode(llmagent.TimelineFilterAll),
+)
+```
 
 ### 命令模式（动态路由 / Fan-out）
 
@@ -1718,29 +2123,29 @@ flowchart TB
         R[Runner]:::runnerClass
         S[Session Service]:::sessionClass
     end
-    
+
     subgraph "GraphAgent"
         GA[GraphAgent Wrapper]:::agentClass
         CB[Callbacks]:::callbackClass
     end
-    
+
     subgraph "Graph Engine"
         SG[StateGraph Builder]:::builderClass
         G[Graph]:::graphClass
         E[Executor]:::executorClass
     end
-    
+
     subgraph "Execution Components"
         P[Planning]:::phaseClass
         EX[Execution]:::phaseClass
         U[Update]:::phaseClass
     end
-    
+
     subgraph "Storage"
         CP[Checkpoint]:::storageClass
         ST[State Store]:::storageClass
     end
-    
+
     R --> GA
     GA --> G
     G --> E
@@ -1748,7 +2153,7 @@ flowchart TB
     E --> EX
     E --> U
     E --> CP
-    
+
     classDef runnerClass fill:#e8f5e9,stroke:#43a047,stroke-width:2px
     classDef sessionClass fill:#f3e5f5,stroke:#8e24aa,stroke-width:2px
     classDef agentClass fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
@@ -1993,6 +2398,7 @@ flowchart LR
 ```
 
 要点：
+
 - 智能路由 where_to_go 可由 LLM 决策或函数节点实现（条件边）。
 - Fanout Pipeline 使用 Command GoTo 进行运行时 fanout，三路并行后在 aggregate 节点聚合。
 - 可选的人机把关位于聚合之后，确保关键输出经人工确认。
@@ -2120,26 +2526,26 @@ flowchart LR
         LR[last_response: string]:::schemaClass
         NR[node_responses: Map]:::schemaClass
     end
-    
+
     subgraph "State Operations"
         R1[MessageReducer]:::reducerClass
         R2[AppendReducer]:::reducerClass
         R3[DefaultReducer]:::reducerClass
     end
-    
+
     subgraph "Concurrent Updates"
         N1[Node 1 Output]:::nodeOutputClass
         N2[Node 2 Output]:::nodeOutputClass
         N3[Node 3 Output]:::nodeOutputClass
     end
-    
+
     N1 --> R1
     N2 --> R2
     N3 --> R3
     R1 --> MS
     R2 --> NR
     R3 --> LR
-    
+
     classDef schemaClass fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
     classDef reducerClass fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
     classDef nodeOutputClass fill:#fff8e1,stroke:#f57f17,stroke-width:2px
@@ -2155,13 +2561,33 @@ Graph 的状态底层是 `map[string]any`，通过 `StateSchema` 提供运行时
 
 常量均定义在 `graph/state.go` 与 `graph/keys.go`，建议通过常量引用，避免硬编码。
 
-#### 节点级回调与生成参数
+#### 节点级回调、工具与生成参数
 
 节点可通过可选项注册回调或参数（见 `graph/state_graph.go`）：
+
 - `graph.WithPreNodeCallback` / `graph.WithPostNodeCallback` / `graph.WithNodeErrorCallback`
 - LLM 节点可用 `graph.WithGenerationConfig`、`graph.WithModelCallbacks`
-- 工具节点可用 `graph.WithToolCallbacks`
+- 工具相关：`graph.WithToolCallbacks`、`graph.WithToolSets`（除 `tools []tool.Tool` 外，再额外提供 ToolSet`）、
+  `graph.WithRefreshToolSetsOnRun`（在每次运行时从 ToolSet 重新构造工具列表，适合 MCP 等动态工具源）
 - Agent 节点可用 `graph.WithAgentNodeEventCallback`
+
+#### Graph 中的 ToolSet 与 Agent 的区别
+
+`graph.WithToolSets` 是**节点级、构图期**配置：在构建图时，把一个或多个 `tool.ToolSet` 绑定到特定的 LLM 节点，例如：
+
+```go
+sg.AddLLMNode("llm",
+    model,
+    "inst",
+    tools,
+    graph.WithToolSets([]tool.ToolSet{mcpToolSet, fileToolSet}),
+)
+```
+
+需要注意：
+
+- Graph 一旦 `Compile()`，结构（包括节点绑定的 ToolSet）就是**不可变的**。如果要调整某个节点的 ToolSet，需要重新构图或创建新的 `GraphAgent`。
+- 运行时希望动态增删 ToolSet，应该在 Agent 层处理（例如使用 `llmagent.AddToolSet`、`llmagent.RemoveToolSet`、`llmagent.SetToolSets`），或者替换 Graph 中 Agent 节点所使用的下游 Agent。
 
 此外，`graph.WithName`/`graph.WithDescription` 可为节点添加友好的名称与描述；`graph.WithDestinations` 可声明潜在动态路由目标（仅用于静态校验/可视化）。
 
@@ -2242,6 +2668,7 @@ sg.AddToolsConditionalEdges(nodeAsk, nodeExecTools, nodeFallback)
 #### 指令占位符注入
 
 `AddLLMNode` 的 `instruction` 支持占位符，语法与 `llmagent` 一致：
+
 - `{key}` / `{key?}`：从会话 `session.State` 读取键值，可选后缀 `?` 缺失时为空；
 - `{user:subkey}`、`{app:subkey}`、`{temp:subkey}`：按命名空间读取。
 
@@ -2261,10 +2688,10 @@ import (
 // 这样的图结构会自动并行执行
 stateGraph.
     AddNode("analyze", analyzeData).
-    AddNode("generate_report", generateReport). 
+    AddNode("generate_report", generateReport).
     AddNode("call_external_api", callAPI).
     AddEdge("analyze", "generate_report").    // 这两个会并行执行
-    AddEdge("analyze", "call_external_api")   // 
+    AddEdge("analyze", "call_external_api")   //
 ```
 
 内部实现保证了并发安全：执行器为每个任务构造浅拷贝（maps.Copy）并在合并时加锁，同时通过 Reducer 机制来安全地合并并发更新。
@@ -2274,14 +2701,17 @@ stateGraph.
 节点之间仅通过共享 `State` 传递数据，节点函数返回的增量由 Schema 的 Reducer 合并。
 
 - 函数节点（Function）
+
   - 输入：完整 `State`（按 Schema 声明读取）
   - 输出：只写业务键（例如 `{"parsed_time":"..."}`），不要写内部键
 
 - LLM 节点
+
   - 输入优先级：`graph.StateKeyOneShotMessages` → `graph.StateKeyUserInput` → `graph.StateKeyMessages`
   - 输出：原子写回 `graph.StateKeyMessages`、设置 `graph.StateKeyLastResponse`、设置 `graph.StateKeyNodeResponses[<llm_node_id>]`
 
 - 工具节点（Tools）
+
   - 自 `graph.StateKeyMessages` 尾部配对当前轮的 `assistant(tool_calls)`，按顺序追加工具返回到 `graph.StateKeyMessages`
   - 多个工具按 LLM 返回顺序顺序执行
 
@@ -2290,6 +2720,7 @@ stateGraph.
   - 输出：设置 `graph.StateKeyLastResponse` 与 `graph.StateKeyNodeResponses[<agent_node_id>]`；执行成功后会清空 `graph.StateKeyUserInput`
 
 实践建议：
+
 - 串行读取：紧邻下游直接读取 `graph.StateKeyLastResponse`；
 - 并行/汇合读取：从 `graph.StateKeyNodeResponses[<nodeID>]` 读取指定节点输出；
 - 为业务键在 Schema 中声明合适的 Reducer，避免并发写入冲突。
@@ -2297,6 +2728,7 @@ stateGraph.
 ### API 速查表
 
 - 构图
+
   - `graph.NewStateGraph(schema)` → 构建器
   - `AddNode(id, func, ...opts)` / `AddLLMNode(id, model, instruction, tools, ...opts)`
   - `AddToolsNode(id, tools, ...opts)` / `AddAgentNode(id, ...opts)`
@@ -2305,11 +2737,16 @@ stateGraph.
   - `SetEntryPoint(nodeID)` / `SetFinishPoint(nodeID)` / `Compile()`
 
 - 常用 State 键（用户可见）
+
   - `graph.StateKeyUserInput`、`graph.StateKeyOneShotMessages`、`graph.StateKeyMessages`、`graph.StateKeyLastResponse`、`graph.StateKeyNodeResponses`、`graph.StateKeyMetadata`
 
 - 节点级可选项
-  - `graph.WithGenerationConfig`、`graph.WithModelCallbacks`、`graph.WithToolCallbacks`
-  - `graph.WithPreNodeCallback`、`graph.WithPostNodeCallback`、`graph.WithNodeErrorCallback`
+
+  - LLM / 工具相关：
+    - `graph.WithGenerationConfig`、`graph.WithModelCallbacks`
+    - `graph.WithToolCallbacks`、`graph.WithToolSets`
+  - 回调相关：
+    - `graph.WithPreNodeCallback`、`graph.WithPostNodeCallback`、`graph.WithNodeErrorCallback`
 
 - 执行
   - `graphagent.New(name, compiledGraph, ...opts)` → `runner.NewRunner(app, agent)` → `Run(...)`
@@ -2358,7 +2795,7 @@ API 参考：
 
 ### 检查点与恢复
 
-为了支持时间旅行与可靠恢复，可以为执行器或 GraphAgent 配置检查点保存器。下面演示使用 SQLite Saver 持久化检查点并从特定检查点恢复。
+为了支持时间旅行与可靠恢复，可以为执行器或 GraphAgent 配置检查点保存器。下面演示使用 SQLite/Redis Saver 持久化检查点并从特定检查点恢复。
 
 ```go
 import (
@@ -2369,6 +2806,7 @@ import (
     "trpc.group/trpc-go/trpc-agent-go/agent/graphagent"
     "trpc.group/trpc-go/trpc-agent-go/graph"
     "trpc.group/trpc-go/trpc-agent-go/graph/checkpoint/sqlite"
+    "trpc.group/trpc-go/trpc-agent-go/graph/checkpoint/redis"
     "trpc.group/trpc-go/trpc-agent-go/model"
 )
 
@@ -2378,6 +2816,22 @@ saver, _ := sqlite.NewSaver(db)
 
 graphAgent, _ := graphagent.New("workflow", g,
     graphagent.WithCheckpointSaver(saver))
+
+// 执行时自动保存检查点（默认每步保存）
+
+// 从检查点恢复
+eventCh, err := r.Run(ctx, userID, sessionID,
+    model.NewUserMessage("resume"),
+    agent.WithRuntimeState(map[string]any{
+        graph.CfgKeyCheckpointID: "ckpt-123",
+    }),
+)
+
+// 配置redis检查点
+redisSaver, _ := redis.NewSaver(redis.WithRedisClientURL("redis://[username:password@]host:port[/database]"))
+
+graphAgent, _ := graphagent.New("workflow", g,
+    graphagent.WithCheckpointSaver(redisSaver))
 
 // 执行时自动保存检查点（默认每步保存）
 
@@ -2415,6 +2869,7 @@ _ = cm.DeleteLineage(ctx, lineageID)
 ### 默认值与注意事项
 
 - 默认值（Executor）
+
   - `ChannelBufferSize = 256`、`MaxSteps = 100`、`CheckpointSaveTimeout = 10s`
   - 步/节点超时可通过 `Executor` 的 `WithStepTimeout` / `WithNodeTimeout` 配置（目前 GraphAgent 选项未直接暴露）
 
@@ -2423,12 +2878,15 @@ _ = cm.DeleteLineage(ctx, lineageID)
 - Runner 会自动从会话事件播种多轮 `graph.StateKeyMessages`
 
 - 检查点
+
   - 采用稳定的 `namespace` 命名（如 `svc:prod:flowX`）；使用 `CheckpointManager` 按谱系审计与清理
 
 - 事件与背压
+
   - 调整 `WithChannelBufferSize`；按 `author`/`object` 过滤事件降低噪音
 
 - 命名与键
+
   - 节点/路由标签/状态键使用常量；为需要合并的键声明 Reducer
 
 - 治理与合规
@@ -2437,6 +2895,7 @@ _ = cm.DeleteLineage(ctx, lineageID)
 ### 事件速览
 
 - Author 约定
+
   - 节点级：节点 ID（无法获取时为 `graph.AuthorGraphNode`）
   - Pregel 阶段：`graph.AuthorGraphPregel`
   - 执行器/系统：`graph.AuthorGraphExecutor`
@@ -2613,7 +3072,7 @@ for ev := range eventCh {
 ```go
 import (
     "encoding/json"
-    
+
     "trpc.group/trpc-go/trpc-agent-go/graph"
 )
 
@@ -2636,6 +3095,7 @@ for ev := range events {
 默认情况下，中途事件（如 `graph.state.update`）只会上报“更新了哪些键”，不携带值；最终完成事件（`graph.execution`）的 `StateDelta` 才包含“最终状态快照”。如果仅需在“某个节点”完成后，将其返回的部分键值即时发给上游服务，可在该节点的 After 回调中构造并发送一条自定义事件：
 
 实现步骤：
+
 - 在节点上注册 `WithPostNodeCallback`；
 - 在回调的 `result any` 中读取该节点返回的 `graph.State`（state delta）；
 - 选择需要的键值，序列化后放入自定义事件的 `StateDelta`；
@@ -2700,6 +3160,7 @@ func buildGraph() (*graph.Graph, error) {
 ```
 
 建议：
+
 - 仅输出必要键，控制负载与敏感信息；
 - 内部/易变键不会被序列化到最终快照，亦不建议外发（参考 [graph/internal_keys.go:16](https://github.com/trpc-group/trpc-agent-go/blob/main/graph/internal_keys.go#L16)）；
 - 文本类中间结果优先复用模型流式事件（`choice.Delta.Content`）。
@@ -2713,12 +3174,13 @@ import (
 )
 
 // 方式一：构造回调并注册（推荐）
+// 注意：结构化回调 API 需要 trpc-agent-go >= 0.6.0
 cb := agent.NewCallbacks().
-    RegisterBeforeAgent(func(ctx context.Context, inv *agent.Invocation) (*model.Response, error) {
-        // 返回非空 *model.Response 可直接短路此轮执行
+    RegisterBeforeAgent(func(ctx context.Context, args *agent.BeforeAgentArgs) (*agent.BeforeAgentResult, error) {
+        // 返回非空 CustomResponse 可直接短路此轮执行
         return nil, nil
     }).
-    RegisterAfterAgent(func(ctx context.Context, inv *agent.Invocation, runErr error) (*model.Response, error) {
+    RegisterAfterAgent(func(ctx context.Context, args *agent.AfterAgentArgs) (*agent.AfterAgentResult, error) {
         // 可对最终响应做统一修改/替换
         return nil, nil
     })
@@ -2730,27 +3192,84 @@ graphAgent, _ := graphagent.New("workflow", g,
 
 ## 常见问题排查
 
-- 报错 "graph must have an entry point"
-  - 未设置入口点。调用 `SetEntryPoint()`，并确保目标节点已定义。
+**Q1: 报错 "graph must have an entry point"**
 
-- 报错目标/源节点不存在
-  - 在连边/条件路由前先定义节点；条件路由的 `pathMap` 目标也需存在。
+- 未设置入口点。调用 `SetEntryPoint()`，并确保目标节点已定义。
 
-- 工具未执行
-  - 确认 LLM 返回了 `tool_calls`，并使用了 `AddToolsConditionalEdges(ask, tools, fallback)`；
-  - 工具名需与模型声明一致；
-  - 配对规则是从最近一次 `assistant(tool_calls)` 回溯到下一个 `user`，检查消息顺序。
+**Q2: 报错目标/源节点不存在**
 
-- 没有观察到流式事件
-  - 调大 `WithChannelBufferSize` 并按 `Author`/对象类型过滤；
-  - 确认从 `Runner.Run(...)` 消费事件。
+- 在连边/条件路由前先定义节点；条件路由的 `pathMap` 目标也需存在。
 
-- 从检查点恢复未按预期继续
-  - 通过 `agent.WithRuntimeState(map[string]any{ graph.CfgKeyCheckpointID: "..." })` 传入；
-  - HITL 恢复时提供 `ResumeMap`；纯 "resume" 文本不会注入到 `graph.StateKeyUserInput`。
+**Q3: 工具未执行**
 
-- 并行下状态冲突
-  - 为列表/映射等声明合并型 Reducer（如 `StringSliceReducer`、`MergeReducer`），避免多个分支覆盖同一键。
+- 确认 LLM 返回了 `tool_calls`，并使用了 `AddToolsConditionalEdges(ask, tools, fallback)`；
+- 工具名需与模型声明一致；
+- 配对规则是从最近一次 `assistant(tool_calls)` 回溯到下一个 `user`，检查消息顺序。
+
+**Q4: LLM 返回 tool_calls 但工具节点未执行（永远路由到 fallback）**
+
+- **根本原因**：使用了 `NewStateSchema()` 而非 `MessagesStateSchema()`。
+- `AddToolsConditionalEdges` 内部检查 `state[StateKeyMessages].([]model.Message)` 来判断是否有工具调用。
+- 如果 Schema 中没有 `StateKeyMessages` 字段，`MessageReducer` 不会被应用，LLM 节点返回的是 `[]graph.MessageOp` 类型而非 `[]model.Message`，导致类型断言失败，永远路由到 `fallbackNode`。
+- **解决方案**：将 `graph.NewStateSchema()` 改为 `graph.MessagesStateSchema()`，然后在其基础上添加业务字段：
+  ```go
+  // 错误写法
+  schema := graph.NewStateSchema()
+
+  // 正确写法
+  schema := graph.MessagesStateSchema()
+  schema.AddField("my_field", graph.StateField{...})
+  ```
+
+**Q5: 没有观察到流式事件**
+
+- 调大 `WithChannelBufferSize` 并按 `Author`/对象类型过滤；
+- 确认从 `Runner.Run(...)` 消费事件。
+
+**Q6: 从检查点恢复未按预期继续**
+
+- 通过 `agent.WithRuntimeState(map[string]any{ graph.CfgKeyCheckpointID: "..." })` 传入；
+- HITL 恢复时提供 `ResumeMap`；纯 "resume" 文本不会注入到 `graph.StateKeyUserInput`。
+
+**Q7: 并行下状态冲突**
+
+- 为列表/映射等声明合并型 Reducer（如 `StringSliceReducer`、`MergeReducer`），避免多个分支覆盖同一键。
+
+**Q8: AddLLMNode 的 tools 参数起什么作用？工具何时被调用？**
+
+- **tools 参数是声明性的**：传给 `AddLLMNode` 的 tools 会被放入 `model.Request.Tools` 字段，告诉 LLM 有哪些工具可用。
+- **LLM 决定是否调用工具**：LLM 根据 tools 声明和用户输入，决定是否在响应中返回 `tool_calls`。
+- **tools 不会自动执行**：`AddLLMNode` 只负责声明工具、发送请求给 LLM，不会执行工具。
+- **工具执行需要配合 AddToolsNode + AddToolsConditionalEdges**：
+  ```go
+  // 1. LLM 节点声明工具（告诉 LLM 有哪些工具可用）
+  sg.AddLLMNode("ask", model, systemPrompt, tools)
+
+  // 2. 工具节点负责执行工具（根据 LLM 返回的 tool_calls）
+  sg.AddToolsNode("tools", tools)
+
+  // 3. 条件边根据 LLM 响应路由（有 tool_calls 则路由到工具节点）
+  sg.AddToolsConditionalEdges("ask", "tools", "fallback")
+  ```
+- **调用时机**：当 `AddToolsConditionalEdges` 检测到 LLM 响应中包含 `tool_calls` 时，会路由到 `AddToolsNode`，由工具节点执行实际调用。
+
+**Q9: 多个 LLM 节点串联时，req.Messages 中消息被重复追加**
+
+- **问题现象**：同一个用户输入在 `req.Messages` 中出现多次。
+- **根本原因**：使用 `MessagesStateSchema()` 时，`MessageReducer` 会累积消息。每个 LLM 节点执行时，如果 `StateKeyUserInput` 不为空，会追加新的 user message。当存在循环（如工具调用循环）或多个 LLM 节点串联时，消息会不断累积。
+- **解决方案**：在设置新的 `StateKeyUserInput` 之前，使用 `RemoveAllMessages` 清除之前的消息：
+  ```go
+  // 在准备 prompt 的节点中
+  func preparePromptNode(ctx context.Context, state graph.State) (any, error) {
+      userMessage := buildUserMessage(...)
+      return graph.State{
+          // 关键：先清除之前的消息，避免累积
+          graph.StateKeyMessages:  graph.RemoveAllMessages{},
+          graph.StateKeyUserInput: userMessage,
+      }, nil
+  }
+  ```
+- **注意**：`WithSubgraphIsolatedMessages(true)` 只对 `AddSubgraphNode` 有效，对 `AddLLMNode` 无效。
 
 ## 实际案例
 

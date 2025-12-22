@@ -15,24 +15,9 @@ import (
 	"fmt"
 	"strings"
 
+	"trpc.group/trpc-go/trpc-agent-go/internal/session/sqldb"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	storage "trpc.group/trpc-go/trpc-agent-go/storage/postgres"
-)
-
-// Table names
-const (
-	tableNameSessionStates    = "session_states"
-	tableNameSessionEvents    = "session_events"
-	tableNameSessionSummaries = "session_summaries"
-	tableNameAppStates        = "app_states"
-	tableNameUserStates       = "user_states"
-)
-
-// Index suffixes
-const (
-	indexSuffixUniqueActive = "unique_active"
-	indexSuffixLookup       = "lookup"
-	indexSuffixExpires      = "expires"
 )
 
 // SQL templates for table creation
@@ -56,6 +41,20 @@ const (
 			app_name VARCHAR(255) NOT NULL,
 			user_id VARCHAR(255) NOT NULL,
 			session_id VARCHAR(255) NOT NULL,
+			event JSONB NOT NULL,
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			expires_at TIMESTAMP DEFAULT NULL,
+			deleted_at TIMESTAMP DEFAULT NULL
+		)`
+
+	sqlCreateSessionTrackEventsTable = `
+		CREATE TABLE IF NOT EXISTS {{TABLE_NAME}} (
+			id BIGSERIAL PRIMARY KEY,
+			app_name VARCHAR(255) NOT NULL,
+			user_id VARCHAR(255) NOT NULL,
+			session_id VARCHAR(255) NOT NULL,
+			track VARCHAR(255) NOT NULL,
 			event JSONB NOT NULL,
 			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -123,6 +122,16 @@ const (
 		CREATE INDEX IF NOT EXISTS {{INDEX_NAME}}
 		ON {{TABLE_NAME}}(expires_at) WHERE expires_at IS NOT NULL`
 
+	// session_track_events: lookup index on (app_name, user_id, session_id, track, created_at).
+	sqlCreateSessionTracksIndex = `
+		CREATE INDEX IF NOT EXISTS {{INDEX_NAME}}
+		ON {{TABLE_NAME}}(app_name, user_id, session_id, track, created_at)`
+
+	// session_track_events: TTL index on (expires_at).
+	sqlCreateSessionTracksExpiresIndex = `
+		CREATE INDEX IF NOT EXISTS {{INDEX_NAME}}
+		ON {{TABLE_NAME}}(expires_at) WHERE expires_at IS NOT NULL`
+
 	// session_summaries: partial unique index on (app_name, user_id, session_id, filter_key) - only for non-deleted records
 	sqlCreateSessionSummariesUniqueIndex = `
 		CREATE UNIQUE INDEX IF NOT EXISTS {{INDEX_NAME}}
@@ -176,7 +185,7 @@ var expectedSchema = map[string]struct {
 	columns []tableColumn
 	indexes []tableIndex
 }{
-	tableNameSessionStates: {
+	sqldb.TableNameSessionStates: {
 		columns: []tableColumn{
 			{"id", "bigint", false},
 			{"app_name", "character varying", false},
@@ -189,11 +198,11 @@ var expectedSchema = map[string]struct {
 			{"deleted_at", "timestamp without time zone", true},
 		},
 		indexes: []tableIndex{
-			{tableNameSessionStates, indexSuffixUniqueActive, []string{"app_name", "user_id", "session_id"}},
-			{tableNameSessionStates, indexSuffixExpires, []string{"expires_at"}},
+			{sqldb.TableNameSessionStates, sqldb.IndexSuffixUniqueActive, []string{"app_name", "user_id", "session_id"}},
+			{sqldb.TableNameSessionStates, sqldb.IndexSuffixExpires, []string{"expires_at"}},
 		},
 	},
-	tableNameSessionEvents: {
+	sqldb.TableNameSessionEvents: {
 		columns: []tableColumn{
 			{"id", "bigint", false},
 			{"app_name", "character varying", false},
@@ -206,11 +215,29 @@ var expectedSchema = map[string]struct {
 			{"deleted_at", "timestamp without time zone", true},
 		},
 		indexes: []tableIndex{
-			{tableNameSessionEvents, indexSuffixLookup, []string{"app_name", "user_id", "session_id", "created_at"}},
-			{tableNameSessionEvents, indexSuffixExpires, []string{"expires_at"}},
+			{sqldb.TableNameSessionEvents, sqldb.IndexSuffixLookup, []string{"app_name", "user_id", "session_id", "created_at"}},
+			{sqldb.TableNameSessionEvents, sqldb.IndexSuffixExpires, []string{"expires_at"}},
 		},
 	},
-	tableNameSessionSummaries: {
+	sqldb.TableNameSessionTrackEvents: {
+		columns: []tableColumn{
+			{"id", "bigint", false},
+			{"app_name", "character varying", false},
+			{"user_id", "character varying", false},
+			{"session_id", "character varying", false},
+			{"track", "character varying", false},
+			{"event", "jsonb", false},
+			{"created_at", "timestamp without time zone", false},
+			{"updated_at", "timestamp without time zone", false},
+			{"expires_at", "timestamp without time zone", true},
+			{"deleted_at", "timestamp without time zone", true},
+		},
+		indexes: []tableIndex{
+			{sqldb.TableNameSessionTrackEvents, sqldb.IndexSuffixLookup, []string{"app_name", "user_id", "session_id", "track", "created_at"}},
+			{sqldb.TableNameSessionTrackEvents, sqldb.IndexSuffixExpires, []string{"expires_at"}},
+		},
+	},
+	sqldb.TableNameSessionSummaries: {
 		columns: []tableColumn{
 			{"id", "bigint", false},
 			{"app_name", "character varying", false},
@@ -223,11 +250,11 @@ var expectedSchema = map[string]struct {
 			{"deleted_at", "timestamp without time zone", true},
 		},
 		indexes: []tableIndex{
-			{tableNameSessionSummaries, indexSuffixUniqueActive, []string{"app_name", "user_id", "session_id", "filter_key"}},
-			{tableNameSessionSummaries, indexSuffixExpires, []string{"expires_at"}},
+			{sqldb.TableNameSessionSummaries, sqldb.IndexSuffixUniqueActive, []string{"app_name", "user_id", "session_id", "filter_key"}},
+			{sqldb.TableNameSessionSummaries, sqldb.IndexSuffixExpires, []string{"expires_at"}},
 		},
 	},
-	tableNameAppStates: {
+	sqldb.TableNameAppStates: {
 		columns: []tableColumn{
 			{"id", "bigint", false},
 			{"app_name", "character varying", false},
@@ -239,11 +266,11 @@ var expectedSchema = map[string]struct {
 			{"deleted_at", "timestamp without time zone", true},
 		},
 		indexes: []tableIndex{
-			{tableNameAppStates, indexSuffixUniqueActive, []string{"app_name", "key"}},
-			{tableNameAppStates, indexSuffixExpires, []string{"expires_at"}},
+			{sqldb.TableNameAppStates, sqldb.IndexSuffixUniqueActive, []string{"app_name", "key"}},
+			{sqldb.TableNameAppStates, sqldb.IndexSuffixExpires, []string{"expires_at"}},
 		},
 	},
-	tableNameUserStates: {
+	sqldb.TableNameUserStates: {
 		columns: []tableColumn{
 			{"id", "bigint", false},
 			{"app_name", "character varying", false},
@@ -256,8 +283,8 @@ var expectedSchema = map[string]struct {
 			{"deleted_at", "timestamp without time zone", true},
 		},
 		indexes: []tableIndex{
-			{tableNameUserStates, indexSuffixUniqueActive, []string{"app_name", "user_id", "key"}},
-			{tableNameUserStates, indexSuffixExpires, []string{"expires_at"}},
+			{sqldb.TableNameUserStates, sqldb.IndexSuffixUniqueActive, []string{"app_name", "user_id", "key"}},
+			{sqldb.TableNameUserStates, sqldb.IndexSuffixExpires, []string{"expires_at"}},
 		},
 	},
 }
@@ -277,57 +304,59 @@ type tableDefinition struct {
 
 // Global table definitions
 var tableDefs = []tableDefinition{
-	{tableNameSessionStates, sqlCreateSessionStatesTable},
-	{tableNameSessionEvents, sqlCreateSessionEventsTable},
-	{tableNameSessionSummaries, sqlCreateSessionSummariesTable},
-	{tableNameAppStates, sqlCreateAppStatesTable},
-	{tableNameUserStates, sqlCreateUserStatesTable},
+	{sqldb.TableNameSessionStates, sqlCreateSessionStatesTable},
+	{sqldb.TableNameSessionEvents, sqlCreateSessionEventsTable},
+	{sqldb.TableNameSessionTrackEvents, sqlCreateSessionTrackEventsTable},
+	{sqldb.TableNameSessionSummaries, sqlCreateSessionSummariesTable},
+	{sqldb.TableNameAppStates, sqlCreateAppStatesTable},
+	{sqldb.TableNameUserStates, sqlCreateUserStatesTable},
 }
 
 // Global index definitions
 var indexDefs = []indexDefinition{
 	// Partial unique indexes (only for non-deleted records)
-	{tableNameSessionStates, indexSuffixUniqueActive, sqlCreateSessionStatesUniqueIndex},
-	{tableNameSessionSummaries, indexSuffixUniqueActive, sqlCreateSessionSummariesUniqueIndex},
-	{tableNameAppStates, indexSuffixUniqueActive, sqlCreateAppStatesUniqueIndex},
-	{tableNameUserStates, indexSuffixUniqueActive, sqlCreateUserStatesUniqueIndex},
+	{sqldb.TableNameSessionStates, sqldb.IndexSuffixUniqueActive, sqlCreateSessionStatesUniqueIndex},
+	{sqldb.TableNameSessionSummaries, sqldb.IndexSuffixUniqueActive, sqlCreateSessionSummariesUniqueIndex},
+	{sqldb.TableNameAppStates, sqldb.IndexSuffixUniqueActive, sqlCreateAppStatesUniqueIndex},
+	{sqldb.TableNameUserStates, sqldb.IndexSuffixUniqueActive, sqlCreateUserStatesUniqueIndex},
 	// Lookup indexes (only session_events needs a separate lookup index)
-	{tableNameSessionEvents, indexSuffixLookup, sqlCreateSessionEventsIndex},
+	{sqldb.TableNameSessionEvents, sqldb.IndexSuffixLookup, sqlCreateSessionEventsIndex},
+	{sqldb.TableNameSessionTrackEvents, sqldb.IndexSuffixLookup, sqlCreateSessionTracksIndex},
 	// TTL indexes
-	{tableNameSessionStates, indexSuffixExpires, sqlCreateSessionStatesExpiresIndex},
-	{tableNameSessionEvents, indexSuffixExpires, sqlCreateSessionEventsExpiresIndex},
-	{tableNameSessionSummaries, indexSuffixExpires, sqlCreateSessionSummariesExpiresIndex},
-	{tableNameAppStates, indexSuffixExpires, sqlCreateAppStatesExpiresIndex},
-	{tableNameUserStates, indexSuffixExpires, sqlCreateUserStatesExpiresIndex},
+	{sqldb.TableNameSessionStates, sqldb.IndexSuffixExpires, sqlCreateSessionStatesExpiresIndex},
+	{sqldb.TableNameSessionEvents, sqldb.IndexSuffixExpires, sqlCreateSessionEventsExpiresIndex},
+	{sqldb.TableNameSessionTrackEvents, sqldb.IndexSuffixExpires, sqlCreateSessionTracksExpiresIndex},
+	{sqldb.TableNameSessionSummaries, sqldb.IndexSuffixExpires, sqlCreateSessionSummariesExpiresIndex},
+	{sqldb.TableNameAppStates, sqldb.IndexSuffixExpires, sqlCreateAppStatesExpiresIndex},
+	{sqldb.TableNameUserStates, sqldb.IndexSuffixExpires, sqlCreateUserStatesExpiresIndex},
 }
 
 // buildCreateTableSQL builds CREATE TABLE SQL with table prefix.
 func buildCreateTableSQL(schema, prefix, tableName, template string) string {
-	fullTableName := buildFullTableName(schema, prefix, tableName)
+	fullTableName := sqldb.BuildTableNameWithSchema(schema, prefix, tableName)
 	return strings.ReplaceAll(template, "{{TABLE_NAME}}", fullTableName)
 }
 
-// buildIndexName constructs an index name with schema/prefix.
-// Example: schema="new", prefix="app_", tableName="session_states", suffix="unique_active"
-// Result: "idx_new_app_session_states_unique_active"
-func buildIndexName(schema, prefix, tableName, suffix string) string {
-	// Build the prefixed table name for index
-	// Convert dots to underscores for index names (schema.table -> schema_table)
-	prefixedTableName := strings.ReplaceAll(buildFullTableName(schema, prefix, tableName), ".", "_")
-
-	// Construct index name: idx_{prefixed_table}_{suffix}
-	return fmt.Sprintf("idx_%s_%s", prefixedTableName, suffix)
-}
-
-// buildIndexSQL builds CREATE INDEX SQL with table and index prefix.
-// suffix should be the index suffix like "unique_active", "lookup", "expires".
-func buildIndexSQL(schema, prefix, tableName, suffix, template string) string {
-	fullTableName := buildFullTableName(schema, prefix, tableName)
-	finalIndexName := buildIndexName(schema, prefix, tableName, suffix)
+// buildCreateIndexSQL builds CREATE INDEX SQL with table and index names.
+func buildCreateIndexSQL(schema, prefix, tableName, suffix, template string) string {
+	fullTableName := sqldb.BuildTableNameWithSchema(schema, prefix, tableName)
+	indexName := sqldb.BuildIndexNameWithSchema(schema, prefix, tableName, suffix)
 
 	sql := strings.ReplaceAll(template, "{{TABLE_NAME}}", fullTableName)
-	sql = strings.ReplaceAll(sql, "{{INDEX_NAME}}", finalIndexName)
+	sql = strings.ReplaceAll(sql, "{{INDEX_NAME}}", indexName)
 	return sql
+}
+
+// parseTableName parses a full table name into schema and table components.
+// Examples:
+// - "session_states" -> ("public", "session_states")
+// - "myschema.session_states" -> ("myschema", "session_states")
+func parseTableName(fullTableName string) (schema, tableName string) {
+	parts := strings.Split(fullTableName, ".")
+	if len(parts) == 2 {
+		return parts[0], parts[1]
+	}
+	return "public", fullTableName
 }
 
 // initDB initializes the database schema
@@ -353,7 +382,7 @@ func (s *Service) initDB(ctx context.Context) {
 func createTables(ctx context.Context, client storage.Client, schema, prefix string) error {
 	for _, table := range tableDefs {
 		tableSQL := buildCreateTableSQL(schema, prefix, table.name, table.template)
-		fullTableName := buildFullTableName(schema, prefix, table.name)
+		fullTableName := sqldb.BuildTableNameWithSchema(schema, prefix, table.name)
 		if _, err := client.ExecContext(ctx, tableSQL); err != nil {
 			return fmt.Errorf("create table %s failed: %w", fullTableName, err)
 		}
@@ -366,8 +395,8 @@ func createTables(ctx context.Context, client storage.Client, schema, prefix str
 // This function can be used by both Service and standalone InitDB.
 func createIndexes(ctx context.Context, client storage.Client, schema, prefix string) error {
 	for _, idx := range indexDefs {
-		indexSQL := buildIndexSQL(schema, prefix, idx.table, idx.suffix, idx.template)
-		fullTableName := buildFullTableName(schema, prefix, idx.table)
+		indexSQL := buildCreateIndexSQL(schema, prefix, idx.table, idx.suffix, idx.template)
+		fullTableName := sqldb.BuildTableNameWithSchema(schema, prefix, idx.table)
 		if _, err := client.ExecContext(ctx, indexSQL); err != nil {
 			return fmt.Errorf("create index on %s failed: %w", fullTableName, err)
 		}
@@ -379,7 +408,7 @@ func createIndexes(ctx context.Context, client storage.Client, schema, prefix st
 // verifySchema verifies that the database schema matches expectations
 func (s *Service) verifySchema(ctx context.Context) error {
 	for tableName, schema := range expectedSchema {
-		fullTableName := buildFullTableName(s.opts.schema, s.opts.tablePrefix, tableName)
+		fullTableName := sqldb.BuildTableNameWithSchema(s.opts.schema, s.opts.tablePrefix, tableName)
 
 		// Check if table exists
 		exists, err := s.tableExists(ctx, fullTableName)
@@ -397,7 +426,12 @@ func (s *Service) verifySchema(ctx context.Context) error {
 
 		// Verify indexes
 		if err := s.verifyIndexes(ctx, fullTableName, schema.indexes); err != nil {
-			log.Warnf("verify indexes for table %s failed (non-fatal): %v", fullTableName, err)
+			log.WarnfContext(
+				ctx,
+				"verify indexes for table %s failed (non-fatal): %v",
+				fullTableName,
+				err,
+			)
 		}
 	}
 
@@ -499,11 +533,21 @@ func (s *Service) verifyIndexes(ctx context.Context, fullTableName string, expec
 
 	// Check each expected index
 	for _, expected := range expectedIndexes {
-		// Use buildIndexName to construct the expected index name
-		expectedIndexName := buildIndexName(s.opts.schema, s.opts.tablePrefix, expected.table, expected.suffix)
+		// Use sqldb.BuildIndexNameWithSchema to construct the expected index.
+		expectedIndexName := sqldb.BuildIndexNameWithSchema(
+			s.opts.schema,
+			s.opts.tablePrefix,
+			expected.table,
+			expected.suffix,
+		)
 
 		if !actualIndexes[expectedIndexName] {
-			log.Warnf("index %s on table %s is missing", expectedIndexName, fullTableName)
+			log.WarnfContext(
+				ctx,
+				"index %s on table %s is missing",
+				expectedIndexName,
+				fullTableName,
+			)
 		}
 	}
 
@@ -573,7 +617,7 @@ func WithInitDBSSLMode(sslMode string) InitDBOpt {
 // Note: An underscore will be automatically added if not present.
 // "trpc" and "trpc_" both result in "trpc_" prefix.
 //
-// Security: Only alphanumeric characters and underscore are allowed to prevent SQL injection.
+// Security: Uses internal/session/sqldb.ValidateTablePrefix to prevent SQL injection.
 func WithInitDBTablePrefix(prefix string) InitDBOpt {
 	return func(c *InitDBConfig) {
 		if prefix == "" {
@@ -581,9 +625,8 @@ func WithInitDBTablePrefix(prefix string) InitDBOpt {
 			return
 		}
 
-		if err := validateTablePrefix(prefix); err != nil {
-			panic(fmt.Sprintf("invalid table prefix: %v", err))
-		}
+		// Use internal/session/sqldb validation
+		sqldb.MustValidateTablePrefix(prefix)
 
 		// Automatically add underscore if not present
 		if !strings.HasSuffix(prefix, "_") {
@@ -595,13 +638,12 @@ func WithInitDBTablePrefix(prefix string) InitDBOpt {
 
 // WithInitDBSchema sets the PostgreSQL schema name where tables will be created.
 // Note: The schema must already exist in the database before calling InitDB.
-// Security: Only alphanumeric characters and underscore are allowed to prevent SQL injection.
+// Security: Uses internal/session/sqldb.ValidateTableName to prevent SQL injection.
 func WithInitDBSchema(schema string) InitDBOpt {
 	return func(c *InitDBConfig) {
 		if schema != "" {
-			if err := validateTablePrefix(schema); err != nil {
-				panic(fmt.Sprintf("invalid schema name: %v", err))
-			}
+			// Use internal/session/sqldb validation
+			sqldb.MustValidateTableName(schema)
 		}
 		c.schema = schema
 	}

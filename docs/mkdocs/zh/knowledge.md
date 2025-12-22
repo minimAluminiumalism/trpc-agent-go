@@ -37,6 +37,8 @@ Knowledge 系统与 Agent 的集成方式：
 
 ## 快速开始
 
+> **完整示例**: [examples/knowledge/basic](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/basic)
+
 ### 环境要求
 
 - Go 1.24.1 或更高版本
@@ -63,19 +65,22 @@ import (
     "context"
     "log"
 
-    // 核心组件
     "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
-    "trpc.group/trpc-go/trpc-agent-go/event"
     "trpc.group/trpc-go/trpc-agent-go/knowledge"
     openaiembedder "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/openai"
     "trpc.group/trpc-go/trpc-agent-go/knowledge/source"
     dirsource "trpc.group/trpc-go/trpc-agent-go/knowledge/source/dir"
     filesource "trpc.group/trpc-go/trpc-agent-go/knowledge/source/file"
+    knowledgetool "trpc.group/trpc-go/trpc-agent-go/knowledge/tool"
     vectorinmemory "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/inmemory"
     "trpc.group/trpc-go/trpc-agent-go/model"
     "trpc.group/trpc-go/trpc-agent-go/model/openai"
     "trpc.group/trpc-go/trpc-agent-go/runner"
     "trpc.group/trpc-go/trpc-agent-go/session/inmemory"
+    "trpc.group/trpc-go/trpc-agent-go/tool"
+
+    // 如需支持 PDF 文件，需手动引入 PDF reader（独立 go.mod，避免引入不必要的第三方依赖）
+    // _ "trpc.group/trpc-go/trpc-agent-go/knowledge/document/reader/pdf"
 )
 
 func main() {
@@ -89,8 +94,7 @@ func main() {
     // 2. 创建向量存储
     vectorStore := vectorinmemory.New()
 
-    // 3. 创建知识源（确保这些路径存在或替换为你自己的路径）
-    // 以下文件在 https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge
+    // 3. 创建知识源
     sources := []source.Source{
         filesource.New([]string{"./data/llm.md"}),
         dirsource.New([]string{"./dir"}),
@@ -101,134 +105,39 @@ func main() {
         knowledge.WithEmbedder(embedder),
         knowledge.WithVectorStore(vectorStore),
         knowledge.WithSources(sources),
-        knowledge.WithEnableSourceSync(true), // 启用增量同步，保持向量存储与源一致
+        knowledge.WithEnableSourceSync(true),
     )
 
     // 5. 加载文档
-    log.Println("🚀 开始加载 Knowledge ...")
     if err := kb.Load(ctx); err != nil {
         log.Fatalf("Failed to load knowledge base: %v", err)
     }
-    log.Println("✅ Knowledge 加载完成！")
 
-    // 6. 创建 LLM 模型
+    // 6. 创建搜索工具
+    searchTool := knowledgetool.NewKnowledgeSearchTool(
+        kb,
+        knowledgetool.WithToolName("knowledge_search"),
+        knowledgetool.WithToolDescription("Search for relevant information in the knowledge base."),
+    )
+
+    // 7. 创建 Agent 并添加工具
     modelInstance := openai.New("claude-4-sonnet-20250514")
-
-    // 7. 创建 Agent 并集成 Knowledge
     llmAgent := llmagent.New(
         "knowledge-assistant",
         llmagent.WithModel(modelInstance),
-        llmagent.WithDescription("具有 Knowledge 访问能力的智能助手"),
-        llmagent.WithInstruction("使用 knowledge_search 工具从 Knowledge 检索相关信息，并基于检索内容回答问题。"),
-        llmagent.WithKnowledge(kb), // 自动添加 knowledge_search 工具
+        llmagent.WithTools([]tool.Tool{searchTool}),
     )
 
-    // 8. 创建 Runner
+    // 8. 创建 Runner 并执行
     sessionService := inmemory.NewSessionService()
-    appRunner := runner.NewRunner(
-        "knowledge-chat",
-        llmAgent,
-        runner.WithSessionService(sessionService),
-    )
+    appRunner := runner.NewRunner("knowledge-chat", llmAgent, runner.WithSessionService(sessionService))
 
-    // 9. 执行对话（Agent 会自动使用 knowledge_search 工具）
-    log.Println("🔍 开始搜索 Knowledge ...")
     message := model.NewUserMessage("请告诉我关于 LLM 的信息")
-    eventChan, err := appRunner.Run(ctx, "user123", "session456", message)
+    _, err := appRunner.Run(ctx, "user123", "session456", message)
     if err != nil {
         log.Fatalf("Failed to run agent: %v", err)
     }
 }
-```
-
-### 手动调用示例
-
-```go
-
-package main
-
-import (
-    openaiembedder "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/openai"
-    vectorelasticsearch "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/elasticsearch"
-    "trpc.group/trpc-go/trpc-agent-go/knowledge"
-    "trpc.group/trpc-go/trpc-agent-go/knowledge/searchfilter"
-)
-
-// 创建支持多版本 (v7, v8, v9) 的 Elasticsearch 向量存储
-esVS, err := vectorelasticsearch.New(
-    vectorelasticsearch.WithAddresses([]string{"http://localhost:9200"}),
-    vectorelasticsearch.WithUsername(os.Getenv("ELASTICSEARCH_USERNAME")),
-    vectorelasticsearch.WithPassword(os.Getenv("ELASTICSEARCH_PASSWORD")),
-    vectorelasticsearch.WithAPIKey(os.Getenv("ELASTICSEARCH_API_KEY")),
-    vectorelasticsearch.WithIndexName(getEnvOrDefault("ELASTICSEARCH_INDEX_NAME", "trpc_agent_documents")),
-    vectorelasticsearch.WithMaxRetries(3),
-    // 版本可选："v7"、"v8"、"v9"（默认 "v9"）
-    vectorelasticsearch.WithVersion("v9"),
-    // 用于文档检索时的自定义文档构建方法。若不提供，则使用默认构建方法。
-    vectorelasticsearch.WithDocBuilder(docBuilder),
-)
-if err != nil {
-    // 处理 error
-}
-
-embedder := openaiembedder.New(
-    openaiembedder.WithModel("text-embedding-3-small"), // embedding 模型，也可通过 OPENAI_EMBEDDING_MODEL 环境变量设置
-)
-
-kb := knowledge.New(
-    knowledge.WithVectorStore(esVS),
-    knowledge.WithEmbedder(embedder),
-)
-
-filterCondition := &searchfilter.UniversalFilterCondition{
-    Operator: searchfilter.OperatorAnd,
-    Value: []*searchfilter.UniversalFilterCondition{
-        {
-            Field: "tag",
-            Operator: searchfilter.OperatorEqual,
-            Value: "tag",
-        },
-        {
-            Field: "age",
-            Operator: searchfilter.OperatorGreaterThanOrEqual,
-            Value: 18,
-        },
-        {
-            Field: "create_time",
-            Operator: searchfilter.OperatorBetween,
-            Value: []string{"2024-10-11 12:11:00", "2025-10-11 12:11:00"},
-        },
-        {
-            Operator: searchfilter.OperatorOr,
-            Value: []*searchfilter.UniversalFilterCondition{
-                {
-                    Field: "login_time",
-                    Operator: searchfilter.OperatorLessThanOrEqual,
-                    Value: "2025-01-11 12:11:00",
-                },
-                {
-                    Field: "status",
-                    Operator: searchfilter.OperatorEqual,
-                    Value: "logout",
-                },
-            },
-        },
-    },
-}
-
-req := &knowledge.SearchRequest{
-    Query: "any text"
-    MaxResults: 5,
-    MinScore: 0.7,
-    SearchFilter: &knowledge.SearchFilter{
-        DocumentIDs: []string{"id1","id2"},
-        Metadata: map[string]any{
-            "title": "title test",
-        },
-        FilterCondition: filterCondition,
-    }
-}
-searchResult, err := kb.Search(ctx, req)
 ```
 
 
@@ -270,59 +179,42 @@ knowledge/
 
 ### 与 Agent 集成
 
-Knowledge 系统提供了两种与 Agent 集成的方式：自动集成和手动构建工具。
+Knowledge 系统提供了两种与 Agent 集成的方式：手动构建工具和自动集成。
 
-#### 方式一：自动集成（推荐）
+#### 方式一：手动构建工具（推荐）
 
-使用 `llmagent.WithKnowledge(kb)` 将 Knowledge 集成到 Agent，框架会自动注册 `knowledge_search` 工具，无需手动创建自定义工具。
-
-```go
-import (
-    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
-    "trpc.group/trpc-go/trpc-agent-go/model"
-    "trpc.group/trpc-go/trpc-agent-go/tool" // 可选：需要附加其他工具时使用
-)
-
-// 创建 Knowledge
-// kb := ...
-
-// 创建 Agent 并集成 Knowledge
-llmAgent := llmagent.New(
-    "knowledge-assistant",
-    llmagent.WithModel(modelInstance),
-    llmagent.WithDescription("具有 Knowledge 访问能力的智能助手"),
-    llmagent.WithInstruction("使用 knowledge_search 工具从 Knowledge 检索相关信息，并基于检索内容回答问题。"),
-    llmagent.WithKnowledge(kb), // 自动添加 knowledge_search 工具
-    // llmagent.WithTools([]tool.Tool{otherTool}), // 可选：附加其他工具
-)
-```
-
-#### 方式二：手动构建工具
-
-使用手动构建SearchTool的方法来配置知识库，通过这个方法可以构建多个知识库
-
-**使用 NewKnowledgeSearchTool 创建基础搜索工具：**
+使用 `NewKnowledgeSearchTool` 手动创建搜索工具，可以灵活配置工具名称、描述，并支持构建多个知识库。
 
 ```go
 import (
     knowledgetool "trpc.group/trpc-go/trpc-agent-go/knowledge/tool"
+    "trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
-// 创建 Knowledge
-// kb := ...
-
-// 创建基础搜索工具
+// 创建搜索工具
 searchTool := knowledgetool.NewKnowledgeSearchTool(
-    kb,                    // Knowledge 实例
+    kb,
     knowledgetool.WithToolName("knowledge_search"),
     knowledgetool.WithToolDescription("Search for relevant information in the knowledge base."),
 )
 
-// 创建 Agent 并手动添加工具
+// 创建 Agent 并添加工具
 llmAgent := llmagent.New(
     "knowledge-assistant",
     llmagent.WithModel(modelInstance),
     llmagent.WithTools([]tool.Tool{searchTool}),
+)
+```
+
+#### 方式二：自动集成
+
+使用 `llmagent.WithKnowledge(kb)` 将 Knowledge 集成到 Agent，框架会自动注册 `knowledge_search` 工具。
+
+```go
+llmAgent := llmagent.New(
+    "knowledge-assistant",
+    llmagent.WithModel(modelInstance),
+    llmagent.WithKnowledge(kb), // 自动添加 knowledge_search 工具
 )
 ```
 
@@ -354,20 +246,42 @@ llmAgent := llmagent.New(
 
 ### 向量存储 (VectorStore)
 
+> **示例代码**: [examples/knowledge/vectorstores](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/vectorstores)
+
 向量存储可在代码中通过选项配置，配置来源可以是配置文件、命令行参数或环境变量，用户可以自行实现。
 
+trpc-agent-go 支持多种向量存储实现：
+
+- **Memory**：内存向量存储，适用于测试和小规模数据
+- **PgVector**：基于 PostgreSQL + pgvector 扩展的向量存储，支持混合检索 - [示例](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/vectorstores/postgres)
+- **TcVector**：腾讯云向量数据库，支持远程 embedding 计算和混合检索 - [示例](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/vectorstores/tcvector)
+- **Elasticsearch**：支持 v7/v8/v9 多版本的 Elasticsearch 向量存储 - [示例](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/vectorstores/elasticsearch)
+- **Milvus**：高性能向量数据库，支持十亿级向量搜索 - [示例](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/vectorstores/milvus)
+
 #### 向量存储配置示例
+
+##### Memory（内存向量存储）
 
 ```go
 import (
     vectorinmemory "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/inmemory"
-    vectorpgvector "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/pgvector"
-    vectortcvector "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/tcvector"
-    vectorelasticsearch "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/elasticsearch"
 )
 
-// 内存实现，可用于测试
+// 内存实现，适用于测试和小规模数据
 memVS := vectorinmemory.New()
+
+kb := knowledge.New(
+    knowledge.WithVectorStore(memVS),
+    knowledge.WithEmbedder(embedder), // 需要配置本地 embedder
+)
+```
+
+##### PgVector（PostgreSQL + pgvector）
+
+```go
+import (
+    vectorpgvector "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/pgvector"
+)
 
 // PostgreSQL + pgvector
 pgVS, err := vectorpgvector.New(
@@ -376,38 +290,89 @@ pgVS, err := vectorpgvector.New(
     vectorpgvector.WithUser("postgres"),
     vectorpgvector.WithPassword("your-password"),
     vectorpgvector.WithDatabase("your-database"),
-    // 根据 embedding 模型设置索引维度（text-embedding-3-small 为 1536）。
-    pgvector.WithIndexDimension(1536),
-    // 启用/关闭文本检索向量，配合混合检索权重使用。
-    pgvector.WithEnableTSVector(true),
-    // 调整混合检索权重（向量相似度权重与文本相关性权重）。
-    pgvector.WithHybridSearchWeights(0.7, 0.3),
-    // 如安装了中文分词扩展（如 zhparser/jieba），可设置语言以提升文本召回。
-    pgvector.WithLanguageExtension("english"),
+    // 根据 embedding 模型设置索引维度（text-embedding-3-small 为 1536）
+    vectorpgvector.WithIndexDimension(1536),
+    // 启用/关闭文本检索向量，配合混合检索权重使用
+    vectorpgvector.WithEnableTSVector(true),
+    // 调整混合检索权重（向量相似度权重与文本相关性权重）
+    vectorpgvector.WithHybridSearchWeights(0.7, 0.3),
+    // 如安装了中文分词扩展（如 zhparser/jieba），可设置语言以提升文本召回
+    vectorpgvector.WithLanguageExtension("english"),
 )
 if err != nil {
     // 处理 error
 }
 
+kb := knowledge.New(
+    knowledge.WithVectorStore(pgVS),
+    knowledge.WithEmbedder(embedder), // 需要配置本地 embedder
+)
+```
+
+##### TcVector（腾讯云向量数据库）
+
+TcVector 支持两种 embedding 模式：
+
+**1. 本地 Embedding 模式（默认）**
+
+使用本地 embedder 计算向量，然后存储到 TcVector：
+
+```go
+import (
+    vectortcvector "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/tcvector"
+)
+
 docBuilder := func(tcDoc tcvectordb.Document) (*document.Document, []float64, error) {
     return &document.Document{ID: tcDoc.Id}, nil, nil
 }
 
-// TcVector
+// 本地 embedding 模式
 tcVS, err := vectortcvector.New(
     vectortcvector.WithURL("https://your-tcvector-endpoint"),
     vectortcvector.WithUsername("your-username"),
     vectortcvector.WithPassword("your-password"),
-    // 用于文档检索时的自定义文档构建方法。若不提供，则使用默认构建方法。
+    // 用于文档检索时的自定义文档构建方法。若不提供，则使用默认构建方法
     vectortcvector.WithDocBuilder(docBuilder),
 )
 if err != nil {
     // 处理 error
 }
 
-// 传递给 Knowledge
 kb := knowledge.New(
-    knowledge.WithVectorStore(memVS), // pgVS, tcVS
+    knowledge.WithVectorStore(tcVS),
+    knowledge.WithEmbedder(embedder), // 需要配置本地 embedder
+)
+```
+
+**2. 远程 Embedding 模式**
+
+使用 TcVector 云端 embedding 计算，无需本地 embedder，节省资源：
+
+```go
+import (
+    vectortcvector "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/tcvector"
+)
+
+// 远程 embedding 模式
+tcVS, err := vectortcvector.New(
+    vectortcvector.WithURL("https://your-tcvector-endpoint"),
+    vectortcvector.WithUsername("your-username"),
+    vectortcvector.WithPassword("your-password"),
+    // 启用远程 embedding 计算
+    vectortcvector.WithEnableRemoteEmbedding(true),
+    // 指定 TcVector 的 embedding 模型（如 bge-base-zh）
+    vectortcvector.WithRemoteEmbeddingModel("bge-base-zh"),
+    // 如需混合检索，需启用 TSVector
+    vectortcvector.WithEnableTSVector(true),
+)
+if err != nil {
+    // 处理 error
+}
+
+kb := knowledge.New(
+    knowledge.WithVectorStore(tcVS),
+    // 注意：使用远程 embedding 时，不需要配置 embedder
+    // knowledge.WithEmbedder(embedder), // 不需要
 )
 ```
 
@@ -511,6 +476,7 @@ kb := knowledge.New(
 - 其他兼容 OpenAI API 的 embedding 服务
 - Gemini embedding 模型（通过 `knowledge/embedder/gemini`）
 - Ollama embedding 模型 (通过 `knowledge/embedder/ollama`）
+- hugging_face text_embedding_interface 模型 (通过 `knowledge/embedder/hugging_face`）
 
 > **注意**:
 >
@@ -519,7 +485,14 @@ kb := knowledge.New(
 
 ### 文档源配置
 
+> 📁 **示例代码**: [examples/knowledge/sources](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/sources)
+
 源模块提供了多种文档源类型，每种类型都支持丰富的配置选项：
+
+- **文件源 (file)**: 单个文件处理 - [示例](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/sources/file-source)
+- **目录源 (dir)**: 批量处理目录 - [示例](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/sources/directory-source)
+- **URL 源 (url)**: 从网页获取内容 - [示例](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/sources/url-source)
+- **自动源 (auto)**: 智能识别类型 - [示例](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/sources/auto-source)
 
 ```go
 import (
@@ -615,7 +588,17 @@ err := kb.Load(ctx,
 
 ## 过滤器功能
 
+> 📁 **示例代码**: [examples/knowledge/features/metadata-filter](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/features/metadata-filter)
+
 Knowledge 系统提供了强大的过滤器功能，允许基于文档元数据进行精准搜索。这包括静态过滤器和智能过滤器两种模式。
+
+> **重要：过滤器字段命名规范**
+>
+> 在使用过滤器时，**元数据字段建议使用 `metadata.` 前缀**：
+> - `metadata.` 前缀用于区分元数据字段和系统字段（如 `id`、`name`、`content` 等）
+> - 无论是 `WithKnowledgeFilter()`、`tool.WithFilter()` 还是 `searchfilter.Equal()` 等，元数据字段都建议加 `metadata.` 前缀
+> - 如果通过 `WithMetadataField()` 自定义了元数据字段名，仍然使用 `metadata.` 前缀，框架会自动转换为实际的字段名
+> - 通过 `WithDocBuilder` 自定义的表字段（如 `status`、`priority` 等额外列）直接使用字段名，无需前缀
 
 ### 基础过滤器
 
@@ -632,8 +615,8 @@ llmAgent := llmagent.New(
     llmagent.WithModel(modelInstance),
     llmagent.WithKnowledge(kb),
     llmagent.WithKnowledgeFilter(map[string]interface{}{
-        "category": "documentation",
-        "topic":    "programming",
+        "metadata.category": "documentation",
+        "metadata.topic":    "programming",
     }),
 )
 ```
@@ -652,9 +635,9 @@ eventCh, err := runner.Run(
     sessionID,
     message,
     agent.WithKnowledgeFilter(map[string]interface{}{
-        "user_level": "premium",     // 根据用户级别过滤
-        "region":     "china",       // 根据地区过滤
-        "language":   "zh",          // 根据语言过滤
+        "metadata.user_level": "premium",     // 根据用户级别过滤
+        "metadata.region":     "china",       // 根据地区过滤
+        "metadata.language":   "zh",          // 根据语言过滤
     }),
 )
 ```
@@ -667,8 +650,8 @@ llmAgent := llmagent.New(
     "assistant",
     llmagent.WithKnowledge(kb),
     llmagent.WithKnowledgeFilter(map[string]interface{}{
-        "category": "general",
-        "source":   "internal",
+        "metadata.category": "general",
+        "metadata.source":   "internal",
     }),
 )
 
@@ -676,20 +659,22 @@ llmAgent := llmagent.New(
 eventCh, err := runner.Run(
     ctx, userID, sessionID, message,
     agent.WithKnowledgeFilter(map[string]interface{}{
-        "source": "external",  // 会被 Agent 级的 "internal" 覆盖
-        "topic":  "api",       // 新增过滤条件（Agent 级没有此键）
+        "metadata.source": "external",  // 会被 Agent 级的 "internal" 覆盖
+        "metadata.topic":  "api",       // 新增过滤条件（Agent 级没有此键）
     }),
 )
 
 // 最终生效的过滤器：
 // {
-//     "category": "general",   // 来自 Agent 级
-//     "source":   "internal",  // 来自 Agent 级（覆盖了 Runner 级的 "external"）
-//     "topic":    "api",       // 来自 Runner 级（新增）
+//     "metadata.category": "general",   // 来自 Agent 级
+//     "metadata.source":   "internal",  // 来自 Agent 级（覆盖了 Runner 级的 "external"）
+//     "metadata.topic":    "api",       // 来自 Runner 级（新增）
 // }
 ```
 
 ### 智能过滤器 (Agentic Filter)
+
+> 📁 **示例代码**: [examples/knowledge/features/agentic-filter](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/features/agentic-filter)
 
 智能过滤器是 Knowledge 系统的高级功能，允许 LLM Agent 根据用户查询动态选择合适的过滤条件。
 
@@ -752,12 +737,12 @@ llmAgent := llmagent.New(
     llmagent.WithKnowledge(kb),
     // Agent 级元数据过滤器
     llmagent.WithKnowledgeFilter(map[string]any{
-        "source":   "official",      // 官方来源
-        "category": "documentation", // 文档类别
+        "metadata.source":   "official",      // 官方来源
+        "metadata.category": "documentation", // 文档类别
     }),
-    // Agent 级复杂条件过滤器
+    // Agent 级复杂条件过滤器（元数据字段使用 metadata. 前缀）
     llmagent.WithKnowledgeConditionedFilter(
-        searchfilter.Equal("status", "published"), // 已发布状态
+        searchfilter.Equal("metadata.status", "published"), // 已发布状态
     ),
 )
 
@@ -766,26 +751,26 @@ eventCh, err := runner.Run(
     ctx, userID, sessionID, message,
     // Runner 级元数据过滤器
     agent.WithKnowledgeFilter(map[string]any{
-        "region":   "china",  // 中国区域
-        "language": "zh",     // 中文
+        "metadata.region":   "china",  // 中国区域
+        "metadata.language": "zh",     // 中文
     }),
     // Runner 级复杂条件过滤器
     agent.WithKnowledgeConditionedFilter(
-        searchfilter.GreaterThan("priority", 5), // 优先级大于 5
+        searchfilter.GreaterThan("metadata.priority", 5), // 优先级大于 5
     ),
 )
 
 // 3. LLM 智能过滤器（由 LLM 动态生成）
-// 例如：用户问 "查找 API 相关文档"，LLM 可能生成 {"topic": "api"}
+// 例如：用户问 "查找 API 相关文档"，LLM 可能生成 {"field": "metadata.topic", "value": "api"}
 
 // 最终生效的过滤条件（所有条件通过 AND 组合）：
-// source = "official" AND 
-// category = "documentation" AND 
-// status = "published" AND
-// region = "china" AND 
-// language = "zh" AND 
-// priority > 5 AND
-// topic = "api"
+// metadata.source = "official" AND
+// metadata.category = "documentation" AND
+// metadata.status = "published" AND
+// metadata.region = "china" AND
+// metadata.language = "zh" AND
+// metadata.priority > 5 AND
+// metadata.topic = "api"
 //
 // 即：必须同时满足所有层级的所有条件
 ```
@@ -798,13 +783,13 @@ searchTool := tool.NewKnowledgeSearchTool(
     kb,
     // Agent 级元数据过滤器
     tool.WithFilter(map[string]any{
-        "source": "official",
+        "metadata.source": "official",
     }),
-    // Agent 级复杂条件过滤器
+    // Agent 级复杂条件过滤器（元数据字段使用 metadata. 前缀）
     tool.WithConditionedFilter(
         searchfilter.Or(
-            searchfilter.Equal("topic", "programming"),
-            searchfilter.Equal("topic", "llm"),
+            searchfilter.Equal("metadata.topic", "programming"),
+            searchfilter.Equal("metadata.topic", "llm"),
         ),
     ),
 )
@@ -816,35 +801,39 @@ llmAgent := llmagent.New(
 )
 
 // 最终过滤条件：
-// source = "official" AND (topic = "programming" OR topic = "llm")
+// metadata.source = "official" AND (metadata.topic = "programming" OR metadata.topic = "llm")
 // 即：必须是官方来源，且主题是编程或 LLM
 ```
 
 ##### 常用过滤器辅助函数
 
 ```go
-// 比较操作符
-searchfilter.Equal(field, value)              // field = value
-searchfilter.NotEqual(field, value)           // field != value
-searchfilter.GreaterThan(field, value)        // field > value
-searchfilter.GreaterThanOrEqual(field, value) // field >= value
-searchfilter.LessThan(field, value)           // field < value
-searchfilter.LessThanOrEqual(field, value)    // field <= value
-searchfilter.In(field, values...)             // field IN (...)
-searchfilter.NotIn(field, values...)          // field NOT IN (...)
-searchfilter.Like(field, pattern)             // field LIKE pattern
-searchfilter.Between(field, min, max)         // field BETWEEN min AND max
+// 比较操作符（注意：元数据字段需要 metadata. 前缀）
+searchfilter.Equal("metadata.topic", value)              // metadata.topic = value
+searchfilter.NotEqual("metadata.status", value)          // metadata.status != value
+searchfilter.GreaterThan("metadata.priority", value)     // metadata.priority > value
+searchfilter.GreaterThanOrEqual("metadata.score", value) // metadata.score >= value
+searchfilter.LessThan("metadata.age", value)             // metadata.age < value
+searchfilter.LessThanOrEqual("metadata.level", value)    // metadata.level <= value
+searchfilter.In("metadata.category", values...)          // metadata.category IN (...)
+searchfilter.NotIn("metadata.type", values...)           // metadata.type NOT IN (...)
+searchfilter.Like("metadata.title", pattern)             // metadata.title LIKE pattern
+searchfilter.Between("metadata.date", min, max)          // metadata.date BETWEEN min AND max
+
+// 自定义表字段（通过 WithDocBuilder 添加的额外列）不需要前缀
+searchfilter.NotEqual("status", "deleted")               // status != "deleted"
+searchfilter.GreaterThanOrEqual("priority", 3)           // priority >= 3
 
 // 逻辑操作符
 searchfilter.And(conditions...)               // AND 组合
 searchfilter.Or(conditions...)                // OR 组合
 
-// 嵌套示例：(status = 'published') AND (category = 'doc' OR category = 'tutorial')
+// 嵌套示例：(metadata.status = 'published') AND (metadata.category = 'doc' OR metadata.category = 'tutorial')
 searchfilter.And(
-    searchfilter.Equal("status", "published"),
+    searchfilter.Equal("metadata.status", "published"),
     searchfilter.Or(
-        searchfilter.Equal("category", "documentation"),
-        searchfilter.Equal("category", "tutorial"),
+        searchfilter.Equal("metadata.category", "documentation"),
+        searchfilter.Equal("metadata.category", "tutorial"),
     ),
 )
 ```
@@ -966,6 +955,8 @@ vectorStore, err := vectortcvector.New(
 - ⚠️ 仅适用于开发和测试
 
 ### 知识库管理功能
+
+> 📁 **示例代码**: [examples/knowledge/features/management](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge/features/management)
 
 Knowledge 系统提供了强大的知识库管理功能，支持动态源管理和智能同步机制。
 
@@ -1108,6 +1099,8 @@ kb := knowledge.New(
 
 ## 完整示例
 
+> 📁 **所有示例**: [examples/knowledge](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/knowledge)
+
 以下是一个完整的示例，展示了如何创建具有 Knowledge 访问能力的 Agent：
 
 ```go
@@ -1132,6 +1125,7 @@ import (
     geminiembedder "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/gemini"
     openaiembedder "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/openai"
 	ollamaembedder "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/ollama"
+	huggingfaceembedder "trpc.group/trpc-go/trpc-agent-go/knowledge/embedder/huggingface"
 
     // Source
     "trpc.group/trpc-go/trpc-agent-go/knowledge/source"
@@ -1145,11 +1139,14 @@ import (
     vectorinmemory "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/inmemory"
     vectorpgvector "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/pgvector"
     vectortcvector "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/tcvector"
+
+    // 如需支持 PDF 文件，需手动引入 PDF reader（独立 go.mod，避免引入不必要的第三方依赖）
+    // _ "trpc.group/trpc-go/trpc-agent-go/knowledge/document/reader/pdf"
 )
 
 func main() {
     var (
-        embedderType    = flag.String("embedder", "openai", "ollama", "embedder type (openai, gemini, ollama)")
+        embedderType    = flag.String("embedder", "openai", "ollama", "embedder type (openai, gemini, ollama,huggingface)")
         vectorStoreType = flag.String("vectorstore", "inmemory", "vector store type (inmemory, pgvector, tcvector)")
         modelName       = flag.String("model", "claude-4-sonnet-20250514", "Name of the model to use")
     )
@@ -1173,6 +1170,8 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to create ollama embedder: %v", err)
         }
+	case "huggingface":
+		embedder = huggingfaceembedder.New()
     default: // openai
         embedder = openaiembedder.New(
             openaiembedder.WithModel(getEnvOrDefault("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")),
@@ -1396,7 +1395,7 @@ go run main.go -embedder openai -vectorstore tcvector
 go run main.go -embedder openai -vectorstore elasticsearch -es-version v9
 
 # 参数说明：
-# -embedder: 选择 embedder 类型 (openai, gemini, ollama)， 默认为 openai
+# -embedder: 选择 embedder 类型 (openai, gemini, ollama,huggingface)， 默认为 openai
 # -vectorstore: 选择向量存储类型 (inmemory, pgvector, tcvector, elasticsearch)，默认为 inmemory
 # -es-version: 指定 Elasticsearch 版本 (v7, v8, v9)，仅当 vectorstore=elasticsearch 时有效
 ```
@@ -1479,3 +1478,15 @@ go run main.go -embedder openai -vectorstore elasticsearch -es-version v9
      - 确认文件存在且后缀受支持（.md/.txt/.pdf/.csv/.json/.docx 等）；
      - 目录源是否需要 `WithRecursive(true)`；
      - 使用 `WithFileExtensions` 做白名单过滤。
+
+7. **PDF 文件读取支持**
+
+   - 说明：由于 PDF reader 依赖第三方库，为避免主模块引入不必要的依赖，PDF reader 采用独立 `go.mod` 管理。
+   - 使用方式：如需支持 PDF 文件读取，需在代码中手动引入 PDF reader 包进行注册：
+     ```go
+     import (
+         // 引入 PDF reader 以支持 .pdf 文件解析
+         _ "trpc.group/trpc-go/trpc-agent-go/knowledge/document/reader/pdf"
+     )
+     ```
+   - 注意：其他格式（.txt/.md/.csv/.json 等）的 reader 已自动注册，无需手动引入。

@@ -22,476 +22,43 @@ import (
 	sdktrace "go.opentelemetry.io/otel/trace"
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
-	"trpc.group/trpc-go/trpc-agent-go/agent/llmagent/internal/jsonschema"
 	"trpc.group/trpc-go/trpc-agent-go/codeexecutor"
+	localexec "trpc.group/trpc-go/trpc-agent-go/codeexecutor/local"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/internal/flow"
 	"trpc.group/trpc-go/trpc-agent-go/internal/flow/llmflow"
 	"trpc.group/trpc-go/trpc-agent-go/internal/flow/processor"
 	itelemetry "trpc.group/trpc-go/trpc-agent-go/internal/telemetry"
 	itool "trpc.group/trpc-go/trpc-agent-go/internal/tool"
-	"trpc.group/trpc-go/trpc-agent-go/knowledge"
-	"trpc.group/trpc-go/trpc-agent-go/knowledge/searchfilter"
 	knowledgetool "trpc.group/trpc-go/trpc-agent-go/knowledge/tool"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/planner"
 	"trpc.group/trpc-go/trpc-agent-go/telemetry/trace"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
+	toolskill "trpc.group/trpc-go/trpc-agent-go/tool/skill"
 	"trpc.group/trpc-go/trpc-agent-go/tool/transfer"
 )
 
-var defaultChannelBufferSize = 256
-
-const (
-	// defaultModelName is the model name used when only WithModel is set
-	// without WithModels.
-	defaultModelName = "__default__"
-
-	// BranchFilterModePrefix Prefix matching pattern
-	BranchFilterModePrefix = processor.BranchFilterModePrefix
-	// BranchFilterModeAll include all
-	BranchFilterModeAll = processor.BranchFilterModeAll
-	// BranchFilterModeExact exact match
-	BranchFilterModeExact = processor.BranchFilterModeExact
-
-	// TimelineFilterAll includes all historical message records
-	// Suitable for scenarios requiring full conversation context
-	TimelineFilterAll = processor.TimelineFilterAll
-	// TimelineFilterCurrentRequest only includes messages within the current request cycle
-	// Filters out previous historical records, keeping only messages related to this request
-	TimelineFilterCurrentRequest = processor.TimelineFilterCurrentRequest
-	// TimelineFilterCurrentInvocation only includes messages within the current invocation session
-	// Suitable for scenarios requiring isolation between different invocation cycles in long-running sessions
-	TimelineFilterCurrentInvocation = processor.TimelineFilterCurrentInvocation
-)
-
-// Option is a function that configures an LLMAgent.
-type Option func(*Options)
-
-// WithModel sets the model to use.
-func WithModel(model model.Model) Option {
-	return func(opts *Options) {
-		opts.Model = model
-	}
-}
-
-// WithModels registers a map of models that can be switched by name.
-// The map key is the model name, and the value is the model.Model instance.
-// If both WithModel and WithModels are set, WithModel specifies the initial
-// model. If only WithModels is set, the first model in the map will be used
-// as the initial model (note: map iteration order is not guaranteed).
-func WithModels(models map[string]model.Model) Option {
-	return func(opts *Options) {
-		opts.Models = models
-	}
-}
-
-// WithDescription sets the description of the agent.
-func WithDescription(description string) Option {
-	return func(opts *Options) {
-		opts.Description = description
-	}
-}
-
-// WithInstruction sets the instruction of the agent.
-func WithInstruction(instruction string) Option {
-	return func(opts *Options) {
-		opts.Instruction = instruction
-	}
-}
-
-// WithGlobalInstruction sets the global instruction of the agent.
-func WithGlobalInstruction(instruction string) Option {
-	return func(opts *Options) {
-		opts.GlobalInstruction = instruction
-	}
-}
-
-// WithGenerationConfig sets the generation configuration.
-func WithGenerationConfig(config model.GenerationConfig) Option {
-	return func(opts *Options) {
-		opts.GenerationConfig = config
-	}
-}
-
-// WithChannelBufferSize sets the buffer size for event channels.
-func WithChannelBufferSize(size int) Option {
-	return func(opts *Options) {
-		opts.ChannelBufferSize = size
-	}
-}
-
-// WithCodeExecutor sets the code executor to use for executing code blocks.
-func WithCodeExecutor(ce codeexecutor.CodeExecutor) Option {
-	return func(opts *Options) {
-		opts.codeExecutor = ce
-	}
-}
-
-// WithTools sets the list of tools available to the agent.
-func WithTools(tools []tool.Tool) Option {
-	return func(opts *Options) {
-		opts.Tools = tools
-	}
-}
-
-// WithToolSets sets the list of tool sets available to the agent.
-func WithToolSets(toolSets []tool.ToolSet) Option {
-	return func(opts *Options) {
-		opts.ToolSets = toolSets
-	}
-}
-
-// WithPlanner sets the planner to use for planning instructions.
-func WithPlanner(planner planner.Planner) Option {
-	return func(opts *Options) {
-		opts.Planner = planner
-	}
-}
-
-// WithSubAgents sets the list of sub-agents available to the agent.
-func WithSubAgents(subAgents []agent.Agent) Option {
-	return func(opts *Options) {
-		opts.SubAgents = subAgents
-	}
-}
-
-// WithAgentCallbacks sets the agent callbacks.
-func WithAgentCallbacks(callbacks *agent.Callbacks) Option {
-	return func(opts *Options) {
-		opts.AgentCallbacks = callbacks
-	}
-}
-
-// WithModelCallbacks sets the model callbacks.
-func WithModelCallbacks(callbacks *model.Callbacks) Option {
-	return func(opts *Options) {
-		opts.ModelCallbacks = callbacks
-	}
-}
-
-// WithToolCallbacks sets the tool callbacks.
-func WithToolCallbacks(callbacks *tool.Callbacks) Option {
-	return func(opts *Options) {
-		opts.ToolCallbacks = callbacks
-	}
-}
-
-// WithKnowledge sets the knowledge base for the agent.
-// If provided, the knowledge search tool will be automatically added to the agent's tools.
-func WithKnowledge(kb knowledge.Knowledge) Option {
-	return func(opts *Options) {
-		opts.Knowledge = kb
-	}
-}
-
-// WithOutputKey sets the key in session state to store the output of the agent.
-func WithOutputKey(outputKey string) Option {
-	return func(opts *Options) {
-		opts.OutputKey = outputKey
-	}
-}
-
-// WithOutputSchema sets the JSON schema for validating agent output.
-// When this is set, the agent can ONLY reply and CANNOT use any tools,
-// such as function tools, RAGs, agent transfer, etc.
-func WithOutputSchema(schema map[string]any) Option {
-	return func(opts *Options) {
-		opts.OutputSchema = schema
-	}
-}
-
-// WithInputSchema sets the JSON schema for validating agent input.
-// When this is set, the agent's input will be validated against this schema
-// when used as a tool or when receiving input from other agents.
-func WithInputSchema(schema map[string]any) Option {
-	return func(opts *Options) {
-		opts.InputSchema = schema
-	}
-}
-
-// WithAddNameToInstruction adds the agent name to the instruction if true.
-func WithAddNameToInstruction(addNameToInstruction bool) Option {
-	return func(opts *Options) {
-		opts.AddNameToInstruction = addNameToInstruction
-	}
-}
-
-// WithEnableParallelTools enables parallel tool execution if set to true.
-// By default, tools execute serially for safety and compatibility.
-func WithEnableParallelTools(enable bool) Option {
-	return func(opts *Options) {
-		opts.EnableParallelTools = enable
-	}
-}
-
-// WithDefaultTransferMessage configures the default message used when the model
-// calls a sub-agent without providing a message. If msg is an empty string,
-// the default message injection is disabled; if non-empty, it is enabled and msg is used.
-func WithDefaultTransferMessage(msg string) Option {
-	return func(opts *Options) {
-		opts.DefaultTransferMessage = &msg
-	}
-}
-
-// WithStructuredOutputJSON sets a JSON schema structured output for normal runs.
-// The schema is constructed automatically from the provided example type.
-// Provide a typed zero-value pointer like: new(MyStruct) or (*MyStruct)(nil) and we infer the type.
-func WithStructuredOutputJSON(examplePtr any, strict bool, description string) Option {
-	return func(opts *Options) {
-		// Infer reflect.Type from examplePtr.
-		var t reflect.Type
-		if examplePtr == nil {
-			return
-		}
-		if rt := reflect.TypeOf(examplePtr); rt.Kind() == reflect.Pointer {
-			t = rt
-		} else {
-			t = reflect.PointerTo(rt)
-		}
-		// Generate a robust JSON schema via the generator.
-		gen := jsonschema.New()
-		schema := gen.Generate(t.Elem())
-		name := t.Elem().Name()
-		opts.StructuredOutput = &model.StructuredOutput{
-			Type: model.StructuredOutputJSONSchema,
-			JSONSchema: &model.JSONSchemaConfig{
-				Name:        name,
-				Schema:      schema,
-				Strict:      strict,
-				Description: description,
-			},
-		}
-		opts.StructuredOutputType = t
-	}
-}
-
-// WithAddCurrentTime adds the current time to the system prompt if true.
-func WithAddCurrentTime(addCurrentTime bool) Option {
-	return func(opts *Options) {
-		opts.AddCurrentTime = addCurrentTime
-	}
-}
-
-// WithTimezone specifies the timezone to use for time display.
-func WithTimezone(timezone string) Option {
-	return func(opts *Options) {
-		opts.Timezone = timezone
-	}
-}
-
-// WithTimeFormat specifies the format for time display.
-// The format should be a valid Go time format string.
-// See https://pkg.go.dev/time#Time.Format for more details.
-func WithTimeFormat(timeFormat string) Option {
-	return func(opts *Options) {
-		opts.TimeFormat = timeFormat
-	}
-}
-
-// WithAddContextPrefix controls whether to add "For context:" prefix when converting foreign events.
-// When false, foreign agent events are passed directly without the prefix.
-// This is useful for chain agents where you want to pass formatted data between agents.
-func WithAddContextPrefix(addPrefix bool) Option {
-	return func(opts *Options) {
-		opts.AddContextPrefix = addPrefix
-	}
-}
-
-// WithAddSessionSummary controls whether to prepend the current-branch summary
-// as a system message in the request context when available.
-func WithAddSessionSummary(addSummary bool) Option {
-	return func(opts *Options) {
-		opts.AddSessionSummary = addSummary
-	}
-}
-
-// WithMaxHistoryRuns sets the maximum number of history messages when AddSessionSummary is false.
-// When 0 (default), no limit is applied.
-func WithMaxHistoryRuns(maxRuns int) Option {
-	return func(opts *Options) {
-		opts.MaxHistoryRuns = maxRuns
-	}
-}
-
-// WithPreserveSameBranch controls whether messages from the same invocation
-// branch lineage (ancestor/descendant) should preserve their original roles
-// instead of being rewritten into user context when used as history.
-// Default is true.
-func WithPreserveSameBranch(preserve bool) Option {
-	return func(opts *Options) {
-		opts.PreserveSameBranch = preserve
-	}
-}
-
-// WithKnowledgeFilter sets the metadata filter for the knowledge base.
-func WithKnowledgeFilter(filter map[string]any) Option {
-	return func(opts *Options) {
-		opts.KnowledgeFilter = filter
-	}
-}
-
-// WithKnowledgeConditionedFilter sets the complex condition filter for the knowledge base.
-func WithKnowledgeConditionedFilter(filter *searchfilter.UniversalFilterCondition) Option {
-	return func(opts *Options) {
-		opts.KnowledgeConditionedFilter = filter
-	}
-}
-
-// WithKnowledgeAgenticFilterInfo sets the knowledge agentic filter info for the knowledge base.
-func WithKnowledgeAgenticFilterInfo(filter map[string][]any) Option {
-	return func(opts *Options) {
-		opts.AgenticFilterInfo = filter
-	}
-}
-
-// WithEnableKnowledgeAgenticFilter sets whether enable llm generate filter for the knowledge base.
-func WithEnableKnowledgeAgenticFilter(agenticFilter bool) Option {
-	return func(opts *Options) {
-		opts.EnableKnowledgeAgenticFilter = agenticFilter
-	}
-}
-
-// WithEndInvocationAfterTransfer sets whether end invocation after transfer.
-func WithEndInvocationAfterTransfer(end bool) Option {
-	return func(opts *Options) {
-		opts.EndInvocationAfterTransfer = end
-	}
-}
-
-// WithMessageTimelineFilterMode sets the message timeline filter mode.
-func WithMessageTimelineFilterMode(mode string) Option {
-	return func(opts *Options) {
-		opts.messageTimelineFilterMode = mode
-	}
-}
-
-// WithMessageBranchFilterMode sets the message branch filter mode.
-func WithMessageBranchFilterMode(mode string) Option {
-	return func(opts *Options) {
-		opts.messageBranchFilterMode = mode
-	}
-}
-
-// Options contains configuration options for creating an LLMAgent.
-type Options struct {
-	// Name is the name of the agent.
-	Name string
-	// Model is the model to use for generating responses.
-	Model model.Model
-	// Models is a map of models that can be switched by name at runtime.
-	Models map[string]model.Model
-	// Description is a description of the agent.
-	Description string
-	// Instruction is the instruction for the agent.
-	Instruction string
-	// GlobalInstruction is the global instruction for the agent.
-	// It will be used for all agents in the agent tree.
-	GlobalInstruction string
-	// GenerationConfig contains the generation configuration.
-	GenerationConfig model.GenerationConfig
-	// ChannelBufferSize is the buffer size for event channels (default: 256).
-	ChannelBufferSize int
-	codeExecutor      codeexecutor.CodeExecutor
-	// Tools is the list of tools available to the agent.
-	Tools []tool.Tool
-	// ToolSets is the list of tool sets available to the agent.
-	ToolSets []tool.ToolSet
-	// Planner is the planner to use for planning instructions.
-	Planner planner.Planner
-	// SubAgents is the list of sub-agents available to the agent.
-	SubAgents []agent.Agent
-	// AgentCallbacks contains callbacks for agent operations.
-	AgentCallbacks *agent.Callbacks
-	// ModelCallbacks contains callbacks for model operations.
-	ModelCallbacks *model.Callbacks
-	// ToolCallbacks contains callbacks for tool operations.
-	ToolCallbacks *tool.Callbacks
-	// Knowledge is the knowledge base for the agent.
-	// If provided, the knowledge search tool will be automatically added.
-	Knowledge knowledge.Knowledge
-	// KnowledgeFilter is the metadata filter for the knowledge search tool.
-	KnowledgeFilter map[string]any
-	// KnowledgeConditionedFilter is the complex condition filter for the knowledge search tool.
-	KnowledgeConditionedFilter *searchfilter.UniversalFilterCondition
-	// EnableKnowledgeAgenticFilter enables agentic filter mode for knowledge search.
-	// When true, allows the LLM to dynamically decide whether to pass filter parameters.
-	EnableKnowledgeAgenticFilter bool
-	// KnowledgeAgenticFilter is the knowledge agentic filter for the knowledge search tool.
-	AgenticFilterInfo map[string][]any
-	// AddNameToInstruction adds the agent name to the instruction if true.
-	AddNameToInstruction bool
-	// EnableParallelTools enables parallel tool execution if true.
-	// If false (default), tools will execute serially for safety.
-	EnableParallelTools bool
-	// AddCurrentTime adds the current time to the system prompt if true.
-	AddCurrentTime bool
-	// Timezone specifies the timezone to use for time display.
-	Timezone string
-	// TimeFormat specifies the format for time display.
-	TimeFormat string
-	// OutputKey is the key in session state to store the output of the agent.
-	OutputKey string
-	// OutputSchema is the JSON schema for validating agent output.
-	// When this is set, the agent can ONLY reply and CANNOT use any tools.
-	OutputSchema map[string]any
-	// InputSchema is the JSON schema for validating agent input.
-	// When this is set, the agent's input will be validated against this schema
-	// when used as a tool or when receiving input from other agents.
-	InputSchema map[string]any
-	// AddContextPrefix controls whether to add "For context:" prefix when converting foreign events.
-	// When false, foreign agent events are passed directly without the prefix.
-	AddContextPrefix bool
-
-	// AddSessionSummary controls whether to prepend the current branch summary
-	// as a system message when available (default: false).
-	AddSessionSummary bool
-
-	// MaxHistoryRuns sets the maximum number of history messages when AddSessionSummary is false.
-	// When 0 (default), no limit is applied.
-	MaxHistoryRuns int
-
-	// PreserveSameBranch controls whether the content request processor
-	// should preserve original roles (assistant/tool) for events that
-	// belong to the same invocation branch lineage (ancestor/descendant).
-	// When true, messages emitted within the same branch tree will not be
-	// rewritten into user context, keeping their original roles intact.
-	// Default is true (correct-by-default for multi-agent flows).
-	PreserveSameBranch bool
-	// StructuredOutput defines how the model should produce structured output in normal runs.
-	StructuredOutput *model.StructuredOutput
-	// StructuredOutputType is the reflect.Type of the example pointer used to generate the schema.
-	StructuredOutputType reflect.Type
-	// EndInvocationAfterTransfer controls whether to end the current agent invocation after transfer.
-	// If true, the current agent will end the invocation after transfer, else the current agent will continue to run
-	// when the transfer is complete. Defaults to true.
-	EndInvocationAfterTransfer bool
-
-	// DefaultTransferMessage holds the message to inject when the model directly
-	// calls a sub-agent without providing a message. Configured via WithDefaultTransferMessage.
-	// Behavior:
-	//   - Not configured: use built-in default message.
-	//   - Configured with empty string: use built-in default message.
-	//   - Configured with non-empty: use the provided message.
-	DefaultTransferMessage *string
-
-	messageTimelineFilterMode string
-	messageBranchFilterMode   string
+// localruntimeFallback returns a simple local workspace executor used when
+// no explicit executor is provided.
+func defaultCodeExecutor() codeexecutor.CodeExecutor {
+	return localexec.New()
 }
 
 // LLMAgent is an agent that uses an LLM to generate responses.
 type LLMAgent struct {
-	name                 string
-	mu                   sync.RWMutex
-	model                model.Model
-	models               map[string]model.Model // Registered models for switching
-	description          string
-	instruction          string
-	systemPrompt         string
-	genConfig            model.GenerationConfig
-	flow                 flow.Flow
-	tools                []tool.Tool     // All tools (user tools + framework tools)
-	userToolNames        map[string]bool // Names of tools explicitly registered by user via WithTools and WithToolSets
+	name          string
+	mu            sync.RWMutex
+	model         model.Model
+	models        map[string]model.Model // Registered models for switching
+	description   string
+	instruction   string
+	systemPrompt  string
+	genConfig     model.GenerationConfig
+	flow          flow.Flow
+	tools         []tool.Tool     // All tools (user tools + framework tools)
+	userToolNames map[string]bool // Names of tools explicitly registered
+	// via WithTools and WithToolSets.
 	codeExecutor         codeexecutor.CodeExecutor
 	planner              planner.Planner
 	subAgents            []agent.Agent // Sub-agents that can be delegated to
@@ -501,17 +68,12 @@ type LLMAgent struct {
 	inputSchema          map[string]any // JSON schema for input validation
 	structuredOutput     *model.StructuredOutput
 	structuredOutputType reflect.Type
+	option               Options
 }
 
 // New creates a new LLMAgent with the given options.
 func New(name string, opts ...Option) *LLMAgent {
-	var options Options = Options{
-		ChannelBufferSize:          defaultChannelBufferSize,
-		EndInvocationAfterTransfer: true,
-		// Default to preserving same-branch lineage so assistant/tool roles
-		// from parent/child branches are retained for downstream agents.
-		PreserveSameBranch: true,
-	}
+	options := defaultOptions
 
 	// Apply function options.
 	for _, opt := range opts {
@@ -558,6 +120,7 @@ func New(name string, opts ...Option) *LLMAgent {
 		inputSchema:          options.InputSchema,
 		structuredOutput:     options.StructuredOutput,
 		structuredOutputType: options.StructuredOutputType,
+		option:               options,
 	}
 
 	// Prepare request processors in the correct order, wiring dynamic getters.
@@ -671,14 +234,31 @@ func buildRequestProcessorsWithAgent(a *LLMAgent, options *Options) []flow.Reque
 		requestProcessors = append(requestProcessors, timeProcessor)
 	}
 
-	contentProcessor := processor.NewContentRequestProcessor(
+	// 6. Skills processor - injects skill overview and loaded contents
+	// when a skills repository is configured. This ensures the model
+	// sees available skills (names/descriptions) and any loaded
+	// SKILL.md/doc texts before deciding on tool calls.
+	if options.SkillsRepository != nil {
+		skillsProcessor := processor.NewSkillsRequestProcessor(
+			options.SkillsRepository,
+		)
+		requestProcessors = append(requestProcessors, skillsProcessor)
+	}
+
+	// 7. Content processor - appends conversation/context history.
+	contentOpts := []processor.ContentOption{
 		processor.WithAddContextPrefix(options.AddContextPrefix),
 		processor.WithAddSessionSummary(options.AddSessionSummary),
 		processor.WithMaxHistoryRuns(options.MaxHistoryRuns),
 		processor.WithPreserveSameBranch(options.PreserveSameBranch),
 		processor.WithTimelineFilterMode(options.messageTimelineFilterMode),
 		processor.WithBranchFilterMode(options.messageBranchFilterMode),
-	)
+	}
+	if options.ReasoningContentMode != "" {
+		contentOpts = append(contentOpts,
+			processor.WithReasoningContentMode(options.ReasoningContentMode))
+	}
+	contentProcessor := processor.NewContentRequestProcessor(contentOpts...)
 	requestProcessors = append(requestProcessors, contentProcessor)
 
 	return requestProcessors
@@ -757,17 +337,21 @@ func registerTools(options *Options) ([]tool.Tool, map[string]bool) {
 	allTools := make([]tool.Tool, 0, len(options.Tools))
 	allTools = append(allTools, options.Tools...)
 
-	// Add tools from each toolset with automatic namespacing.
-	// Tools from WithToolSets are also user tools (user explicitly added them).
-	ctx := context.Background()
-	for _, toolSet := range options.ToolSets {
-		// Create named toolset wrapper to avoid name conflicts.
-		namedToolSet := itool.NewNamedToolSet(toolSet)
-		setTools := namedToolSet.Tools(ctx)
-		for _, t := range setTools {
-			allTools = append(allTools, t)
-			// Mark toolset tools as user tools.
-			userToolNames[t.Declaration().Name] = true
+	// Add tools from each toolset with automatic namespacing when using
+	// static ToolSets. Tools from WithToolSets are also user tools
+	// (user explicitly added them). When RefreshToolSetsOnRun is true,
+	// ToolSets are resolved on each Tools() call instead of here.
+	if !options.RefreshToolSetsOnRun {
+		ctx := context.Background()
+		for _, toolSet := range options.ToolSets {
+			// Create named toolset wrapper to avoid name conflicts.
+			namedToolSet := itool.NewNamedToolSet(toolSet)
+			setTools := namedToolSet.Tools(ctx)
+			for _, t := range setTools {
+				allTools = append(allTools, t)
+				// Mark toolset tools as user tools.
+				userToolNames[t.Declaration().Name] = true
+			}
 		}
 	}
 
@@ -797,6 +381,24 @@ func registerTools(options *Options) ([]tool.Tool, map[string]bool) {
 		}
 	}
 
+	// Add skill tools when skills are enabled.
+	if options.SkillsRepository != nil {
+		allTools = append(allTools,
+			toolskill.NewLoadTool(options.SkillsRepository))
+		// Specialized doc tools for clarity and control.
+		allTools = append(allTools,
+			toolskill.NewSelectDocsTool(options.SkillsRepository))
+		allTools = append(allTools,
+			toolskill.NewListDocsTool(options.SkillsRepository))
+		// Provide executor to skill_run, fallback to local.
+		exec := options.codeExecutor
+		if exec == nil {
+			exec = defaultCodeExecutor()
+		}
+		allTools = append(allTools,
+			toolskill.NewRunTool(options.SkillsRepository, exec))
+	}
+
 	return allTools, userToolNames
 }
 
@@ -808,7 +410,7 @@ func (a *LLMAgent) Run(ctx context.Context, invocation *agent.Invocation) (e <-c
 	ctx, span := trace.Tracer.Start(ctx, fmt.Sprintf("%s %s", itelemetry.OperationInvokeAgent, a.name))
 	itelemetry.TraceBeforeInvokeAgent(span, invocation, a.description, a.systemPrompt+a.instruction, &a.genConfig)
 
-	flowEventChan, err := a.executeAgentFlow(ctx, invocation)
+	ctx, flowEventChan, err := a.executeAgentFlow(ctx, invocation)
 	if err != nil {
 		// Check if this is a custom response error (early return)
 		var customErr *haveCustomResponseError
@@ -827,31 +429,37 @@ func (a *LLMAgent) Run(ctx context.Context, invocation *agent.Invocation) (e <-c
 }
 
 // executeAgentFlow executes the agent flow with before agent callbacks.
-// Returns the event channel and any error that occurred.
-func (a *LLMAgent) executeAgentFlow(ctx context.Context, invocation *agent.Invocation) (<-chan *event.Event, error) {
+// Returns the updated context, event channel, and any error that occurred.
+func (a *LLMAgent) executeAgentFlow(ctx context.Context, invocation *agent.Invocation) (context.Context, <-chan *event.Event, error) {
 	if a.agentCallbacks != nil {
-		customResponse, err := a.agentCallbacks.RunBeforeAgent(ctx, invocation)
+		result, err := a.agentCallbacks.RunBeforeAgent(ctx, &agent.BeforeAgentArgs{
+			Invocation: invocation,
+		})
 		if err != nil {
-			return nil, fmt.Errorf("before agent callback failed: %w", err)
+			return ctx, nil, fmt.Errorf("before agent callback failed: %w", err)
 		}
-		if customResponse != nil {
+		// Use the context from result if provided.
+		if result != nil && result.Context != nil {
+			ctx = result.Context
+		}
+		if result != nil && result.CustomResponse != nil {
 			// Create a channel that returns the custom response and then closes.
 			eventChan := make(chan *event.Event, 1)
 			// Create an event from the custom response.
-			customEvent := event.NewResponseEvent(invocation.InvocationID, invocation.AgentName, customResponse)
+			customEvent := event.NewResponseEvent(invocation.InvocationID, invocation.AgentName, result.CustomResponse)
 			agent.EmitEvent(ctx, invocation, eventChan, customEvent)
 			close(eventChan)
-			return nil, &haveCustomResponseError{EventChan: eventChan}
+			return ctx, nil, &haveCustomResponseError{EventChan: eventChan}
 		}
 	}
 
 	// Use the underlying flow to execute the agent logic.
 	flowEventChan, err := a.flow.Run(ctx, invocation)
 	if err != nil {
-		return nil, err
+		return ctx, nil, err
 	}
 
-	return flowEventChan, nil
+	return ctx, flowEventChan, nil
 
 }
 
@@ -895,6 +503,13 @@ func (a *LLMAgent) setupInvocation(invocation *agent.Invocation) {
 	// Propagate structured output configuration into invocation and request path.
 	invocation.StructuredOutputType = a.structuredOutputType
 	invocation.StructuredOutput = a.structuredOutput
+
+	// Propagate per-agent safety limits into the invocation. These limits are
+	// evaluated by the Invocation helpers (IncLLMCallCount / IncToolIteration)
+	// and enforced at the flow layer. When the values are <= 0, the helpers
+	// treat them as "no limit", preserving existing behavior.
+	invocation.MaxLLMCalls = a.option.MaxLLMCalls
+	invocation.MaxToolIterations = a.option.MaxToolIterations
 }
 
 // wrapEventChannel wraps the event channel to apply after agent callbacks.
@@ -904,9 +519,11 @@ func (a *LLMAgent) wrapEventChannel(
 	originalChan <-chan *event.Event,
 	span sdktrace.Span,
 ) <-chan *event.Event {
-	wrappedChan := make(chan *event.Event, 256) // Use default buffer size
+	// Create a new channel with the same capacity as the original channel
+	wrappedChan := make(chan *event.Event, cap(originalChan))
 
-	go func() {
+	runCtx := agent.CloneContext(ctx)
+	go func(ctx context.Context) {
 		var fullRespEvent *event.Event
 		tokenUsage := &itelemetry.TokenUsage{}
 		defer func() {
@@ -920,12 +537,12 @@ func (a *LLMAgent) wrapEventChannel(
 		// Forward all events from the original channel
 		for evt := range originalChan {
 			if evt != nil && evt.Response != nil {
-				if evt.Response.Usage != nil {
-					tokenUsage.PromptTokens += evt.Response.Usage.PromptTokens
-					tokenUsage.CompletionTokens += evt.Response.Usage.CompletionTokens
-					tokenUsage.TotalTokens += evt.Response.Usage.TotalTokens
-				}
 				if !evt.Response.IsPartial {
+					if evt.Response.Usage != nil {
+						tokenUsage.PromptTokens += evt.Response.Usage.PromptTokens
+						tokenUsage.CompletionTokens += evt.Response.Usage.CompletionTokens
+						tokenUsage.TotalTokens += evt.Response.Usage.TotalTokens
+					}
 					fullRespEvent = evt
 				}
 
@@ -935,9 +552,23 @@ func (a *LLMAgent) wrapEventChannel(
 			}
 		}
 
+		// Collect error from the final response event.
+		var agentErr error
+		if fullRespEvent != nil && fullRespEvent.Response != nil && fullRespEvent.Response.Error != nil {
+			agentErr = fmt.Errorf("%s: %s", fullRespEvent.Response.Error.Type, fullRespEvent.Response.Error.Message)
+		}
+
 		// After all events are processed, run after agent callbacks
 		if a.agentCallbacks != nil {
-			customResponse, err := a.agentCallbacks.RunAfterAgent(ctx, invocation, nil)
+			result, err := a.agentCallbacks.RunAfterAgent(ctx, &agent.AfterAgentArgs{
+				Invocation:        invocation,
+				Error:             agentErr,
+				FullResponseEvent: fullRespEvent,
+			})
+			// Use the context from result if provided.
+			if result != nil && result.Context != nil {
+				ctx = result.Context
+			}
 			var evt *event.Event
 			if err != nil {
 				// Send error event.
@@ -947,9 +578,9 @@ func (a *LLMAgent) wrapEventChannel(
 					agent.ErrorTypeAgentCallbackError,
 					err.Error(),
 				)
-			} else if customResponse != nil {
+			} else if result != nil && result.CustomResponse != nil {
 				// Create an event from the custom response.
-				evt = event.NewResponseEvent(invocation.InvocationID, invocation.AgentName, customResponse)
+				evt = event.NewResponseEvent(invocation.InvocationID, invocation.AgentName, result.CustomResponse)
 			}
 			if evt != nil {
 				fullRespEvent = evt
@@ -957,7 +588,7 @@ func (a *LLMAgent) wrapEventChannel(
 
 			agent.EmitEvent(ctx, invocation, wrappedChan, evt)
 		}
-	}()
+	}(runCtx)
 
 	return wrappedChan
 }
@@ -973,31 +604,79 @@ func (a *LLMAgent) Info() agent.Info {
 	}
 }
 
-// Tools implements the agent.Agent interface.
-// It returns the list of tools available to the agent, including transfer tools.
-func (a *LLMAgent) Tools() []tool.Tool {
-	if len(a.subAgents) == 0 {
-		return a.tools
+// getAllToolsLocked builds the full tool list.
+// It combines user tools with framework tools like transfer_to_agent
+// under the caller's read lock. It always returns a fresh slice so
+// callers can safely use it after releasing the lock without data
+// races.
+func (a *LLMAgent) getAllToolsLocked() []tool.Tool {
+	base := make([]tool.Tool, len(a.tools))
+	copy(base, a.tools)
+
+	// When RefreshToolSetsOnRun is enabled, rebuild tools from ToolSets
+	// on each call to keep ToolSet-provided tools in sync with their
+	// underlying dynamic source (for example, MCP ListTools).
+	if a.option.RefreshToolSetsOnRun && len(a.option.ToolSets) > 0 {
+		ctx := context.Background()
+
+		dynamic := make([]tool.Tool, 0)
+		for _, toolSet := range a.option.ToolSets {
+			namedToolSet := itool.NewNamedToolSet(toolSet)
+			setTools := namedToolSet.Tools(ctx)
+			dynamic = append(dynamic, setTools...)
+		}
+
+		if len(dynamic) > 0 {
+			combined := make([]tool.Tool, 0, len(base)+len(dynamic))
+			combined = append(combined, base...)
+			combined = append(combined, dynamic...)
+			base = combined
+		}
 	}
 
-	// Create agent info for sub-agents.
+	if len(a.subAgents) == 0 {
+		return base
+	}
+
 	agentInfos := make([]agent.Info, len(a.subAgents))
 	for i, subAgent := range a.subAgents {
 		agentInfos[i] = subAgent.Info()
 	}
 
 	transferTool := transfer.New(agentInfos)
-	return append(a.tools, transferTool)
+	return append(base, transferTool)
+}
+
+// Tools implements the agent.Agent interface.
+// It returns the list of tools available to the agent, including
+// transfer tools.
+func (a *LLMAgent) Tools() []tool.Tool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	return a.getAllToolsLocked()
 }
 
 // SubAgents returns the list of sub-agents for this agent.
 func (a *LLMAgent) SubAgents() []agent.Agent {
-	return a.subAgents
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if len(a.subAgents) == 0 {
+		return nil
+	}
+
+	subAgents := make([]agent.Agent, len(a.subAgents))
+	copy(subAgents, a.subAgents)
+	return subAgents
 }
 
 // FindSubAgent finds a sub-agent by name.
 // Returns nil if no sub-agent with the given name is found.
 func (a *LLMAgent) FindSubAgent(name string) agent.Agent {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
 	for _, subAgent := range a.subAgents {
 		if subAgent.Info().Name == name {
 			return subAgent
@@ -1006,27 +685,95 @@ func (a *LLMAgent) FindSubAgent(name string) agent.Agent {
 	return nil
 }
 
-// UserTools returns the list of tools that were explicitly registered by the user
-// via WithTools and WithToolSets options.
+// UserTools returns the list of tools that were explicitly registered
+// by the user via WithTools and WithToolSets options.
 //
 // User tools (can be filtered):
 //   - Tools registered via WithTools
 //   - Tools registered via WithToolSets
 //
 // Framework tools (never filtered, not included in this list):
-//   - knowledge_search / agentic_knowledge_search (auto-added when WithKnowledge is set)
+//   - knowledge_search / agentic_knowledge_search (auto-added when
+//     WithKnowledge is set)
 //   - transfer_to_agent (auto-added when WithSubAgents is set)
 //
-// This method is used by the tool filtering logic to distinguish user tools from framework tools.
+// This method is used by the tool filtering logic to distinguish user
+// tools from framework tools.
 func (a *LLMAgent) UserTools() []tool.Tool {
-	// Filter user tools from all tools
-	userTools := make([]tool.Tool, 0, len(a.userToolNames))
-	for _, t := range a.tools {
-		if a.userToolNames[t.Declaration().Name] {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	// When ToolSets are static, user tool tracking is based on the
+	// snapshot captured at construction time.
+	if !a.option.RefreshToolSetsOnRun {
+		userTools := make([]tool.Tool, 0, len(a.userToolNames))
+		for _, t := range a.tools {
+			if a.userToolNames[t.Declaration().Name] {
+				userTools = append(userTools, t)
+			}
+		}
+		return userTools
+	}
+
+	// When ToolSets are refreshed on each run, user tools include:
+	//   - Tools from WithTools (tracked in userToolNames)
+	//   - Tools coming from ToolSets (wrapped as NamedTool).
+	// Framework tools (knowledge_search, transfer_to_agent, etc.)
+	// remain excluded.
+	allTools := a.getAllToolsLocked()
+	userTools := make([]tool.Tool, 0, len(allTools))
+
+	for _, t := range allTools {
+		name := t.Declaration().Name
+
+		if a.userToolNames[name] {
+			userTools = append(userTools, t)
+			continue
+		}
+
+		if _, ok := t.(*itool.NamedTool); ok {
 			userTools = append(userTools, t)
 		}
 	}
+
 	return userTools
+}
+
+// FilterTools filters the list of tools based on the provided filter
+// function.
+func (a *LLMAgent) FilterTools(ctx context.Context) []tool.Tool {
+	a.mu.RLock()
+	tools := a.getAllToolsLocked()
+	userToolNames := make(map[string]bool, len(a.userToolNames))
+	for name, isUser := range a.userToolNames {
+		userToolNames[name] = isUser
+	}
+	refreshToolSets := a.option.RefreshToolSetsOnRun
+	filter := a.option.toolFilter
+	a.mu.RUnlock()
+
+	filtered := make([]tool.Tool, 0, len(tools))
+	for _, t := range tools {
+		name := t.Declaration().Name
+		isUser := userToolNames[name]
+
+		if refreshToolSets {
+			if _, ok := t.(*itool.NamedTool); ok {
+				isUser = true
+			}
+		}
+
+		if !isUser {
+			filtered = append(filtered, t)
+			continue
+		}
+
+		if filter == nil || filter(ctx, t) {
+			filtered = append(filtered, t)
+		}
+	}
+
+	return filtered
 }
 
 // CodeExecutor returns the code executor used by this agent.
@@ -1034,6 +781,101 @@ func (a *LLMAgent) UserTools() []tool.Tool {
 // This allows the agent to execute code blocks in different environments.
 func (a *LLMAgent) CodeExecutor() codeexecutor.CodeExecutor {
 	return a.codeExecutor
+}
+
+// SetSubAgents replaces the sub-agents for this agent in a
+// concurrency-safe way. This enables dynamic sub-agent discovery from
+// registries without recreating the agent instance.
+func (a *LLMAgent) SetSubAgents(subAgents []agent.Agent) {
+	a.mu.Lock()
+	a.subAgents = subAgents
+	a.mu.Unlock()
+}
+
+// refreshToolsLocked recomputes the aggregated tool list and user tool
+// tracking map from the current options. Caller must hold a.mu.Lock.
+func (a *LLMAgent) refreshToolsLocked() {
+	tools, userToolNames := registerTools(&a.option)
+	a.tools = tools
+	a.userToolNames = userToolNames
+}
+
+// AddToolSet adds or replaces a tool set at runtime in a
+// concurrency-safe way. If another ToolSet with the same Name()
+// already exists, it will be replaced. Subsequent invocations see the
+// updated tool list without recreating the agent.
+func (a *LLMAgent) AddToolSet(toolSet tool.ToolSet) {
+	if toolSet == nil {
+		return
+	}
+
+	name := toolSet.Name()
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	replaced := false
+	for i, ts := range a.option.ToolSets {
+		if name != "" && ts.Name() == name {
+			a.option.ToolSets[i] = toolSet
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		a.option.ToolSets = append(a.option.ToolSets, toolSet)
+	}
+
+	a.refreshToolsLocked()
+}
+
+// RemoveToolSet removes all tool sets whose Name() matches the given
+// name. It returns true if at least one ToolSet was removed. Tools
+// from the removed tool sets will no longer be exposed on future
+// invocations.
+func (a *LLMAgent) RemoveToolSet(name string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if len(a.option.ToolSets) == 0 {
+		return false
+	}
+
+	dst := a.option.ToolSets[:0]
+	removed := false
+	for _, ts := range a.option.ToolSets {
+		if ts.Name() == name {
+			removed = true
+			continue
+		}
+		dst = append(dst, ts)
+	}
+	if !removed {
+		return false
+	}
+	a.option.ToolSets = dst
+
+	a.refreshToolsLocked()
+
+	return true
+}
+
+// SetToolSets replaces the agent ToolSets with the provided slice in a
+// concurrency-safe way. Subsequent invocations will see tools from
+// exactly these ToolSets plus framework tools (knowledge, skills).
+func (a *LLMAgent) SetToolSets(toolSets []tool.ToolSet) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if len(toolSets) == 0 {
+		a.option.ToolSets = nil
+	} else {
+		copied := make([]tool.ToolSet, len(toolSets))
+		copy(copied, toolSets)
+		a.option.ToolSets = copied
+	}
+
+	a.refreshToolsLocked()
 }
 
 // SetModel sets the model for this agent in a concurrency-safe way.

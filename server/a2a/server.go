@@ -35,7 +35,8 @@ import (
 // New creates a new a2a server.
 func New(opts ...Option) (*a2a.A2AServer, error) {
 	options := &options{
-		errorHandler: defaultErrorHandler,
+		errorHandler:     defaultErrorHandler,
+		adkCompatibility: true, // Enable ADK compatibility by default
 	}
 	for _, opt := range opts {
 		opt(options)
@@ -96,7 +97,7 @@ func buildProcessor(agent agent.Agent, sessionService session.Service, options *
 
 	eventToA2AConverter := options.eventToA2AConverter
 	if eventToA2AConverter == nil {
-		eventToA2AConverter = &defaultEventToA2AMessage{}
+		eventToA2AConverter = &defaultEventToA2AMessage{adkCompatibility: options.adkCompatibility}
 	}
 
 	return &messageProcessor{
@@ -105,6 +106,8 @@ func buildProcessor(agent agent.Agent, sessionService session.Service, options *
 		eventToA2AConverter: eventToA2AConverter,
 		errorHandler:        options.errorHandler,
 		debugLogging:        options.debugLogging,
+		adkCompatibility:    options.adkCompatibility,
+		agentName:           agentName,
 	}
 }
 
@@ -197,6 +200,8 @@ type messageProcessor struct {
 	eventToA2AConverter EventToA2AMessage
 	errorHandler        ErrorHandler
 	debugLogging        bool
+	adkCompatibility    bool
+	agentName           string
 }
 
 func isFinalStreamingEvent(evt *event.Event) bool {
@@ -204,22 +209,9 @@ func isFinalStreamingEvent(evt *event.Event) bool {
 		return false
 	}
 
-	rsp := evt.Response
-	if !rsp.Done {
-		return false
-	}
-
-	if rsp.IsToolCallResponse() || rsp.IsToolResultResponse() {
-		return false
-	}
-
-	for _, choice := range rsp.Choices {
-		if choice.Message.Role == model.RoleTool || len(choice.Message.ToolCalls) > 0 || choice.Message.ToolID != "" {
-			return false
-		}
-	}
-
-	return true
+	// The only truly final event is runner.completion
+	// This ensures we don't miss postprocessing events (code execution, etc.)
+	return evt.IsRunnerCompletion()
 }
 
 // handleDefaultError provides a fallback error handling mechanism
@@ -230,7 +222,12 @@ func (m *messageProcessor) handleError(
 	err error,
 ) (*taskmanager.MessageProcessingResult, error) {
 	if m.debugLogging {
-		log.Debugf("handling error: req msg id: %s, error: %v", msg.MessageID, err)
+		log.DebugfContext(
+			ctx,
+			"handling error: req msg id: %s, error: %v",
+			msg.MessageID,
+			err,
+		)
 	}
 
 	errMsg, handlerErr := m.errorHandler(ctx, msg, err)
@@ -255,17 +252,23 @@ func (m *messageProcessor) handleStreamingProcessingError(
 ) error {
 	if m.debugLogging {
 		msgJson, _ := json.Marshal(msg)
-		log.Debugf("handling error: req msg id: %s, error: %v, msg: %s", msg.MessageID, err, string(msgJson))
+		log.DebugfContext(
+			ctx,
+			"handling error: req msg id: %s, error: %v, msg: %s",
+			msg.MessageID,
+			err,
+			string(msgJson),
+		)
 	}
 
 	errMsg, err := m.errorHandler(ctx, msg, err)
 	if err != nil {
-		log.Warnf("handle streaming processing error: %v", err)
+		log.WarnfContext(ctx, "handle streaming processing error: %v", err)
 		return err
 	}
 
 	if err := subscriber.Send(protocol.StreamingMessageEvent{Result: errMsg}); err != nil {
-		log.Errorf("failed to send error message: %v", err)
+		log.ErrorfContext(ctx, "failed to send error message: %v", err)
 		return fmt.Errorf("failed to send error message: %w", err)
 	}
 	return nil
@@ -280,33 +283,58 @@ func (m *messageProcessor) ProcessMessage(
 ) (*taskmanager.MessageProcessingResult, error) {
 	if m.debugLogging {
 		msgJson, _ := json.Marshal(message)
-		log.Debugf("received A2A message: msg id: %s, message: %s", message.MessageID, string(msgJson))
+		log.DebugfContext(
+			ctx,
+			"received A2A message: msg id: %s, message: %s",
+			message.MessageID,
+			string(msgJson),
+		)
 	}
 
 	user, ok := ctx.Value(auth.AuthUserKey).(*auth.User)
 	if !ok {
-		log.Warn("a2aserver: user is nil")
+		log.WarnContext(ctx, "a2aserver: user is nil")
 		return m.handleError(ctx, &message, options.Streaming, errors.New("a2aserver: user is nil"))
 	}
 	if message.ContextID == nil {
 		// It should not reach here, if client transfers an empty ctx id, trpc-a2a-go will generate one
-		log.Warnf("a2aserver: context id not exists")
+		log.WarnfContext(ctx, "a2aserver: context id not exists")
 		return m.handleError(ctx, &message, options.Streaming, errors.New("context id not exists"))
 	}
 
-	userID := user.ID
 	ctxID := *message.ContextID
+
+	// Get user ID from auth context, or generate from context ID if not available
+	// This follows ADK pattern: use auth user if available, otherwise use A2A_USER_{context_id}
+	userID := user.ID
+	if userID == "" {
+		userID = fmt.Sprintf("A2A_USER_%s", ctxID)
+		log.DebugfContext(
+			ctx,
+			"UserID not set in auth context, using generated ID from context: %s",
+			userID,
+		)
+	}
 
 	// Convert A2A message to agent message
 	agentMsg, err := m.a2aToAgentConverter.ConvertToAgentMessage(ctx, message)
 	if err != nil {
-		log.Errorf("failed to convert A2A message to agent message: %v", err)
+		log.ErrorfContext(
+			ctx,
+			"failed to convert A2A message to agent message: %v",
+			err,
+		)
 		return m.handleError(ctx, &message, options.Streaming, err)
 	}
 
 	if m.debugLogging {
 		agentMsgJson, _ := json.Marshal(agentMsg)
-		log.Debugf("converted A2A message to agent message: id: %s, message: %s", message.MessageID, string(agentMsgJson))
+		log.DebugfContext(
+			ctx,
+			"converted A2A message to agent message: id: %s, message: %s",
+			message.MessageID,
+			string(agentMsgJson),
+		)
 	}
 
 	runnerOpts := []agent.RunOption{
@@ -316,7 +344,7 @@ func (m *messageProcessor) ProcessMessage(
 	if options.Streaming {
 		return m.processStreamingMessage(ctx, userID, ctxID, &message, agentMsg, handler, runnerOpts)
 	}
-	return m.processMessage(ctx, userID, ctxID, &message, agentMsg, handler, runnerOpts)
+	return m.processMessage(ctx, userID, ctxID, &message, agentMsg, runnerOpts)
 }
 
 func (m *messageProcessor) processStreamingMessage(
@@ -329,26 +357,45 @@ func (m *messageProcessor) processStreamingMessage(
 	runnerOpts []agent.RunOption,
 ) (*taskmanager.MessageProcessingResult, error) {
 	if agentMsg == nil {
-		log.Error("agent message is nil in streaming processing")
+		log.ErrorContext(
+			ctx,
+			"agent message is nil in streaming processing",
+		)
 		return m.handleError(ctx, a2aMsg, true, errors.New("a2aserver: agent message is nil"))
 	}
 
 	taskID, err := handler.BuildTask(nil, &ctxID)
 	if err != nil {
-		log.Errorf("failed to build task for context %s: %v", ctxID, err)
+		log.ErrorfContext(
+			ctx,
+			"failed to build task for context %s: %v",
+			ctxID,
+			err,
+		)
 		return m.handleError(ctx, a2aMsg, true, err)
 	}
 
 	subscriber, err := handler.SubscribeTask(&taskID)
 	if err != nil {
-		log.Errorf("failed to subscribe to task %s: %v", taskID, err)
+		log.ErrorfContext(
+			ctx,
+			"failed to subscribe to task %s: %v",
+			taskID,
+			err,
+		)
 		return m.handleError(ctx, a2aMsg, true, err)
 	}
 
 	// Run the agent and get streaming events
 	agentMsgChan, err := m.runner.Run(ctx, userID, ctxID, *agentMsg, runnerOpts...)
 	if err != nil {
-		log.Errorf("failed to run agent for user %s, context %s: %v", userID, ctxID, err)
+		log.ErrorfContext(
+			ctx,
+			"failed to run agent for user %s, context %s: %v",
+			userID,
+			ctxID,
+			err,
+		)
 		subscriber.Close()
 		return m.handleError(ctx, a2aMsg, true, err)
 	}
@@ -357,15 +404,24 @@ func (m *messageProcessor) processStreamingMessage(
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Errorf("panic in streaming processing for task %s: %v", taskID, r)
+				log.ErrorfContext(
+					ctx,
+					"panic in streaming processing for task %s: %v",
+					taskID,
+					r,
+				)
 				// Send error to subscriber before closing
 				if err := m.handleStreamingProcessingError(ctx, a2aMsg, subscriber,
 					fmt.Errorf("streaming processing panic: %v", r)); err != nil {
-					log.Errorf("failed to handle panic error: %v", err)
+					log.ErrorfContext(
+						ctx,
+						"failed to handle panic error: %v",
+						err,
+					)
 				}
 			}
 		}()
-		m.processAgentStreamingEvents(ctx, taskID, a2aMsg, agentMsgChan, subscriber, handler)
+		m.processAgentStreamingEvents(ctx, taskID, userID, ctxID, a2aMsg, agentMsgChan, subscriber, handler)
 	}()
 
 	return &taskmanager.MessageProcessingResult{
@@ -377,6 +433,8 @@ func (m *messageProcessor) processStreamingMessage(
 func (m *messageProcessor) processAgentStreamingEvents(
 	ctx context.Context,
 	taskID string,
+	userID string,
+	sessionID string,
 	a2aMsg *protocol.Message,
 	agentMsgChan <-chan *event.Event,
 	subscriber taskmanager.TaskSubscriber,
@@ -385,7 +443,12 @@ func (m *messageProcessor) processAgentStreamingEvents(
 	defer func() {
 		subscriber.Close()
 		if err := handler.CleanTask(&taskID); err != nil {
-			log.Warnf("failed to clean task %s: %v", taskID, err)
+			log.WarnfContext(
+				ctx,
+				"failed to clean task %s: %v",
+				taskID,
+				err,
+			)
 		}
 	}()
 	produce := func() (*event.Event, bool) {
@@ -413,21 +476,33 @@ func (m *messageProcessor) processAgentStreamingEvents(
 		},
 		false,
 	)
+	// Add ADK-compatible metadata if enabled
+	m.addTaskMetadata(&taskSubmitted, userID, sessionID)
 	if err := subscriber.Send(protocol.StreamingMessageEvent{Result: &taskSubmitted}); err != nil {
-		log.Errorf("failed to send task submitted message: %v", err)
+		log.ErrorfContext(
+			ctx,
+			"failed to send task submitted message: %v",
+			err,
+		)
 		m.handleStreamingProcessingError(ctx, a2aMsg, subscriber, err)
 	}
 
 	// run event tunnel
 	tunnel := newEventTunnel(defaultBatchSize, defaultFlushInterval, produce, consume)
 	if err := tunnel.Run(ctx); err != nil {
-		log.Warnf("Event transfer error: %v", err)
+		log.WarnfContext(ctx, "Event transfer error: %v", err)
 		m.handleStreamingProcessingError(ctx, a2aMsg, subscriber, err)
 	}
 
-	finalArtifact := protocol.NewTaskArtifactUpdateEvent(taskID, *a2aMsg.ContextID, protocol.Artifact{}, true)
+	finalArtifact := protocol.NewTaskArtifactUpdateEvent(taskID, *a2aMsg.ContextID, protocol.Artifact{
+		Parts: []protocol.Part{},
+	}, true)
 	if err := subscriber.Send(protocol.StreamingMessageEvent{Result: &finalArtifact}); err != nil {
-		log.Errorf("failed to send final artifact message: %v", err)
+		log.ErrorfContext(
+			ctx,
+			"failed to send final artifact message: %v",
+			err,
+		)
 		m.handleStreamingProcessingError(ctx, a2aMsg, subscriber, err)
 	}
 
@@ -440,7 +515,11 @@ func (m *messageProcessor) processAgentStreamingEvents(
 		true,
 	)
 	if err := subscriber.Send(protocol.StreamingMessageEvent{Result: &taskCompleted}); err != nil {
-		log.Errorf("failed to send task completed message: %v", err)
+		log.ErrorfContext(
+			ctx,
+			"failed to send task completed message: %v",
+			err,
+		)
 		m.handleStreamingProcessingError(ctx, a2aMsg, subscriber, err)
 	}
 }
@@ -454,7 +533,7 @@ func (m *messageProcessor) processBatchStreamingEvents(
 	subscriber taskmanager.TaskSubscriber,
 ) (bool, error) {
 	if len(batch) == 0 {
-		log.Debug("received empty batch, continuing")
+		log.DebugContext(ctx, "received empty batch, continuing")
 		// continue processing
 		return true, nil
 	}
@@ -463,23 +542,38 @@ func (m *messageProcessor) processBatchStreamingEvents(
 		// Check context cancellation
 		select {
 		case <-ctx.Done():
-			log.Warnf("context cancelled during batch processing")
+			log.WarnfContext(ctx, "context cancelled during batch processing")
 			return false, ctx.Err()
 		default:
 		}
 
 		if m.debugLogging {
 			agentEventJson, _ := json.Marshal(agentEvent)
-			log.Debugf("get agent event: req msg id: %s, event: %s", a2aMsg.MessageID, string(agentEventJson))
+			log.DebugfContext(
+				ctx,
+				"get agent event: req msg id: %s, event: %s",
+				a2aMsg.MessageID,
+				string(agentEventJson),
+			)
 		}
 
 		if agentEvent == nil {
-			log.Warnf("received nil event at index %d, skipping", i)
+			log.WarnfContext(
+				ctx,
+				"received nil event at index %d, skipping",
+				i,
+			)
 			continue
 		}
 
 		if agentEvent.Response == nil {
-			log.Debugf("received empty response event at index %d, continuing, event: %v", i, agentEvent)
+			log.DebugfContext(
+				ctx,
+				"received empty response event at index %d, "+
+					"continuing, event: %v",
+				i,
+				agentEvent,
+			)
 			continue
 		}
 
@@ -493,20 +587,35 @@ func (m *messageProcessor) processBatchStreamingEvents(
 
 		if m.debugLogging {
 			a2aMsgJson, _ := json.Marshal(convertedResult)
-			log.Debugf("converted agent event to A2A message: req msg id: %s, event: %s", a2aMsg.MessageID, string(a2aMsgJson))
+			log.DebugfContext(
+				ctx,
+				"converted agent event to A2A message: req msg id: %s, "+
+					"event: %s",
+				a2aMsg.MessageID,
+				string(a2aMsgJson),
+			)
 		}
 
 		// Send message if conversion successful
 		if convertedResult != nil {
 			if err := subscriber.Send(protocol.StreamingMessageEvent{Result: convertedResult}); err != nil {
-				log.Errorf("failed to send streaming message event: %v", err)
+				log.ErrorfContext(
+					ctx,
+					"failed to send streaming message event: %v",
+					err,
+				)
 				return false, fmt.Errorf("failed to send streaming message event: %w", err)
 			}
 		}
 
 		// Check if this is the final event - stop processing if done
 		if isFinalStreamingEvent(agentEvent) {
-			log.Debugf("received final event, stopping batch processing (eventID=%s)", agentEvent.ID)
+			log.DebugfContext(
+				ctx,
+				"received final event, stopping batch processing "+
+					"(eventID=%s)",
+				agentEvent.ID,
+			)
 			return false, nil
 		}
 	}
@@ -521,22 +630,30 @@ func (m *messageProcessor) processMessage(
 	ctxID string,
 	a2aMsg *protocol.Message,
 	agentMsg *model.Message,
-	handler taskmanager.TaskHandler,
 	runnerOpts []agent.RunOption,
 ) (*taskmanager.MessageProcessingResult, error) {
 	if agentMsg == nil {
-		log.Error("agent message is nil in non-streaming processing")
+		log.ErrorContext(
+			ctx,
+			"agent message is nil in non-streaming processing",
+		)
 		return nil, errors.New("a2aserver: agent message is nil")
 	}
 
 	agentMsgChan, err := m.runner.Run(ctx, userID, ctxID, *agentMsg, runnerOpts...)
 	if err != nil {
-		log.Errorf("failed to run agent for user %s, context %s: %v", userID, ctxID, err)
+		log.ErrorfContext(
+			ctx,
+			"failed to run agent for user %s, context %s: %v",
+			userID,
+			ctxID,
+			err,
+		)
 		return m.handleError(ctx, a2aMsg, false, err)
 	}
 
-	// Collect and convert events to A2A message
-	var allParts []protocol.Part
+	// Collect converted A2A messages
+	var messages []protocol.Message
 	var eventCount int
 
 	for agentEvent := range agentMsgChan {
@@ -545,18 +662,31 @@ func (m *messageProcessor) processMessage(
 		// Check context cancellation
 		select {
 		case <-ctx.Done():
-			log.Warnf("context cancelled after processing %d events", eventCount)
+			log.WarnfContext(
+				ctx,
+				"context cancelled after processing %d events",
+				eventCount,
+			)
 			return m.handleError(ctx, a2aMsg, false, ctx.Err())
 		default:
 		}
 
 		if m.debugLogging {
 			agentEventJson, _ := json.Marshal(agentEvent)
-			log.Debugf("get agent event: req msg id: %s, event: %s", a2aMsg.MessageID, string(agentEventJson))
+			log.DebugfContext(
+				ctx,
+				"get agent event: req msg id: %s, event: %s",
+				a2aMsg.MessageID,
+				string(agentEventJson),
+			)
 		}
 
 		if agentEvent == nil || agentEvent.Response == nil {
-			log.Warnf("received nil event or response at position %d, skipping", eventCount)
+			log.WarnfContext(
+				ctx,
+				"received nil event or response at position %d, skipping",
+				eventCount,
+			)
 			continue
 		}
 
@@ -564,40 +694,100 @@ func (m *messageProcessor) processMessage(
 			ctx, agentEvent, EventToA2AUnaryOptions{CtxID: *a2aMsg.ContextID},
 		)
 		if err != nil {
-			log.Errorf("failed to convert event %d to A2A message: %v", eventCount, err)
+			log.ErrorfContext(
+				ctx,
+				"failed to convert event %d to A2A message: %v",
+				eventCount,
+				err,
+			)
 			return m.handleError(ctx, a2aMsg, false, err)
 		}
 
 		if m.debugLogging {
 			convertedMsgJson, _ := json.Marshal(convertedResult)
-			log.Debugf("converted agent event to A2A message: req msg id: %s, event: %s", a2aMsg.MessageID, string(convertedMsgJson))
+			log.DebugfContext(
+				ctx,
+				"converted agent event to A2A message: req msg id: %s, "+
+					"event: %s",
+				a2aMsg.MessageID,
+				string(convertedMsgJson),
+			)
 		}
 
 		if convertedResult != nil {
 			if msg, ok := convertedResult.(*protocol.Message); ok {
-				allParts = append(allParts, msg.Parts...)
+				messages = append(messages, *msg)
 			}
 			if task, ok := convertedResult.(*protocol.Task); ok {
+				// Extract messages from task artifacts.
 				for _, artifact := range task.Artifacts {
-					allParts = append(allParts, artifact.Parts...)
+					artifactMsg := protocol.NewMessage(
+						protocol.MessageRoleAgent,
+						artifact.Parts,
+					)
+					messages = append(messages, artifactMsg)
 				}
 			}
 		}
 	}
 
-	log.Debugf("processed %d events, collected %d parts", eventCount, len(allParts))
+	log.DebugfContext(
+		ctx,
+		"processed %d events, collected %d messages",
+		eventCount,
+		len(messages),
+	)
 
-	var responseMsg *protocol.Message
-	if len(allParts) == 0 {
-		log.Warnf("no response parts from agent after processing %d events for message %s", eventCount, a2aMsg.MessageID)
-		return m.handleError(ctx, a2aMsg, false, errors.New("no response parts from agent after processing events"))
+	if len(messages) == 0 {
+		log.WarnfContext(
+			ctx,
+			"no response messages from agent after processing %d "+
+				"events for message %s",
+			eventCount,
+			a2aMsg.MessageID,
+		)
+		return m.handleError(
+			ctx,
+			a2aMsg,
+			false,
+			errors.New(
+				"no response messages from agent after processing "+
+					"events",
+			),
+		)
 	}
 
-	// only support message return in non-streaming processing
-	msg := protocol.NewMessage(protocol.MessageRoleAgent, allParts)
-	responseMsg = &msg
+	// If only one message, return it directly
+	// If multiple messages, return a Task with history
+	if len(messages) == 1 {
+		return &taskmanager.MessageProcessingResult{
+			Result: &messages[0],
+		}, nil
+	}
+
+	// Multiple messages: return Task with history containing intermediate messages
+	// and final message in artifacts
+	taskID := fmt.Sprintf("task-%s-%d", a2aMsg.MessageID, time.Now().UnixNano())
+	task := protocol.NewTask(taskID, ctxID)
+	task.Status = protocol.TaskStatus{
+		State:     protocol.TaskStateCompleted,
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
+
+	// Put all messages except the last one in history
+	if len(messages) > 1 {
+		task.History = messages[:len(messages)-1]
+	}
+
+	// Put the last message in artifacts
+	lastMsg := messages[len(messages)-1]
+	task.Artifacts = []protocol.Artifact{{
+		ArtifactID: lastMsg.MessageID,
+		Parts:      lastMsg.Parts,
+	}}
+
 	return &taskmanager.MessageProcessingResult{
-		Result: responseMsg,
+		Result: task,
 	}, nil
 }
 
@@ -644,4 +834,22 @@ func buildSkillsFromTools(agent agent.Agent, agentName, agentDesc string) []a2a.
 	}
 
 	return skills
+}
+
+// addTaskMetadata adds ADK-compatible metadata to task status update events.
+// When ADK compatibility mode is enabled, it adds metadata with "adk_" prefix
+// (e.g., "adk_app_name", "adk_user_id", "adk_session_id") to match ADK Python implementation.
+func (m *messageProcessor) addTaskMetadata(event *protocol.TaskStatusUpdateEvent, userID, sessionID string) {
+	if !m.adkCompatibility {
+		return
+	}
+
+	if event.Metadata == nil {
+		event.Metadata = make(map[string]any)
+	}
+
+	// Add ADK-compatible metadata keys
+	event.Metadata[ia2a.GetADKMetadataKey("app_name")] = m.agentName
+	event.Metadata[ia2a.GetADKMetadataKey("user_id")] = userID
+	event.Metadata[ia2a.GetADKMetadataKey("session_id")] = sessionID
 }

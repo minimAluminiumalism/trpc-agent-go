@@ -20,130 +20,139 @@ import (
 
 func TestEvalSetResultJSONRoundTrip(t *testing.T) {
 	const raw = `{
-  "eval_set_result_id": "result-1",
-  "eval_set_result_name": "result-name",
-  "eval_set_id": "greeting-set",
-  "eval_case_results": [
+  "evalSetResultId": "result-1",
+  "evalSetResultName": "result-name",
+  "evalSetId": "greeting-set",
+  "evalCaseResults": [
     {
-      "eval_set_id": "greeting-set",
-      "eval_id": "case-1",
-      "final_eval_status": 1,
-      "overall_eval_metric_results": [
+      "evalSetId": "greeting-set",
+      "evalId": "case-1",
+      "finalEvalStatus": "passed",
+      "overallEvalMetricResults": [
         {
-          "metric_name": "tool_trajectory_avg_score",
+          "metricName": "tool_trajectory_avg_score",
           "score": 0.9,
-          "eval_status": 1,
+          "evalStatus": "passed",
           "threshold": 0.8,
           "details": {
-            "comment": "trajectory matched"
+            "reason": "trajectory matched"
           }
         }
       ],
-      "eval_metric_result_per_invocation": [
+      "evalMetricResultPerInvocation": [
         {
-          "actual_invocation": {
-            "invocation_id": "invocation-actual",
-            "user_content": {
+          "actualInvocation": {
+            "invocationId": "invocation-actual",
+            "userContent": {
               "role": "user",
-              "parts": [
-                {
-                  "text": "calculate 1 + 2."
-                }
-              ]
+              "content": "calculate 1 + 2."
             },
-            "final_response": {
+            "finalResponse": {
               "role": "assistant",
-              "parts": [
-                {
-                  "text": "final: 1+2=3."
-                }
-              ]
+              "content": "final: 1+2=3."
             },
-            "intermediate_data": {
-              "tool_uses": [
+            "intermediateData": {
+              "toolCalls": [
                 {
                   "id": "tool-call-1",
-                  "name": "calculator",
-                  "args": {
-                    "operation": "add",
-                    "a": 1,
-                    "b": 2
+                  "type": "function",
+                  "function": {
+                    "name": "calculator",
+                    "arguments": {
+                      "operation": "add",
+                      "a": 1,
+                      "b": 2
+                    }
                   }
                 }
               ],
-              "intermediate_responses": [
-                [
-                  "assistant",
-                  [
-                    {
-                      "text": "thinking..."
-                    }
-                  ]
-                ]
+              "toolResponses": [
+                {
+                  "content": {
+                    "a": 1,
+                    "b": 2,
+                    "operation": "add",
+                    "result": 3
+                  },
+                  "role": "tool",
+                  "toolId": "tool-call-1",
+                  "toolName": "calculator"
+                }
+              ],
+              "intermediateResponses": [
+                {
+                  "role": "assistant",
+                  "content": "thinking..."
+                }
               ]
             },
-            "creation_timestamp": 1700000000
+            "creationTimestamp": 1700000000
           },
-          "expected_invocation": {
-            "invocation_id": "invocation-expected",
-            "user_content": {
+          "expectedInvocation": {
+            "invocationId": "invocation-expected",
+            "userContent": {
               "role": "user",
-              "parts": [
-                {
-                  "text": "calculate 1 + 2."
-                }
-              ]
+              "content": "calculate 1 + 2."
             },
-            "final_response": {
+            "finalResponse": {
               "role": "assistant",
-              "parts": [
-                {
-                  "text": "final: 1+2=3."
-                }
-              ]
+              "content": "final: 1+2=3."
             },
-            "intermediate_data": {
-              "tool_uses": [
+            "intermediateData": {
+              "toolCalls": [
                 {
-                  "name": "calculator",
-                  "args": {
-                    "operation": "add",
-                    "a": 1,
-                    "b": 2
+                  "id": "tool-call-1",
+                  "type": "function",
+                  "function": {
+                    "name": "calculator",
+                    "arguments": {
+                      "operation": "add",
+                      "a": 1,
+                      "b": 2
+                    }
                   }
                 }
               ],
-              "intermediate_responses": [
-                [
-                  "assistant",
-                  [
-                    {
-                      "text": "thinking..."
-                    }
-                  ]
-                ]
+              "toolResponses": [
+                {
+                  "content": {
+                    "a": 1,
+                    "b": 2,
+                    "operation": "add",
+                    "result": 3
+                  },
+                  "role": "tool",
+                  "toolId": "tool-call-1",
+                  "toolName": "calculator"
+                }
+              ],
+              "intermediateResponses": [
+                {
+                  "role": "assistant",
+                  "content": "thinking..."
+                }
               ]
             },
-            "creation_timestamp": 1700000000
+            "creationTimestamp": 1700000000
           },
-          "eval_metric_results": [
+          "evalMetricResults": [
             {
-              "metric_name": "tool_trajectory_avg_score",
+              "metricName": "tool_trajectory_avg_score",
               "score": 0.9,
-              "eval_status": 1,
+              "evalStatus": "passed",
               "threshold": 0.8,
               "details": {
-                "comment": "per invocation matched"
+                "reason": "per invocation matched"
               }
             }
           ]
         }
       ],
-      "session_id": "session-1",
-      "user_id": "user-1"
+      "sessionId": "session-1",
+      "userId": "user-1"
     }
   ],
-  "creation_timestamp": 1700000000
+  "creationTimestamp": 1700000000
 }`
 
 	var result EvalSetResult
@@ -169,7 +178,7 @@ func TestEvalSetResultJSONRoundTrip(t *testing.T) {
 	assert.Equal(t, 0.9, overallMetric.Score)
 	assert.Equal(t, status.EvalStatusPassed, overallMetric.EvalStatus)
 	assert.Equal(t, 0.8, overallMetric.Threshold)
-	assert.Equal(t, "trajectory matched", overallMetric.Details["comment"])
+	assert.Equal(t, "trajectory matched", overallMetric.Details.Reason)
 
 	perInvocation := caseResult.EvalMetricResultPerInvocation[0]
 	assert.NotNil(t, perInvocation.ActualInvocation)
@@ -183,7 +192,7 @@ func TestEvalSetResultJSONRoundTrip(t *testing.T) {
 	assert.Equal(t, 0.9, perMetric.Score)
 	assert.Equal(t, status.EvalStatusPassed, perMetric.EvalStatus)
 	assert.Equal(t, 0.8, perMetric.Threshold)
-	assert.Equal(t, "per invocation matched", perMetric.Details["comment"])
+	assert.Equal(t, "per invocation matched", perMetric.Details.Reason)
 
 	encoded, marshalErr := json.Marshal(result)
 	assert.NoError(t, marshalErr)

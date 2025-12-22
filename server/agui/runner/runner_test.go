@@ -17,11 +17,14 @@ import (
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 	"github.com/stretchr/testify/assert"
+	"go.opentelemetry.io/otel/trace"
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	agentevent "trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/server/agui/adapter"
 	"trpc.group/trpc-go/trpc-agent-go/server/agui/translator"
+	"trpc.group/trpc-go/trpc-agent-go/session"
+	"trpc.group/trpc-go/trpc-agent-go/session/inmemory"
 )
 
 func TestNew(t *testing.T) {
@@ -31,9 +34,9 @@ func TestNew(t *testing.T) {
 	assert.True(t, ok)
 
 	assert.NotNil(t, runner.runAgentInputHook)
-	trans := runner.translatorFactory(&adapter.RunAgentInput{ThreadID: "thread", RunID: "run"})
+	trans := runner.translatorFactory(context.Background(), &adapter.RunAgentInput{ThreadID: "thread", RunID: "run"})
 	assert.NotNil(t, trans)
-	assert.IsType(t, translator.New("", ""), trans)
+	assert.IsType(t, translator.New(context.Background(), "", ""), trans)
 	assert.NotNil(t, runner.runOptionResolver)
 
 	userID, err := runner.userIDResolver(context.Background(),
@@ -59,20 +62,15 @@ func TestRunNoMessages(t *testing.T) {
 	fakeTrans := &fakeTranslator{}
 	r := &runner{
 		runner:            underlying,
-		translatorFactory: func(*adapter.RunAgentInput) translator.Translator { return fakeTrans },
+		translatorFactory: func(_ context.Context, _ *adapter.RunAgentInput) translator.Translator { return fakeTrans },
 		userIDResolver:    NewOptions().UserIDResolver,
 		runOptionResolver: defaultRunOptionResolver,
 	}
 
 	input := &adapter.RunAgentInput{ThreadID: "thread", RunID: "run"}
 	eventsCh, err := r.Run(context.Background(), input)
-	assert.NoError(t, err)
-
-	evts := collectEvents(t, eventsCh)
-	assert.Len(t, evts, 2)
-	assert.IsType(t, (*aguievents.RunStartedEvent)(nil), evts[0])
-	_, ok := evts[1].(*aguievents.RunErrorEvent)
-	assert.True(t, ok)
+	assert.Nil(t, eventsCh)
+	assert.EqualError(t, err, "no messages provided")
 	assert.Equal(t, 0, underlying.calls)
 }
 
@@ -81,7 +79,7 @@ func TestRunUserIDResolverError(t *testing.T) {
 	fakeTrans := &fakeTranslator{}
 	r := &runner{
 		runner:            underlying,
-		translatorFactory: func(*adapter.RunAgentInput) translator.Translator { return fakeTrans },
+		translatorFactory: func(_ context.Context, _ *adapter.RunAgentInput) translator.Translator { return fakeTrans },
 		userIDResolver: func(context.Context, *adapter.RunAgentInput) (string, error) {
 			return "", errors.New("boom")
 		},
@@ -94,11 +92,9 @@ func TestRunUserIDResolverError(t *testing.T) {
 		Messages: []model.Message{{Role: model.RoleUser, Content: "hi"}},
 	}
 	eventsCh, err := r.Run(context.Background(), input)
-	assert.NoError(t, err)
-	evts := collectEvents(t, eventsCh)
-	assert.Len(t, evts, 2)
-	_, ok := evts[1].(*aguievents.RunErrorEvent)
-	assert.True(t, ok)
+	assert.Nil(t, eventsCh)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "resolve user ID")
 	assert.Equal(t, 0, underlying.calls)
 }
 
@@ -107,7 +103,7 @@ func TestRunLastMessageNotUser(t *testing.T) {
 	fakeTrans := &fakeTranslator{}
 	r := &runner{
 		runner:            underlying,
-		translatorFactory: func(*adapter.RunAgentInput) translator.Translator { return fakeTrans },
+		translatorFactory: func(_ context.Context, _ *adapter.RunAgentInput) translator.Translator { return fakeTrans },
 		userIDResolver:    NewOptions().UserIDResolver,
 		runOptionResolver: defaultRunOptionResolver,
 	}
@@ -118,12 +114,8 @@ func TestRunLastMessageNotUser(t *testing.T) {
 		Messages: []model.Message{{Role: model.RoleAssistant, Content: "bot"}},
 	}
 	eventsCh, err := r.Run(context.Background(), input)
-	assert.NoError(t, err)
-
-	evts := collectEvents(t, eventsCh)
-	assert.Len(t, evts, 2)
-	_, ok := evts[1].(*aguievents.RunErrorEvent)
-	assert.True(t, ok)
+	assert.Nil(t, eventsCh)
+	assert.EqualError(t, err, "last message is not a user message")
 	assert.Equal(t, 0, underlying.calls)
 }
 
@@ -136,9 +128,10 @@ func TestRunUnderlyingRunnerError(t *testing.T) {
 	fakeTrans := &fakeTranslator{}
 	r := &runner{
 		runner:            underlying,
-		translatorFactory: func(*adapter.RunAgentInput) translator.Translator { return fakeTrans },
+		translatorFactory: func(_ context.Context, _ *adapter.RunAgentInput) translator.Translator { return fakeTrans },
 		userIDResolver:    NewOptions().UserIDResolver,
 		runOptionResolver: defaultRunOptionResolver,
+		startSpan:         defaultStartSpan,
 	}
 
 	input := &adapter.RunAgentInput{
@@ -166,7 +159,7 @@ func TestRunRunOptionResolverError(t *testing.T) {
 	}
 	r := &runner{
 		runner:            underlying,
-		translatorFactory: func(*adapter.RunAgentInput) translator.Translator { return fakeTrans },
+		translatorFactory: func(_ context.Context, _ *adapter.RunAgentInput) translator.Translator { return fakeTrans },
 		userIDResolver:    NewOptions().UserIDResolver,
 		runOptionResolver: func(ctx context.Context, in *adapter.RunAgentInput) ([]agent.RunOption, error) {
 			assert.Same(t, input, in)
@@ -175,13 +168,112 @@ func TestRunRunOptionResolverError(t *testing.T) {
 	}
 
 	eventsCh, err := r.Run(context.Background(), input)
-	assert.NoError(t, err)
-	evts := collectEvents(t, eventsCh)
-	assert.Len(t, evts, 2)
-	runErr, ok := evts[1].(*aguievents.RunErrorEvent)
-	assert.True(t, ok)
-	assert.Contains(t, runErr.Message, "resolve run options")
+	assert.Nil(t, eventsCh)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "resolve run option")
 	assert.Equal(t, 0, underlying.calls)
+}
+
+func TestRunStartSpanError(t *testing.T) {
+	startErr := errors.New("start span fail")
+	underlying := &fakeRunner{}
+	input := &adapter.RunAgentInput{
+		ThreadID: "thread",
+		RunID:    "run",
+		Messages: []model.Message{{Role: model.RoleUser, Content: "hi"}},
+	}
+	r := &runner{
+		runner: underlying,
+		translatorFactory: func(_ context.Context, _ *adapter.RunAgentInput) translator.Translator {
+			return &fakeTranslator{}
+		},
+		userIDResolver: defaultUserIDResolver,
+		runOptionResolver: func(ctx context.Context, in *adapter.RunAgentInput) ([]agent.RunOption, error) {
+			assert.Same(t, input, in)
+			return nil, nil
+		},
+		startSpan: func(ctx context.Context, in *adapter.RunAgentInput) (context.Context, trace.Span, error) {
+			assert.Same(t, input, in)
+			return ctx, trace.SpanFromContext(ctx), startErr
+		},
+	}
+
+	eventsCh, err := r.Run(context.Background(), input)
+	assert.Nil(t, eventsCh)
+	assert.ErrorIs(t, err, startErr)
+	assert.Equal(t, 0, underlying.calls)
+}
+
+func TestRunFlushesTracker(t *testing.T) {
+	recorder := &flushRecorder{}
+	underlying := &fakeRunner{
+		run: func(ctx context.Context, userID, sessionID string, message model.Message,
+			_ ...agent.RunOption) (<-chan *agentevent.Event, error) {
+			ch := make(chan *agentevent.Event)
+			close(ch)
+			return ch, nil
+		},
+	}
+	r := &runner{
+		runner:            underlying,
+		translatorFactory: defaultTranslatorFactory,
+		userIDResolver:    defaultUserIDResolver,
+		runOptionResolver: defaultRunOptionResolver,
+		tracker:           recorder,
+		startSpan:         defaultStartSpan,
+	}
+	input := &adapter.RunAgentInput{
+		ThreadID: "thread",
+		RunID:    "run",
+		Messages: []model.Message{{Role: model.RoleUser, Content: "hi"}},
+	}
+	ch, err := r.Run(context.Background(), input)
+	assert.NoError(t, err)
+	collectEvents(t, ch)
+	assert.GreaterOrEqual(t, recorder.appendCount, 1)
+	assert.Equal(t, 1, recorder.flushCount)
+}
+
+func TestNewWithSessionServiceEnablesTracker(t *testing.T) {
+	underlying := &fakeRunner{
+		run: func(context.Context, string, string, model.Message, ...agent.RunOption) (<-chan *agentevent.Event, error) {
+			ch := make(chan *agentevent.Event)
+			close(ch)
+			return ch, nil
+		},
+	}
+	r := New(underlying, WithSessionService(inmemory.NewSessionService()))
+	run, ok := r.(*runner)
+	assert.True(t, ok)
+	assert.NotNil(t, run.tracker)
+}
+
+func TestRunRejectsConcurrentSession(t *testing.T) {
+	ch := make(chan *agentevent.Event)
+	underlying := &fakeRunner{
+		run: func(context.Context, string, string, model.Message, ...agent.RunOption) (<-chan *agentevent.Event, error) {
+			return ch, nil
+		},
+	}
+	r := New(underlying).(*runner)
+
+	input := &adapter.RunAgentInput{
+		ThreadID: "thread",
+		RunID:    "run",
+		Messages: []model.Message{{Role: model.RoleUser, Content: "hi"}},
+	}
+
+	events1, err := r.Run(context.Background(), input)
+	assert.NoError(t, err)
+	go collectEvents(t, events1)
+
+	events2, err := r.Run(context.Background(), input)
+	assert.Nil(t, events2)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "session is already running")
+
+	close(ch)
+	collectEvents(t, events1)
 }
 
 func TestRunRunOptionResolverOptions(t *testing.T) {
@@ -214,7 +306,7 @@ func TestRunRunOptionResolverOptions(t *testing.T) {
 	}
 	r := &runner{
 		runner:            underlying,
-		translatorFactory: func(*adapter.RunAgentInput) translator.Translator { return fakeTrans },
+		translatorFactory: func(_ context.Context, _ *adapter.RunAgentInput) translator.Translator { return fakeTrans },
 		userIDResolver: func(context.Context, *adapter.RunAgentInput) (string, error) {
 			return "user-123", nil
 		},
@@ -223,6 +315,7 @@ func TestRunRunOptionResolverOptions(t *testing.T) {
 			resolverCalled = true
 			return []agent.RunOption{agent.WithRequestID("resolver-request-id")}, nil
 		},
+		startSpan: defaultStartSpan,
 	}
 
 	eventsCh, err := r.Run(context.Background(), input)
@@ -250,11 +343,12 @@ func TestRunTranslateError(t *testing.T) {
 
 	r := &runner{
 		runner: underlying,
-		translatorFactory: func(*adapter.RunAgentInput) translator.Translator {
+		translatorFactory: func(_ context.Context, _ *adapter.RunAgentInput) translator.Translator {
 			return fakeTrans
 		},
 		userIDResolver:    NewOptions().UserIDResolver,
 		runOptionResolver: defaultRunOptionResolver,
+		startSpan:         defaultStartSpan,
 	}
 	input := &adapter.RunAgentInput{
 		ThreadID: "thread",
@@ -290,11 +384,12 @@ func TestRunNormal(t *testing.T) {
 	}
 	r := &runner{
 		runner:            underlying,
-		translatorFactory: func(*adapter.RunAgentInput) translator.Translator { return fakeTrans },
+		translatorFactory: func(_ context.Context, _ *adapter.RunAgentInput) translator.Translator { return fakeTrans },
 		userIDResolver: func(context.Context, *adapter.RunAgentInput) (string, error) {
 			return "user-123", nil
 		},
 		runOptionResolver: defaultRunOptionResolver,
+		startSpan:         defaultStartSpan,
 	}
 
 	input := &adapter.RunAgentInput{
@@ -344,7 +439,7 @@ func TestRunAgentInputHook(t *testing.T) {
 		}
 		r := &runner{
 			runner: underlying,
-			translatorFactory: func(*adapter.RunAgentInput) translator.Translator {
+			translatorFactory: func(ctx context.Context, _ *adapter.RunAgentInput) translator.Translator {
 				return &fakeTranslator{}
 			},
 			userIDResolver: func(ctx context.Context, input *adapter.RunAgentInput) (string, error) {
@@ -356,6 +451,7 @@ func TestRunAgentInputHook(t *testing.T) {
 				return replaced, nil
 			},
 			runOptionResolver: defaultRunOptionResolver,
+			startSpan:         defaultStartSpan,
 		}
 
 		eventsCh, err := r.Run(context.Background(), baseInput)
@@ -384,7 +480,8 @@ func TestRunAgentInputHook(t *testing.T) {
 		}
 		r := &runner{
 			runner: underlying,
-			translatorFactory: func(*adapter.RunAgentInput) translator.Translator {
+			translatorFactory: func(ctx context.Context, input *adapter.RunAgentInput) translator.Translator {
+				assert.Same(t, input, input)
 				return &fakeTranslator{}
 			},
 			userIDResolver: func(ctx context.Context, in *adapter.RunAgentInput) (string, error) {
@@ -395,6 +492,7 @@ func TestRunAgentInputHook(t *testing.T) {
 				return nil, nil
 			},
 			runOptionResolver: defaultRunOptionResolver,
+			startSpan:         defaultStartSpan,
 		}
 
 		ch, err := r.Run(context.Background(), input)
@@ -411,6 +509,7 @@ func TestRunAgentInputHook(t *testing.T) {
 				return nil, wantErr
 			},
 			runOptionResolver: defaultRunOptionResolver,
+			startSpan:         defaultStartSpan,
 		}
 		_, err := r.Run(context.Background(), &adapter.RunAgentInput{})
 		assert.Error(t, err)
@@ -678,11 +777,14 @@ func TestRunnerAfterTranslateCallbackOverridesEmission(t *testing.T) {
 		}}
 
 	r := &runner{
-		runner:             underlying,
-		translatorFactory:  func(*adapter.RunAgentInput) translator.Translator { return fakeTrans },
+		runner: underlying,
+		translatorFactory: func(ctx context.Context, input *adapter.RunAgentInput) translator.Translator {
+			return fakeTrans
+		},
 		userIDResolver:     NewOptions().UserIDResolver,
 		translateCallbacks: callbacks,
 		runOptionResolver:  defaultRunOptionResolver,
+		startSpan:          defaultStartSpan,
 	}
 
 	input := &adapter.RunAgentInput{
@@ -702,7 +804,7 @@ type fakeTranslator struct {
 	err    error
 }
 
-func (f *fakeTranslator) Translate(evt *agentevent.Event) ([]aguievents.Event, error) {
+func (f *fakeTranslator) Translate(ctx context.Context, evt *agentevent.Event) ([]aguievents.Event, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -712,6 +814,45 @@ func (f *fakeTranslator) Translate(evt *agentevent.Event) ([]aguievents.Event, e
 	out := f.events[0]
 	f.events = f.events[1:]
 	return out, nil
+}
+
+type flushRecorder struct {
+	appendCount int
+	flushCount  int
+}
+
+func (f *flushRecorder) AppendEvent(ctx context.Context, key session.Key, event aguievents.Event) error {
+	f.appendCount++
+	return nil
+}
+
+func (f *flushRecorder) GetEvents(ctx context.Context, key session.Key) (*session.TrackEvents, error) {
+	return nil, nil
+}
+
+func (f *flushRecorder) Flush(ctx context.Context, key session.Key) error {
+	f.flushCount++
+	return nil
+}
+
+type errorTracker struct {
+	appendErr error
+	flushErr  error
+}
+
+func (e *errorTracker) AppendEvent(ctx context.Context,
+	_ session.Key, _ aguievents.Event) error {
+	return e.appendErr
+}
+
+func (e *errorTracker) GetEvents(ctx context.Context,
+	_ session.Key) (*session.TrackEvents, error) {
+	return nil, nil
+}
+
+func (e *errorTracker) Flush(ctx context.Context,
+	_ session.Key) error {
+	return e.flushErr
 }
 
 type fakeRunner struct {
@@ -731,6 +872,52 @@ func (f *fakeRunner) Run(ctx context.Context,
 		return f.run(ctx, userID, sessionID, message, opts...)
 	}
 	return nil, nil
+}
+
+func (f *fakeRunner) Close() error {
+	return nil
+}
+
+func TestRunTrackingErrorsAreIgnored(t *testing.T) {
+	appendErr := errors.New("append failed")
+	flushErr := errors.New("flush failed")
+	underlying := &fakeRunner{
+		run: func(ctx context.Context,
+			userID, sessionID string,
+			message model.Message,
+			_ ...agent.RunOption) (<-chan *agentevent.Event, error) {
+			ch := make(chan *agentevent.Event)
+			close(ch)
+			return ch, nil
+		},
+	}
+	r := &runner{
+		runner:            underlying,
+		translatorFactory: defaultTranslatorFactory,
+		userIDResolver:    defaultUserIDResolver,
+		runOptionResolver: defaultRunOptionResolver,
+		tracker: &errorTracker{
+			appendErr: appendErr,
+			flushErr:  flushErr,
+		},
+		startSpan: defaultStartSpan,
+	}
+	input := &adapter.RunAgentInput{
+		ThreadID: "thread",
+		RunID:    "run",
+		Messages: []model.Message{
+			{
+				Role:    model.RoleUser,
+				Content: "hi",
+			},
+		},
+	}
+
+	eventsCh, err := r.Run(context.Background(), input)
+	assert.NoError(t, err)
+	evts := collectEvents(t, eventsCh)
+	assert.Len(t, evts, 1)
+	assert.IsType(t, (*aguievents.RunStartedEvent)(nil), evts[0])
 }
 
 func collectEvents(t *testing.T, ch <-chan aguievents.Event) []aguievents.Event {
@@ -769,6 +956,7 @@ func TestTranslateCallbackError(t *testing.T) {
 			translatorFactory:  defaultTranslatorFactory,
 			userIDResolver:     defaultUserIDResolver,
 			runOptionResolver:  defaultRunOptionResolver,
+			startSpan:          defaultStartSpan,
 		}
 		input := &adapter.RunAgentInput{
 			ThreadID: "thread",
@@ -801,6 +989,7 @@ func TestTranslateCallbackError(t *testing.T) {
 			translatorFactory:  defaultTranslatorFactory,
 			userIDResolver:     defaultUserIDResolver,
 			runOptionResolver:  defaultRunOptionResolver,
+			startSpan:          defaultStartSpan,
 		}
 		input := &adapter.RunAgentInput{
 			ThreadID: "thread",

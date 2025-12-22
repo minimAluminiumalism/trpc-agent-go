@@ -237,6 +237,31 @@ type ResponseError struct {
 
 ## OpenAI Model
 
+### 模型名称参数
+
+使用 `openai.New(name string, opts ...Option)` 创建 OpenAI 模型实例时，第一个参数是实际发送给 OpenAI API 的模型名称，作为告诉 API 使用哪个语言模型的**特定模型标识符**。
+
+由于框架支持与 OpenAI API 兼容的不同模型，您可以从各种模型提供商获取基础 URL、API 密钥和模型名称：
+
+**1. OpenAI 官方**
+
+- 基础 URL：`https://api.openai.com/v1`
+- 模型名称：`gpt-4o`、`gpt-4o-mini` 等
+
+**2. DeepSeek**
+
+- 基础 URL：`https://api.deepseek.com`
+- 模型名称：`deepseek-chat`、`deepseek-reasoner`
+
+**3. 腾讯混元**
+
+- 基础 URL：`https://api.hunyuan.cloud.tencent.com/v1`
+- 模型名称：`hunyuan-2.0-thinking-20251109`、`hunyuan-2.0-instruct-20251111` 等
+
+**4. 其他提供商**
+
+- **Qwen**：基础 URL `https://dashscope.aliyuncs.com/compatible-mode/v1`，模型名称：各种 Qwen 模型
+
 OpenAI Model 用于对接 OpenAI 及其兼容平台，支持流式输出、多模态与高级参数配置，并提供丰富的回调机制、批量处理与重试能力，同时可灵活设置自定义 HTTP Header.
 
 ### 配置方式
@@ -456,7 +481,231 @@ model := openai.New("deepseek-chat",
 )
 ```
 
-#### 2. 批量处理（Batch API）
+#### 2. 模型切换（Model Switching）
+
+模型切换允许在运行时动态更换 Agent 使用的 LLM 模型。框架提供两种方式：Agent 级别切换（影响所有后续请求）和请求级别切换（仅影响单次请求）。
+
+##### Agent 级别切换
+
+Agent 级别切换会改变 Agent 的默认模型，影响所有后续请求。
+
+###### 方式一：直接设置模型实例
+
+通过 `SetModel` 方法直接传入模型实例：
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/model/anthropic"
+)
+
+// 创建 Agent.
+agent := llmagent.New("my-agent",
+    llmagent.WithModel(anthropic.New("claude-3-5-haiku-20241022")),
+)
+
+// 切换到其他模型.
+agent.SetModel(anthropic.New("claude-3-5-sonnet-20241022"))
+```
+
+**使用场景**：
+
+```go
+// 根据任务复杂度选择模型.
+if isComplexTask {
+    agent.SetModel(anthropic.New("claude-3-5-sonnet-20241022"))  // 使用强大模型.
+} else {
+    agent.SetModel(anthropic.New("claude-3-5-haiku-20241022"))  // 使用快速模型.
+}
+```
+
+###### 方式二：按名称切换模型
+
+通过 `WithModels` 预注册多个模型，然后使用 `SetModelByName` 按名称切换：
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/model/anthropic"
+)
+
+// 创建多个模型实例.
+sonnet := anthropic.New("claude-3-5-sonnet-20241022")
+haiku := anthropic.New("claude-3-5-haiku-20241022")
+
+// 创建 Agent 时注册所有模型.
+agent := llmagent.New("my-agent",
+    llmagent.WithModels(map[string]model.Model{
+        "smart": sonnet,
+        "fast":  haiku,
+    }),
+    llmagent.WithModel(haiku), // 指定初始模型.
+    llmagent.WithInstruction("你是一个智能助手。"),
+)
+
+// 运行时按名称切换模型.
+err := agent.SetModelByName("smart")
+if err != nil {
+    log.Fatal(err)
+}
+
+// 切换到其他模型.
+err = agent.SetModelByName("fast")
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+**使用场景**：
+
+```go
+// 根据用户等级选择模型.
+modelName := "fast" // 默认使用快速模型.
+if user.IsPremium() {
+    modelName = "smart" // 付费用户使用高级模型.
+}
+if err := agent.SetModelByName(modelName); err != nil {
+    log.Printf("切换模型失败: %v", err)
+}
+
+// 根据时间段选择模型（成本优化）.
+hour := time.Now().Hour()
+if hour >= 22 || hour < 8 {
+    // 夜间使用快速模型.
+    agent.SetModelByName("fast")
+} else {
+    // 白天使用智能模型.
+    agent.SetModelByName("smart")
+}
+```
+
+##### 请求级别切换
+
+请求级别切换允许为单次请求临时指定模型，不影响 Agent 的默认模型和其他请求。这对于需要针对特定任务使用不同模型的场景非常有用。
+
+###### 方式一：使用 WithModel 选项
+
+通过 `agent.WithModel` 为单次请求指定模型实例：
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent"
+    "trpc.group/trpc-go/trpc-agent-go/model/anthropic"
+)
+
+// 为这次请求使用特定模型.
+eventChan, err := runner.Run(ctx, userID, sessionID, message,
+    agent.WithModel(anthropic.New("claude-3-5-sonnet-20241022")),
+)
+```
+
+###### 方式二：使用 WithModelName 选项（推荐）
+
+通过 `agent.WithModelName` 为单次请求指定预注册的模型名称：
+
+```go
+// 创建 Agent 时预注册多个模型.
+agent := llmagent.New("my-agent",
+    llmagent.WithModels(map[string]model.Model{
+        "smart": anthropic.New("claude-3-5-sonnet-20241022"),
+        "fast":  anthropic.New("claude-3-5-haiku-20241022"),
+    }),
+    llmagent.WithModel(anthropic.New("claude-3-5-haiku-20241022")), // 默认模型.
+)
+
+runner := runner.NewRunner("app", agent)
+
+// 为这次请求临时使用 "smart" 模型.
+eventChan, err := runner.Run(ctx, userID, sessionID, message,
+    agent.WithModelName("smart"),
+)
+
+// 下一次请求仍然使用默认模型 "claude-3-5-haiku-20241022".
+eventChan2, err := runner.Run(ctx, userID, sessionID, message2)
+```
+
+**使用场景**：
+
+```go
+// 根据消息复杂度动态选择模型.
+var opts []agent.RunOption
+if isComplexQuery(message) {
+    opts = append(opts, agent.WithModelName("smart")) // 复杂查询使用强大模型.
+}
+
+eventChan, err := runner.Run(ctx, userID, sessionID, message, opts...)
+
+// 为特定任务使用专门的模型.
+eventChan, err := runner.Run(ctx, userID, sessionID, visionMessage,
+    agent.WithModelName("vision"),
+)
+```
+
+##### 配置说明
+
+**WithModels 选项**：
+
+- 接受一个 `map[string]model.Model`，key 为模型名称，value 为模型实例
+- 如果同时设置了 `WithModel` 和 `WithModels`，`WithModel` 指定初始模型
+- 如果只设置了 `WithModels`，将使用 map 中的第一个模型作为初始模型（注意：map 遍历顺序不确定，建议明确指定初始模型）
+- 保留名称：`__default__` 是框架内部使用的保留名称，建议不要使用
+
+**SetModelByName 方法**：
+
+- 参数：模型名称（字符串）
+- 返回：如果模型名称不存在，返回错误
+- 模型必须是通过 `WithModels` 预先注册的
+
+**请求级别选项**：
+
+- `agent.RunOptions.Model`：直接指定模型实例
+- `agent.RunOptions.ModelName`：指定预注册的模型名称
+- 优先级：`Model` > `ModelName` > Agent 默认模型
+- 如果 `ModelName` 指定的模型不存在，将回退到 Agent 默认模型
+
+##### Agent 级别 vs 请求级别对比
+
+| 特性     | Agent 级别切换              | 请求级别切换                   |
+| -------- | --------------------------- | ------------------------------ |
+| 影响范围 | 所有后续请求                | 仅当前请求                     |
+| 使用方式 | `SetModel`/`SetModelByName` | `RunOptions.Model`/`ModelName` |
+| 状态变化 | 改变 Agent 默认模型         | 不改变 Agent 状态              |
+| 适用场景 | 全局策略调整                | 特定任务临时需求               |
+| 并发影响 | 影响所有并发请求            | 不影响其他请求                 |
+| 典型用例 | 用户等级、时间段策略        | 复杂查询、推理任务             |
+
+##### Agent 级别切换方式对比
+
+| 特性     | SetModel         | SetModelByName       |
+| -------- | ---------------- | -------------------- |
+| 使用方式 | 传入模型实例     | 传入模型名称         |
+| 预注册   | 不需要           | 需要通过 WithModels  |
+| 错误处理 | 无               | 返回 error           |
+| 适用场景 | 简单切换         | 复杂场景，多模型管理 |
+| 代码维护 | 需要持有模型实例 | 只需要记住名称       |
+
+##### 重要说明
+
+**Agent 级别切换**：
+
+- **即时生效**：调用 `SetModel` 或 `SetModelByName` 后，下一次请求立即使用新模型
+- **会话保持**：切换模型不会清除会话历史
+- **配置独立**：每个模型保留自己的配置（温度、最大 token 等）
+- **并发安全**：两种切换方式都是并发安全的
+
+**请求级别切换**：
+
+- **临时覆盖**：仅影响当前请求，不改变 Agent 的默认模型
+- **优先级高**：请求级别的模型设置优先于 Agent 默认模型
+- **无副作用**：不影响其他并发请求或后续请求
+- **灵活组合**：可以与 Agent 级别切换配合使用
+
+##### 使用示例
+
+完整的交互式示例请参考 [examples/model/switch](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/switch)，该示例演示了 Agent 级别和请求级别两种切换方式。
+
+#### 3. 批量处理（Batch API）
 
 Batch API 是一种异步批量处理技术，用于高效处理大量请求。该功能特别适用于需要处理大规模数据的场景，能够显著降低成本并提高处理效率。
 
@@ -624,7 +873,7 @@ batch, err := llm.CreateBatch(ctx, requests,
 
 Batch API 的执行流程：
 
-```
+```text
 1. 准备批处理请求（BatchRequestInput 列表）
 2. 验证请求格式和 CustomID 唯一性
 3. 生成 JSONL 格式的输入文件
@@ -652,7 +901,7 @@ Batch API 的执行流程：
 
 完整的交互式示例请参考 [examples/model/batch](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/batch)。
 
-#### 3. 重试机制（Retry）
+#### 4. 重试机制（Retry）
 
 重试机制是一种自动错误恢复技术，用于在请求失败时自动重试。该功能由底层 OpenAI SDK 提供，框架通过配置选项将重试参数传递给 SDK。
 
@@ -738,7 +987,7 @@ llm := openai.New("gpt-4o-mini",
 
 重试机制的执行流程：
 
-```
+```text
 1. 发送请求到 LLM API
 2. 如果请求失败且错误可重试：
    a. 检查是否达到最大重试次数
@@ -772,7 +1021,7 @@ llm := openai.New("gpt-4o-mini",
 
 完整的交互式示例请参考 [examples/model/retry](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/retry)。
 
-#### 4. 自定义 HTTP Header
+#### 5. 自定义 HTTP Header
 
 在网关、专有平台或代理环境中，请求模型 API 往往需要额外的
 HTTP Header（例如组织/租户标识、灰度路由、自定义鉴权等）。Model 模块
@@ -781,12 +1030,26 @@ HTTP Header（例如组织/租户标识、灰度路由、自定义鉴权等）�
 
 推荐顺序：
 
-- 通过 OpenAI RequestOption 设置全局 Header（简单、直观）
+- 通过 `openai.WithHeaders` 快速追加静态 Header（简便）
+- 通过 OpenAI RequestOption 设置全局 Header（灵活、可组合中间件）
 - 通过自定义 `http.RoundTripper` 注入（进阶、横切能力更强）
 
-上述两种方式同样影响流式请求，因为底层使用的是同一个客户端。
+上述三种方式同样影响流式请求，因为底层使用的是同一个客户端。
 
-##### 1. 使用 OpenAI RequestOption 设置全局 Header
+##### 1. 使用 openai.WithHeaders 追加 Header
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/model/openai"
+
+llm := openai.New("deepseek-chat",
+    openai.WithHeaders(map[string]string{
+        "X-Custom-Header": "custom-value",
+        "X-Request-ID":    "req-123",
+    }),
+)
+```
+
+##### 2. 使用 OpenAI RequestOption 设置全局 Header
 
 通过 `WithOpenAIOptions` 配合 `openaiopt.WithHeader` 或
 `openaiopt.WithMiddleware`，可为底层 OpenAI 客户端发起的“每个请求”
@@ -841,7 +1104,7 @@ llm := openai.New("deepseek-chat",
   `WithAPIKey`，改为使用
   `openaiopt.WithHeader("api-key", "<key>")`。
 
-##### 2. 使用自定义 http.RoundTripper（进阶）
+##### 3. 使用自定义 http.RoundTripper（进阶）
 
 在 HTTP 传输层统一注入 Header，适合同时需要代理、TLS、自定义监控等
 能力的场景。
@@ -869,6 +1132,274 @@ llm := openai.New("deepseek-chat",
   `req.Context()` 读取值，从而为“本次调用”注入头部。
 - 对“对话补全”而言，目前未暴露单次调用级别的 BaseURL 覆盖；如需切
   换，请新建一个使用不同 BaseURL 的模型，或在中间件中修改 `r.URL`。
+
+#### 6. Token 裁剪（Token Tailoring）
+
+Token Tailoring 是一种智能的消息管理技术，用于在消息超出模型上下文窗口限制时自动裁剪消息，确保请求能够成功发送到 LLM API。该功能特别适用于长对话场景，能够在保留关键上下文的同时，将消息列表控制在模型的 token 限制内。
+
+**自动模式（推荐）**：
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
+)
+
+// 只需启用 token tailoring，其他参数自动配置
+model := openai.New("deepseek-chat",
+    openai.WithEnableTokenTailoring(true),
+)
+```
+
+**高级模式**：
+
+```go
+// 自定义 token 限制和策略
+model := openai.New("deepseek-chat",
+    openai.WithEnableTokenTailoring(true),               // 必需：启用 token tailoring
+    openai.WithMaxInputTokens(10000),                    // 自定义 token 限制
+    openai.WithTokenCounter(customCounter),              // 可选：自定义计数器
+    openai.WithTailoringStrategy(customStrategy),        // 可选：自定义策略
+)
+```
+
+**Token 计算公式**：
+
+框架会根据模型的上下文窗口自动计算 "maxInputTokens"：
+
+```
+safetyMargin = contextWindow × 10%
+calculatedMax = contextWindow - 2048（输出预留）- 512（协议开销）- safetyMargin
+ratioLimit = contextWindow × 100%（最大输入比例）
+maxInputTokens = max(min(calculatedMax, ratioLimit), 1024（最小值）)
+```
+
+例如 "gpt-4o"（contextWindow = 128000）：
+
+```
+safetyMargin = 128000 × 0.10 = 12800 tokens
+calculatedMax = 128000 - 2048 - 512 - 12800 = 112640 tokens
+ratioLimit = 128000 × 1.0 = 128000 tokens
+maxInputTokens = 112640 tokens（约占 context window 的 88%）
+```
+
+**默认预算参数**：
+
+框架使用以下默认值进行 token 分配（**建议保留默认值**）：
+
+- **协议开销（ProtocolOverheadTokens）**: 512 tokens - 用于请求/响应格式化
+- **输出预留（ReserveOutputTokens）**: 2048 tokens - 为输出生成预留
+- **输入最小值（InputTokensFloor）**: 1024 tokens - 确保模型正常处理
+- **输出最小值（OutputTokensFloor）**: 256 tokens - 确保有意义的响应
+- **安全边际比例（SafetyMarginRatio）**: 10% - token 计数不准确的缓冲
+- **最大输入比例（MaxInputTokensRatio）**: 100% - 上下文窗口的最大输入比例
+
+**裁剪策略**：
+
+框架提供了默认的裁剪策略，按优先级保留以下消息：
+
+1. **系统消息**：最高优先级，始终保留
+2. **最新用户消息**：确保当前对话轮次完整
+3. **工具调用相关消息**：保持工具调用的上下文完整性
+4. **历史消息**：根据剩余空间保留尽可能多的历史对话
+
+**自定义裁剪策略**：
+
+可以通过实现 `TailoringStrategy` 接口来自定义裁剪逻辑：
+
+```go
+type CustomStrategy struct{}
+
+func (s *CustomStrategy) Tailor(
+    ctx context.Context,
+    messages []model.Message,
+    maxTokens int,
+    counter tokencounter.Counter,
+) ([]model.Message, error) {
+    // 实现自定义裁剪逻辑
+    // 例如：只保留最近 N 轮对话
+    return messages, nil
+}
+
+model := openai.New("deepseek-chat",
+    openai.WithEnableTokenTailoring(true),
+    openai.WithTailoringStrategy(&CustomStrategy{}),
+)
+```
+
+**进阶配置（自定义预算参数）**：
+
+如果默认的 token 分配策略不满足您的需求，可以通过 `WithTokenTailoringConfig` 自定义预算参数。**注意：除非有特殊需求，否则建议保留默认值。**
+
+```go
+model := openai.New("deepseek-chat",
+    openai.WithEnableTokenTailoring(true),
+    openai.WithTokenTailoringConfig(&model.TokenTailoringConfig{
+        ProtocolOverheadTokens: 1024,   // 自定义协议开销
+        ReserveOutputTokens:    4096,   // 自定义输出预留
+        InputTokensFloor:       2048,   // 自定义输入最小值
+        OutputTokensFloor:      512,    // 自定义输出最小值
+        SafetyMarginRatio:      0.15,   // 自定义安全边际（15%）
+        MaxInputTokensRatio:    0.90,   // 自定义最大输入比例（90%）
+    }),
+)
+```
+
+对于 Anthropic 模型，可以使用相同的配置：
+
+```go
+model := anthropic.New("claude-sonnet-4-0",
+    anthropic.WithEnableTokenTailoring(true),
+    anthropic.WithTokenTailoringConfig(&model.TokenTailoringConfig{
+        SafetyMarginRatio: 0.15,  // 提高安全边际到 15%
+    }),
+)
+```
+
+#### 7. Variant 优化：平台特有行为适配
+
+Variant 机制是 Model 模块的重要优化，用于处理不同 OpenAI 兼容平台的特有行为差异。通过指定不同的 Variant，框架能够自动适配各平台的 API 差异，特别是文件上传、删除和处理逻辑。
+
+##### 7.1. 支持的 Variant 类型
+
+框架目前支持以下 Variant：
+
+**1. VariantOpenAI（默认）**
+
+- 标准 OpenAI API 兼容行为
+- 文件上传路径：`/openapi/v1/files`
+- 文件用途：`user_data`
+- 删除文件的 Http 请求方法：`DELETE`
+
+**2. VariantHunyuan（混元）**
+
+- 腾讯混元平台特有适配
+- 文件上传路径：`/openapi/v1/files/uploads`
+- 文件用途：`file-extract`
+- 删除文件的 Http 请求方法：`POST`
+
+**3. VariantDeepSeek**
+
+- DeepSeek 平台适配
+- 默认 BaseURL：`https://api.deepseek.com`
+- API Key 环境变量名：`DEEPSEEK_API_KEY`
+- 其他行为与标准 OpenAI 一致
+
+**4. VariantQwen（千问）**
+
+- 通义千问平台适配
+- 默认 BaseURL：`https://dashscope.aliyuncs.com/compatible-mode/v1`
+- API Key 环境变量名：`DASHSCOPE_API_KEY`
+- 其他行为与标准 OpenAI 一致
+
+##### 7.2. 使用方式
+
+**使用示例**：
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/model/openai"
+
+// 使用混元平台
+model := openai.New("hunyuan-model",
+    openai.WithBaseURL("https://your-hunyuan-api.com"),
+    openai.WithAPIKey("your-api-key"),
+    openai.WithVariant(openai.VariantHunyuan), // 关键：指定混元
+)
+
+// 使用 DeepSeek 平台
+model := openai.New("deepseek-chat",
+    openai.WithBaseURL("https://api.deepseek.com/v1"),
+    openai.WithAPIKey("your-api-key"),
+    openai.WithVariant(openai.VariantDeepSeek), // 指定 DeepSeek
+)
+```
+
+##### 7.3. Variant 的行为差异示例
+
+**消息内容处理差异**：
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/model"
+
+// 对于混元平台，文件 ID 会放在 extraFields 中而非 content parts
+message := model.Message{
+    Role: model.RoleUser,
+    ContentParts: []model.ContentPart{
+        {
+            Type: model.ContentTypeFile,
+            File: &model.File{
+                FileID: "file_123",
+            },
+        },
+    },
+}
+```
+
+**环境变量自动配置**：
+
+对于某些 Variant，框架支持自动从环境变量读取配置：
+
+```bash
+# DeepSeek 自动配置
+export DEEPSEEK_API_KEY="your-api-key"
+# 无需显式调用 WithAPIKey，框架会自动读取
+```
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/model"
+
+// DeepSeek 自动配置示例
+model := openai.New("deepseek-chat",
+    openai.WithVariant(openai.VariantDeepSeek), // 自动读取 DEEPSEEK_API_KEY
+)
+```
+
+#### 8. 流式工具调用增量：ShowToolCallDelta
+
+默认情况下，OpenAI 适配层会**隐藏流式响应中的原始 `tool_calls` 分片**：
+
+- 含有 `tool_calls` 但没有可见文本内容的 chunk 会在适配层被过滤；
+- 工具调用会在内部累积，最终只在一次性汇总的响应中，通过
+  `Response.Choices[0].Message.ToolCalls` 对外暴露；
+- 这种行为适合只关心助手文本的普通聊天界面，避免在流中出现半截
+  JSON 片段。
+
+对于更高级的场景（例如：模型将文档正文写入工具入参的 JSON 字段，
+前端希望“边生成边预览”正文），可以通过 `WithShowToolCallDelta`
+打开原始工具调用增量：
+
+```go
+llm := openai.New(
+    "gpt-4.1",
+    openai.WithShowToolCallDelta(true), // 转发 tool_call 增量分片
+)
+```
+
+当启用 `WithShowToolCallDelta(true)` 时：
+
+- 含有 `tool_calls` 的流式 chunk 不再被适配层压制；
+- 每个 chunk 会被转换为部分响应 `model.Response`，其中：
+  - `Response.IsPartial == true`
+  - `Response.Choices[0].Delta.ToolCalls` 中包含来自提供方的原始
+    `tool_calls` 增量，并映射为 `model.ToolCall`：
+    - `Type` 来自底层的 `type` 字段（例如 `"function"`）；
+    - `Function.Name`、`Function.Arguments` 与原始工具名和
+      JSON 字符串参数保持一致；
+    - `ID`、`Index` 保留工具调用的唯一标识，方便调用方按 ID 合并分片；
+- 最终汇总响应仍然会把合并后的工具调用放在
+  `Response.Choices[0].Message.ToolCalls` 中，原有工具执行链路
+  （例如 `FunctionCallResponseProcessor`）可以无缝复用。
+
+典型的业务接入模式：
+
+1. 在每个部分响应中读取
+   `Response.Choices[0].Delta.ToolCalls[*].Function.Arguments`；
+2. 按工具调用 `ID` 分组并追加 `Arguments` 字符串分片；
+3. 当累积字符串构成合法 JSON 后，将其反序列化为业务结构体
+   （例如 `{ "content": "..." }`），用于前端渐进式展示。
+
+如果不需要在流式阶段解析工具入参，只关心最终调用结果，建议保持
+`WithShowToolCallDelta` 的默认关闭状态，以避免处理部分 JSON 片段，
+并保留默认的“仅流式输出助手文本”的简洁行为。
 
 ## Anthropic Model
 
@@ -1052,18 +1583,256 @@ model := anthropic.New(
 )
 ```
 
-#### 2. 自定义 HTTP Header
+#### 2. 模型切换（Model Switching）
 
-在网关、专有平台或代理环境中，请求模型 API 往往需要额外的HTTP Header（例如组织/租户标识、灰度路由、自定义鉴权等）。Model 模块提供两种可靠方式为“所有模型请求”添加 Header，适用于普通请求、流式、文件上传、批处理等全链路。
+模型切换允许在运行时动态更换 Agent 使用的 LLM 模型。框架提供两种方式：Agent 级别切换（影响所有后续请求）和请求级别切换（仅影响单次请求）。
+
+##### Agent 级别切换
+
+Agent 级别切换会改变 Agent 的默认模型，影响所有后续请求。
+
+###### 方式一：直接设置模型实例
+
+通过 `SetModel` 方法直接传入模型实例：
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/model/anthropic"
+)
+
+// 创建 Agent.
+agent := llmagent.New("my-agent",
+    llmagent.WithModel(anthropic.New("claude-3-5-haiku-20241022")),
+)
+
+// 切换到其他模型.
+agent.SetModel(anthropic.New("claude-3-5-sonnet-20241022"))
+```
+
+**使用场景**：
+
+```go
+// 根据任务复杂度选择模型.
+if isComplexTask {
+    agent.SetModel(anthropic.New("claude-3-5-sonnet-20241022"))  // 使用强大模型.
+} else {
+    agent.SetModel(anthropic.New("claude-3-5-haiku-20241022"))  // 使用快速模型.
+}
+```
+
+###### 方式二：按名称切换模型
+
+通过 `WithModels` 预注册多个模型，然后使用 `SetModelByName` 按名称切换：
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/model/anthropic"
+)
+
+// 创建多个模型实例.
+sonnet := anthropic.New("claude-3-5-sonnet-20241022")
+haiku := anthropic.New("claude-3-5-haiku-20241022")
+
+// 创建 Agent 时注册所有模型.
+agent := llmagent.New("my-agent",
+    llmagent.WithModels(map[string]model.Model{
+        "smart": sonnet,
+        "fast":  haiku,
+    }),
+    llmagent.WithModel(haiku), // 指定初始模型.
+    llmagent.WithInstruction("你是一个智能助手。"),
+)
+
+// 运行时按名称切换模型.
+err := agent.SetModelByName("smart")
+if err != nil {
+    log.Fatal(err)
+}
+
+// 切换到其他模型.
+err = agent.SetModelByName("fast")
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+**使用场景**：
+
+```go
+// 根据用户等级选择模型.
+modelName := "fast" // 默认使用快速模型.
+if user.IsPremium() {
+    modelName = "smart" // 付费用户使用高级模型.
+}
+if err := agent.SetModelByName(modelName); err != nil {
+    log.Printf("切换模型失败: %v", err)
+}
+
+// 根据时间段选择模型（成本优化）.
+hour := time.Now().Hour()
+if hour >= 22 || hour < 8 {
+    // 夜间使用快速模型.
+    agent.SetModelByName("fast")
+} else {
+    // 白天使用智能模型.
+    agent.SetModelByName("smart")
+}
+```
+
+##### 请求级别切换
+
+请求级别切换允许为单次请求临时指定模型，不影响 Agent 的默认模型和其他请求。这对于需要针对特定任务使用不同模型的场景非常有用。
+
+###### 方式一：使用 WithModel 选项
+
+通过 `agent.WithModel` 为单次请求指定模型实例：
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent"
+    "trpc.group/trpc-go/trpc-agent-go/model/anthropic"
+)
+
+// 为这次请求使用特定模型.
+eventChan, err := runner.Run(ctx, userID, sessionID, message,
+    agent.WithModel(anthropic.New("claude-3-5-sonnet-20241022")),
+)
+```
+
+###### 方式二：使用 WithModelName 选项（推荐）
+
+通过 `agent.WithModelName` 为单次请求指定预注册的模型名称：
+
+```go
+// 创建 Agent 时预注册多个模型.
+agent := llmagent.New("my-agent",
+    llmagent.WithModels(map[string]model.Model{
+        "smart": anthropic.New("claude-3-5-sonnet-20241022"),
+        "fast":  anthropic.New("claude-3-5-haiku-20241022"),
+    }),
+    llmagent.WithModel(anthropic.New("claude-3-5-haiku-20241022")), // 默认模型.
+)
+
+runner := runner.NewRunner("app", agent)
+
+// 为这次请求临时使用 "smart" 模型.
+eventChan, err := runner.Run(ctx, userID, sessionID, message,
+    agent.WithModelName("smart"),
+)
+
+// 下一次请求仍然使用默认模型 "claude-3-5-haiku-20241022".
+eventChan2, err := runner.Run(ctx, userID, sessionID, message2)
+```
+
+**使用场景**：
+
+```go
+// 根据消息复杂度动态选择模型.
+var opts []agent.RunOption
+if isComplexQuery(message) {
+    opts = append(opts, agent.WithModelName("smart")) // 复杂查询使用强大模型.
+}
+
+eventChan, err := runner.Run(ctx, userID, sessionID, message, opts...)
+
+// 为特定任务使用专门的模型.
+eventChan, err := runner.Run(ctx, userID, sessionID, visionMessage,
+    agent.WithModelName("vision"),
+)
+```
+
+##### 配置说明
+
+**WithModels 选项**：
+
+- 接受一个 `map[string]model.Model`，key 为模型名称，value 为模型实例
+- 如果同时设置了 `WithModel` 和 `WithModels`，`WithModel` 指定初始模型
+- 如果只设置了 `WithModels`，将使用 map 中的第一个模型作为初始模型（注意：map 遍历顺序不确定，建议明确指定初始模型）
+- 保留名称：`__default__` 是框架内部使用的保留名称，建议不要使用
+
+**SetModelByName 方法**：
+
+- 参数：模型名称（字符串）
+- 返回：如果模型名称不存在，返回错误
+- 模型必须是通过 `WithModels` 预先注册的
+
+**请求级别选项**：
+
+- `agent.RunOptions.Model`：直接指定模型实例
+- `agent.RunOptions.ModelName`：指定预注册的模型名称
+- 优先级：`Model` > `ModelName` > Agent 默认模型
+- 如果 `ModelName` 指定的模型不存在，将回退到 Agent 默认模型
+
+##### Agent 级别 vs 请求级别对比
+
+| 特性     | Agent 级别切换              | 请求级别切换                   |
+| -------- | --------------------------- | ------------------------------ |
+| 影响范围 | 所有后续请求                | 仅当前请求                     |
+| 使用方式 | `SetModel`/`SetModelByName` | `RunOptions.Model`/`ModelName` |
+| 状态变化 | 改变 Agent 默认模型         | 不改变 Agent 状态              |
+| 适用场景 | 全局策略调整                | 特定任务临时需求               |
+| 并发影响 | 影响所有并发请求            | 不影响其他请求                 |
+| 典型用例 | 用户等级、时间段策略        | 复杂查询、推理任务             |
+
+##### Agent 级别切换方式对比
+
+| 特性     | SetModel         | SetModelByName       |
+| -------- | ---------------- | -------------------- |
+| 使用方式 | 传入模型实例     | 传入模型名称         |
+| 预注册   | 不需要           | 需要通过 WithModels  |
+| 错误处理 | 无               | 返回 error           |
+| 适用场景 | 简单切换         | 复杂场景，多模型管理 |
+| 代码维护 | 需要持有模型实例 | 只需要记住名称       |
+
+##### 重要说明
+
+**Agent 级别切换**：
+
+- **即时生效**：调用 `SetModel` 或 `SetModelByName` 后，下一次请求立即使用新模型
+- **会话保持**：切换模型不会清除会话历史
+- **配置独立**：每个模型保留自己的配置（温度、最大 token 等）
+- **并发安全**：两种切换方式都是并发安全的
+
+**请求级别切换**：
+
+- **临时覆盖**：仅影响当前请求，不改变 Agent 的默认模型
+- **优先级高**：请求级别的模型设置优先于 Agent 默认模型
+- **无副作用**：不影响其他并发请求或后续请求
+- **灵活组合**：可以与 Agent 级别切换配合使用
+
+##### 使用示例
+
+完整的交互式示例请参考 [examples/model/switch](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/switch)，该示例演示了 Agent 级别和请求级别两种切换方式。
+
+#### 3. 自定义 HTTP Header
+
+在网关、专有平台或代理环境中，请求模型 API 往往需要额外的 HTTP Header（例如组织/租户标识、灰度路由、自定义鉴权等）。Model 模块提供两种可靠方式为“所有模型请求”添加 Header，适用于普通请求、流式、文件上传、批处理等全链路。
 
 推荐顺序：
 
-- 通过 Anthropic RequestOption 设置全局 Header（简单、直观）
+- 通过 `anthropic.WithHeaders` 快速追加静态 Header（简便）
+- 通过 Anthropic RequestOption 设置全局 Header（灵活、可组合中间件）
 - 通过自定义 `http.RoundTripper` 注入（进阶、横切能力更强）
 
-上述两种方式同样影响流式请求，因为底层使用的是同一个客户端，
+上述三种方式同样影响流式请求，因为底层使用的是同一个客户端，
 
-##### 1. 使用 Anthropic RequestOption 设置全局 Header
+##### 1. 使用 anthropic.WithHeaders 追加 Header
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/model/anthropic"
+
+llm := anthropic.New("claude-sonnet-4-0",
+    anthropic.WithHeaders(map[string]string{
+        "X-Custom-Header": "custom-value",
+        "X-Request-ID":    "req-123",
+    }),
+)
+```
+
+##### 2. 使用 Anthropic RequestOption 设置全局 Header
 
 通过 `WithAnthropicClientOptions` 配合 `anthropicopt.WithHeader` 或 `anthropicopt.WithMiddleware`，可为底层 Anthropic 客户端发起的每个请求注入 Header。
 
@@ -1096,7 +1865,7 @@ llm := anthropic.New("claude-sonnet-4-0",
     anthropic.WithAnthropicClientOptions(
         anthropicopt.WithMiddleware(
             func(r *http.Request, next anthropicopt.MiddlewareNext) (*http.Response, error) {
-                // 例：按上下文值设置“每次请求”的头部
+                // 例：按上下文值设置"每次请求"的头部
                 if v := r.Context().Value("x-request-id"); v != nil {
                     if s, ok := v.(string); ok && s != "" {
                         r.Header.Set("X-Request-ID", s)
@@ -1113,7 +1882,7 @@ llm := anthropic.New("claude-sonnet-4-0",
 )
 ```
 
-##### 2. 使用自定义 http.RoundTripper
+##### 3. 使用自定义 http.RoundTripper
 
 在 HTTP 传输层统一注入 Header，适合同时需要代理、TLS、自定义监控等能力的场景。
 
@@ -1144,428 +1913,38 @@ llm := anthropic.New("claude-sonnet-4-0",
 - Agent/Runner 会把 `ctx` 透传至模型调用；中间件可从 `req.Context()` 读取值，从而为“本次调用”注入头部。
 - 对“对话补全”而言，目前未暴露单次调用级别的 BaseURL 覆盖；如需切换，请新建一个使用不同 BaseURL 的模型，或在中间件中修改 `r.URL`。
 
-## 高级功能
+#### 4. Token 裁剪（Token Tailoring）
 
-### 1. 模型切换（Model Switching）
-
-模型切换允许在运行时动态更换 Agent 使用的 LLM 模型。框架提供两种方式：Agent 级别切换（影响所有后续请求）和请求级别切换（仅影响单次请求）。
-
-#### Agent 级别切换
-
-Agent 级别切换会改变 Agent 的默认模型，影响所有后续请求。
-
-##### 方式一：直接设置模型实例
-
-通过 `SetModel` 方法直接传入模型实例：
-
-```go
-import (
-    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
-    "trpc.group/trpc-go/trpc-agent-go/model/openai"
-)
-
-// 创建 Agent
-agent := llmagent.New("my-agent",
-    llmagent.WithModel(openai.New("gpt-4o-mini")),
-)
-
-// 切换到其他模型
-agent.SetModel(openai.New("gpt-4o"))
-```
-
-**使用场景**：
-
-```go
-// 根据任务复杂度选择模型
-if isComplexTask {
-    agent.SetModel(openai.New("gpt-4o"))  // 使用强大模型
-} else {
-    agent.SetModel(openai.New("gpt-4o-mini"))  // 使用快速模型
-}
-```
-
-##### 方式二：按名称切换模型
-
-通过 `WithModels` 预注册多个模型，然后使用 `SetModelByName` 按名称切换：
-
-```go
-import (
-    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
-    "trpc.group/trpc-go/trpc-agent-go/model"
-    "trpc.group/trpc-go/trpc-agent-go/model/openai"
-)
-
-// 创建多个模型实例
-gpt4 := openai.New("gpt-4o")
-gpt4mini := openai.New("gpt-4o-mini")
-deepseek := openai.New("deepseek-chat")
-
-// 创建 Agent 时注册所有模型
-agent := llmagent.New("my-agent",
-    llmagent.WithModels(map[string]model.Model{
-        "smart": gpt4,
-        "fast":  gpt4mini,
-        "cheap": deepseek,
-    }),
-    llmagent.WithModel(gpt4mini), // 指定初始模型
-    llmagent.WithInstruction("你是一个智能助手。"),
-)
-
-// 运行时按名称切换模型
-err := agent.SetModelByName("smart")
-if err != nil {
-    log.Fatal(err)
-}
-
-// 切换到其他模型
-err = agent.SetModelByName("cheap")
-if err != nil {
-    log.Fatal(err)
-}
-```
-
-**使用场景**：
-
-```go
-// 根据用户等级选择模型
-modelName := "fast" // 默认使用快速模型
-if user.IsPremium() {
-    modelName = "smart" // 付费用户使用高级模型
-}
-if err := agent.SetModelByName(modelName); err != nil {
-    log.Printf("切换模型失败: %v", err)
-}
-
-// 根据时间段选择模型（成本优化）
-hour := time.Now().Hour()
-if hour >= 22 || hour < 8 {
-    // 夜间使用便宜模型
-    agent.SetModelByName("cheap")
-} else {
-    // 白天使用快速模型
-    agent.SetModelByName("fast")
-}
-```
-
-#### 请求级别切换
-
-请求级别切换允许为单次请求临时指定模型，不影响 Agent 的默认模型和其他请求。这对于需要针对特定任务使用不同模型的场景非常有用。
-
-##### 方式一：使用 WithModel 选项
-
-通过 `agent.WithModel` 为单次请求指定模型实例：
-
-```go
-import (
-    "trpc.group/trpc-go/trpc-agent-go/agent"
-    "trpc.group/trpc-go/trpc-agent-go/model/openai"
-)
-
-// 为这次请求使用特定模型
-eventChan, err := runner.Run(ctx, userID, sessionID, message,
-    agent.WithModel(openai.New("gpt-4o")),
-)
-```
-
-##### 方式二：使用 WithModelName 选项（推荐）
-
-通过 `agent.WithModelName` 为单次请求指定预注册的模型名称：
-
-```go
-// 创建 Agent 时预注册多个模型
-agent := llmagent.New("my-agent",
-    llmagent.WithModels(map[string]model.Model{
-        "smart": openai.New("gpt-4o"),
-        "fast":  openai.New("gpt-4o-mini"),
-        "cheap": openai.New("deepseek-chat"),
-    }),
-    llmagent.WithModel(openai.New("gpt-4o-mini")), // 默认模型
-)
-
-runner := runner.NewRunner("app", agent)
-
-// 为这次请求临时使用 "smart" 模型
-eventChan, err := runner.Run(ctx, userID, sessionID, message,
-    agent.WithModelName("smart"),
-)
-
-// 下一次请求仍然使用默认模型 "gpt-4o-mini"
-eventChan2, err := runner.Run(ctx, userID, sessionID, message2)
-```
-
-**使用场景**：
-
-```go
-// 根据消息复杂度动态选择模型
-var opts []agent.RunOption
-if isComplexQuery(message) {
-    opts = append(opts, agent.WithModelName("smart")) // 复杂查询使用强大模型
-}
-
-eventChan, err := runner.Run(ctx, userID, sessionID, message, opts...)
-
-// 为推理任务使用专门的推理模型
-eventChan, err := runner.Run(ctx, userID, sessionID, reasoningMessage,
-    agent.WithModelName("deepseek-reasoner"),
-)
-```
-
-#### 配置说明
-
-**WithModels 选项**：
-
-- 接受一个 `map[string]model.Model`，key 为模型名称，value 为模型实例
-- 如果同时设置了 `WithModel` 和 `WithModels`，`WithModel` 指定初始模型
-- 如果只设置了 `WithModels`，将使用 map 中的第一个模型作为初始模型（注意：map 遍历顺序不确定，建议明确指定初始模型）
-- 保留名称：`__default__` 是框架内部使用的保留名称，建议不要使用
-
-**SetModelByName 方法**：
-
-- 参数：模型名称（字符串）
-- 返回：如果模型名称不存在，返回错误
-- 模型必须是通过 `WithModels` 预先注册的
-
-**请求级别选项**：
-
-- `agent.RunOptions.Model`：直接指定模型实例
-- `agent.RunOptions.ModelName`：指定预注册的模型名称
-- 优先级：`Model` > `ModelName` > Agent 默认模型
-- 如果 `ModelName` 指定的模型不存在，将回退到 Agent 默认模型
-
-#### Agent 级别 vs 请求级别对比
-
-| 特性     | Agent 级别切换              | 请求级别切换                   |
-| -------- | --------------------------- | ------------------------------ |
-| 影响范围 | 所有后续请求                | 仅当前请求                     |
-| 使用方式 | `SetModel`/`SetModelByName` | `RunOptions.Model`/`ModelName` |
-| 状态变化 | 改变 Agent 默认模型         | 不改变 Agent 状态              |
-| 适用场景 | 全局策略调整                | 特定任务临时需求               |
-| 并发影响 | 影响所有并发请求            | 不影响其他请求                 |
-| 典型用例 | 用户等级、时间段策略        | 复杂查询、推理任务             |
-
-#### Agent 级别切换方式对比
-
-| 特性     | SetModel         | SetModelByName       |
-| -------- | ---------------- | -------------------- |
-| 使用方式 | 传入模型实例     | 传入模型名称         |
-| 预注册   | 不需要           | 需要通过 WithModels  |
-| 错误处理 | 无               | 返回 error           |
-| 适用场景 | 简单切换         | 复杂场景，多模型管理 |
-| 代码维护 | 需要持有模型实例 | 只需要记住名称       |
-
-#### 重要说明
-
-**Agent 级别切换**：
-
-- **即时生效**：调用 `SetModel` 或 `SetModelByName` 后，下一次请求立即使用新模型
-- **会话保持**：切换模型不会清除会话历史
-- **配置独立**：每个模型保留自己的配置（温度、最大 token 等）
-- **并发安全**：两种切换方式都是并发安全的
-
-**请求级别切换**：
-
-- **临时覆盖**：仅影响当前请求，不改变 Agent 的默认模型
-- **优先级高**：请求级别的模型设置优先于 Agent 默认模型
-- **无副作用**：不影响其他并发请求或后续请求
-- **灵活组合**：可以与 Agent 级别切换配合使用
-
-#### 使用示例
-
-完整的交互式示例请参考 [examples/model/switch](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/switch)，该示例演示了 Agent 级别和请求级别两种切换方式。
-
-### 2. Token 裁剪（Token Tailoring）
-
-Token Tailoring 是一种智能的消息管理技术，用于在消息超出模型上下文窗口限制时自动裁剪消息，确保请求能够成功发送到 LLM API。该功能特别适用于长对话场景，能够在保留关键上下文的同时，将消息列表控制在模型的 token 限制内。
-
-#### 核心特性
-
-- **双模式配置**：支持自动模式（automatic）和高级模式（advanced）
-- **智能保留**：自动保留系统消息和最后一轮对话
-- **多种策略**：提供 MiddleOut、HeadOut、TailOut 三种裁剪策略
-- **高效算法**：使用前缀和与二分查找，时间复杂度 O(n)
-- **实时统计**：显示裁剪前后的消息数和 token 数
-
-#### 快速开始
+Anthropic 模型同样支持 Token 裁剪功能，用于在消息超出模型上下文窗口限制时自动裁剪消息，确保请求能够成功发送到 LLM API。
 
 **自动模式（推荐）**：
 
 ```go
 import (
-    "trpc.group/trpc-go/trpc-agent-go/model/openai"
+    "trpc.group/trpc-go/trpc-agent-go/model/anthropic"
 )
 
 // 只需启用 token tailoring，其他参数自动配置
-model := openai.New("deepseek-chat",
-    openai.WithEnableTokenTailoring(true),
+model := anthropic.New("claude-3-5-sonnet",
+    anthropic.WithEnableTokenTailoring(true),
 )
 ```
-
-自动模式会：
-
-- 自动检测模型的上下文窗口大小
-- 计算最佳的 `maxInputTokens`（扣除协议开销和输出预留）
-- 使用默认的 `SimpleTokenCounter` 和 `MiddleOutStrategy`
 
 **高级模式**：
 
 ```go
 // 自定义 token 限制和策略
-model := openai.New("deepseek-chat",
-    openai.WithEnableTokenTailoring(true),               // 必需：启用 token tailoring
-    openai.WithMaxInputTokens(10000),                    // 自定义 token 限制
-    openai.WithTokenCounter(customCounter),              // 可选：自定义计数器
-    openai.WithTailoringStrategy(customStrategy),        // 可选：自定义策略
+model := anthropic.New("claude-3-5-sonnet",
+    anthropic.WithEnableTokenTailoring(true),               // 必需：启用 token tailoring
+    anthropic.WithMaxInputTokens(10000),                    // 自定义 token 限制
+    anthropic.WithTokenCounter(customCounter),              // 可选：自定义计数器
+    anthropic.WithTailoringStrategy(customStrategy),        // 可选：自定义策略
 )
 ```
 
-#### 裁剪策略
+关于 Token 计算公式、裁剪策略和自定义策略的详细说明，请参考 [OpenAI Model 的 Token 裁剪部分](#6-token-裁剪token-tailoring)。
 
-框架提供三种内置策略，适用于不同场景：
-
-**MiddleOutStrategy（默认）**：
-
-从中间移除消息，保留头部和尾部：
-
-```go
-import "trpc.group/trpc-go/trpc-agent-go/model"
-
-counter := model.NewSimpleTokenCounter()
-strategy := model.NewMiddleOutStrategy(counter)
-
-model := openai.New("deepseek-chat",
-    openai.WithEnableTokenTailoring(true),
-    openai.WithMaxInputTokens(10000),
-    openai.WithTailoringStrategy(strategy),
-)
-```
-
-- **适用场景**：需要保留对话开始和最近上下文的场景
-- **保留内容**：系统消息 + 早期消息 + 最近消息 + 最后一轮对话
-
-**HeadOutStrategy**：
-
-从头部移除消息，优先保留最近的消息：
-
-```go
-strategy := model.NewHeadOutStrategy(counter)
-
-model := openai.New("deepseek-chat",
-    openai.WithEnableTokenTailoring(true),
-    openai.WithMaxInputTokens(10000),
-    openai.WithTailoringStrategy(strategy),
-)
-```
-
-- **适用场景**：聊天应用，最近的上下文更重要
-- **保留内容**：系统消息 + 最近消息 + 最后一轮对话
-
-**TailOutStrategy**：
-
-从尾部移除消息，优先保留早期的消息：
-
-```go
-strategy := model.NewTailOutStrategy(counter)
-
-model := openai.New("deepseek-chat",
-    openai.WithEnableTokenTailoring(true),
-    openai.WithMaxInputTokens(10000),
-    openai.WithTailoringStrategy(strategy),
-)
-```
-
-- **适用场景**：RAG 应用，初始指令和上下文更重要
-- **保留内容**：系统消息 + 早期消息 + 最后一轮对话
-
-#### Token 计数器
-
-**SimpleTokenCounter（默认）**：
-
-基于字符数的快速估算：
-
-```go
-counter := model.NewSimpleTokenCounter()
-```
-
-- **优点**：快速，无外部依赖，适合大多数场景
-- **缺点**：准确度略低于 tiktoken
-
-**TikToken Counter（可选）**：
-
-使用 OpenAI 官方 tokenizer 精确计数：
-
-```go
-import "trpc.group/trpc-go/trpc-agent-go/model/tiktoken"
-
-tkCounter, err := tiktoken.New("gpt-4o")
-if err != nil {
-    // 处理错误
-}
-
-model := openai.New("gpt-4o-mini",
-    openai.WithEnableTokenTailoring(true),
-    openai.WithTokenCounter(tkCounter),
-)
-```
-
-- **优点**：准确匹配 OpenAI API 的 token 计数
-- **缺点**：需要额外依赖，性能略低
-
-#### 工作原理
-
-Token Tailoring 的执行流程：
-
-```
-1. 检查是否通过 WithEnableTokenTailoring(true) 启用 token tailoring
-2. 计算当前消息的总 token 数
-3. 如果超出限制：
-   a. 标记必须保留的消息（系统消息 + 最后一轮对话）
-   b. 应用选定的策略裁剪中间消息
-   c. 确保结果在 token 限制内
-4. 返回裁剪后的消息列表
-```
-
-**重要说明**：Token tailoring 只有在设置 `WithEnableTokenTailoring(true)` 时才会激活。`WithMaxInputTokens()` 选项仅设置 token 限制，但本身不会启用 tailoring 功能。
-
-关键设计：
-
-- **不修改原始消息**：原始消息列表保持不变
-- **智能保留**：自动保留系统消息和最后完整的用户-助手对话对
-- **高效算法**：使用前缀和（O(n)）+ 二分查找（O(log n)）
-
-#### 模型上下文注册
-
-对于框架不认识的自定义模型，可以注册其上下文窗口大小以启用自动模式：
-
-```go
-import "trpc.group/trpc-go/trpc-agent-go/model"
-
-// 注册单个模型
-model.RegisterModelContextWindow("my-custom-model", 8192)
-
-// 批量注册多个模型
-model.RegisterModelContextWindows(map[string]int{
-    "my-model-1": 4096,
-    "my-model-2": 16384,
-    "my-model-3": 32768,
-})
-
-// 之后可以使用自动模式
-m := openai.New("my-custom-model",
-    openai.WithEnableTokenTailoring(true), // 自动检测 context window
-)
-```
-
-**使用场景**：
-
-- 使用私有部署或自定义模型
-- 覆盖框架内置的 context window 配置
-- 适配新发布的模型版本
-
-#### 使用示例
-
-完整的交互式示例请参考 [examples/tailor](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/tailor)。
-
-### 3. Provider
+## Provider
 
 随着多个大模型供应商的出现，一些供应商定义了各自的 API 规范。目前，框架已接入 OpenAI 和 Anthropic 的 API，并以 Model 的形式提供，用户可以通过 `openai.New` 和 `anthropic.New` 来使用不同供应商的模型。
 
@@ -1575,17 +1954,19 @@ m := openai.New("my-custom-model",
 
 Provider 支持以下 `Option`：
 
-| Option                                                                                            | 说明                                |
-| ------------------------------------------------------------------------------------------------- | --------------------------------- |
-| `WithAPIKey` / `WithBaseURL`                                                                      | 设置模型的 API Key 和 Base URL                      |
-| `WithHTTPClientName` / `WithHTTPClientTransport`                                                  | 配置 HTTP 客户端属性                     |
-| `WithChannelBufferSize`                                                                           | 调整响应 channel 缓冲区容量                |
+| Option                                                                                            | 说明                                           |
+| ------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| `WithAPIKey` / `WithBaseURL`                                                                      | 设置模型的 API Key 和 Base URL                 |
+| `WithHTTPClientName` / `WithHTTPClientTransport`                                                  | 配置 HTTP 客户端属性                           |
+| `WithHeaders`                                                                                     | 追加 HTTP Header                               |
+| `WithChannelBufferSize`                                                                           | 调整响应 channel 缓冲区容量                    |
 | `WithCallbacks`                                                                                   | 配置 OpenAI / Anthropic 的请求、响应、流式回调 |
-| `WithExtraFields`                                                                                 | 配置请求体自定义字段                        |
-| `WithEnableTokenTailoring` / `WithMaxInputTokens`<br>`WithTokenCounter` / `WithTailoringStrategy` | Token 裁剪相关参数                      |
-| `WithOpenAI` / `WithAnthropic`                                                                    | 透传供应商原生 Option                    |
+| `WithExtraFields`                                                                                 | 配置请求体自定义字段                           |
+| `WithEnableTokenTailoring` / `WithMaxInputTokens`<br>`WithTokenCounter` / `WithTailoringStrategy` | Token 裁剪相关参数                             |
+| `WithTokenTailoringConfig`                                                                        | 高级配置：自定义 token 裁剪预算参数            |
+| `WithOpenAIOption` / `WithAnthropicOption`                                                        | 透传供应商原生 Option                          |
 
-#### 使用示例
+### 使用示例
 
 ```go
 import (
@@ -1604,14 +1985,44 @@ modelInstance, err := provider.Model(
     provider.WithChannelBufferSize(c.channelBufferSize),
     provider.WithEnableTokenTailoring(c.tokenTailoring),
     provider.WithMaxInputTokens(c.maxInputTokens),
+    provider.WithHeaders(map[string]string{
+        "X-Custom-Header": "custom-value",
+        "X-Request-ID":    "req-123",
+    }),
 )
 
 agent := llmagent.New("chat-assistant", llmagent.WithModel(modelInstance))
 ```
 
+**高级配置：使用 TokenTailoringConfig**：
+
+对于需要精细调整 token 分配策略的高级用户，可以使用 `WithTokenTailoringConfig`：
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/model/provider"
+)
+
+// 为所有 provider 自定义 token 裁剪预算参数
+config := &model.TokenTailoringConfig{
+    ProtocolOverheadTokens: 1024,
+    ReserveOutputTokens:    4096,
+    SafetyMarginRatio:      0.15,
+}
+
+modelInstance, err := provider.Model(
+    "openai",
+    "deepseek-chat",
+    provider.WithAPIKey(c.apiKey),
+    provider.WithEnableTokenTailoring(true),
+    provider.WithTokenTailoringConfig(config),
+)
+```
+
 完整代码可参见 [examples/provider](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/provider)。
 
-#### 注册自定义 Provider
+### 注册自定义 Provider
 
 框架支持通过注册自定义 Provider 来接入其他大模型供应商或自定义实现的模型。
 

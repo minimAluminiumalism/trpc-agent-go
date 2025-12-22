@@ -148,6 +148,33 @@ type Usage struct {
 
     // 响应中使用的总 Token 数量.
     TotalTokens int `json:"total_tokens"`
+
+    // 时间统计信息（可选）
+    TimingInfo *TimingInfo `json:"timing_info,omitempty"`
+}
+
+type TimingInfo struct {
+    // FirstTokenDuration 是从请求开始到第一个有意义 token 的累积时长
+    // "有意义的 token" 定义为：包含 reasoning 内容、常规内容或工具调用的第一个 chunk
+    // 
+    // 返回时机：
+    // - 流式请求：在收到第一个有意义的 chunk 时立即计算并返回
+    // - 非流式请求：在收到完整响应时计算并返回
+    FirstTokenDuration time.Duration `json:"time_to_first_token,omitempty"`
+
+    // ReasoningDuration 是 reasoning 阶段的累积时长（仅流式模式）
+    // 从每次 LLM 调用的第一个 reasoning chunk 到最后一个 reasoning chunk 的时间
+    //
+    // 测量细节：
+    // - 收到第一个包含 reasoning 内容的 chunk 时开始计时
+    // - 持续计时所有后续的 reasoning chunks
+    // - 收到第一个非 reasoning chunk（常规内容或工具调用）时停止计时
+    //
+    // 返回时机：
+    // - 流式请求：在检测到 reasoning 结束时（即收到第一个非 reasoning 的 content/tool call chunk）
+    //   立即计算并返回
+    // - 非流式请求：无法精确测量，此字段将保持为 0
+    ReasoningDuration time.Duration `json:"reasoning_duration,omitempty"`
 }
 ```
 
@@ -204,6 +231,15 @@ const (
  - 按标签（Tag）过滤：隐藏 `Event.Tag` 中包含 `transfer` 的事件。框架会为与委托相关的事件（包括 transfer 工具结果）统一打上 `transfer` 标签，按标签过滤不会破坏 ToolCall/ToolResult 的配对关系。
 
  标签以分号（`;`）分隔。自定义事件可使用 `event.WithTag(tag)` 追加标签，多标签格式为 `tag1;tag2;...`。
+
+### 代码执行事件标签
+
+对于代码执行（Code Execution）相关的事件，可通过 `Event.Tag` 区分代码和执行结果：
+
+- **代码执行事件**：`Response.Object == "postprocessing.code_execution"` 且 `Event.ContainsTag(event.TagCodeExecution)`
+- **执行结果事件**：`Response.Object == "postprocessing.code_execution"` 且 `Event.ContainsTag(event.TagCodeExecutionResult)`
+
+相关常量定义在 `trpc.group/trpc-go/trpc-agent-go/event` 包中。
 
 #### 辅助方法：检测 Runner 完成
 

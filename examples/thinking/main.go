@@ -34,6 +34,10 @@ var (
 	streaming       = flag.Bool("streaming", true, "Enable streaming mode for responses")
 	thinkingEnabled = flag.Bool("thinking", true, "Enable reasoning/thinking mode if provider supports it")
 	thinkingTokens  = flag.Int("thinking-tokens", 2048, "Max reasoning tokens if provider supports it")
+	variant         = flag.String("variant", "openai", "Name of Variant to use when use openai provider, openai / hunyuan / deepseek / qwen")
+	debug           = flag.Bool("debug", true, "Print messages sent to model API for debugging")
+	reasoningMode   = flag.String("reasoning-mode", "discard_previous",
+		"How to handle reasoning_content in history: keep_all, discard_previous, discard_all")
 )
 
 func main() {
@@ -43,9 +47,11 @@ func main() {
 	fmt.Printf("\nModel: %s\n", *modelName)
 	fmt.Printf("Streaming: %t\n", *streaming)
 	fmt.Printf("Thinking: %t (tokens=%d)\n", *thinkingEnabled, *thinkingTokens)
+	fmt.Printf("Reasoning Mode: %s\n", *reasoningMode)
+	fmt.Printf("Debug: %t\n", *debug)
 	fmt.Println(strings.Repeat("=", 50))
 
-	chat := &thinkingChat{modelName: *modelName, streaming: *streaming}
+	chat := &thinkingChat{modelName: *modelName, streaming: *streaming, variant: *variant}
 	if err := chat.run(context.Background()); err != nil {
 		log.Fatalf("Thinking demo failed: %v", err)
 	}
@@ -59,17 +65,29 @@ type thinkingChat struct {
 	sessionID string
 	appName   string
 	sessSvc   session.Service
+	variant   string
 }
 
 func (c *thinkingChat) run(ctx context.Context) error {
 	if err := c.setup(ctx); err != nil {
 		return err
 	}
+
+	// Ensure runner resources are cleaned up (trpc-agent-go >= v0.5.0)
+	defer c.runner.Close()
+
 	return c.startChat(ctx)
 }
 
 func (c *thinkingChat) setup(_ context.Context) error {
-	modelInstance := openai.New(c.modelName)
+	modelOpts := []openai.Option{openai.WithVariant(openai.Variant(c.variant))}
+
+	// Add debug callback if enabled.
+	if *debug {
+		modelOpts = append(modelOpts, openai.WithChatRequestCallback(printChatRequestMessages))
+	}
+
+	modelInstance := openai.New(c.modelName, modelOpts...)
 
 	// always use in-memory session for this demo
 	var sessionService session.Service = sessioninmemory.NewSessionService()
@@ -84,13 +102,17 @@ func (c *thinkingChat) setup(_ context.Context) error {
 		genConfig.ThinkingTokens = thinkingTokens
 	}
 
-	agent := llmagent.New(
-		"thinking-assistant",
+	agentOpts := []llmagent.Option{
 		llmagent.WithModel(modelInstance),
-		llmagent.WithDescription("A focused demo showing reasoning content."),
-		llmagent.WithInstruction("Be helpful and conversational."),
+		llmagent.WithDescription("A focused demo showing reasoning content with optional tools."),
+		llmagent.WithInstruction("Be helpful and conversational. Use tools when appropriate."),
 		llmagent.WithGenerationConfig(genConfig),
-	)
+		llmagent.WithTools(buildTools()),
+	}
+	// Add reasoning content mode based on flag.
+	agentOpts = append(agentOpts, llmagent.WithReasoningContentMode(resolveReasoningMode()))
+
+	agent := llmagent.New("thinking-assistant", agentOpts...)
 
 	c.runner = runner.NewRunner(
 		"thinking-demo",
@@ -102,7 +124,7 @@ func (c *thinkingChat) setup(_ context.Context) error {
 	c.appName = "thinking-demo"
 	c.sessSvc = sessionService
 	fmt.Printf("✅ Ready! Session: %s\n", c.sessionID)
-	fmt.Printf("(Note: dim text indicates internal reasoning; normal text is the final answer)\n\n")
+	fmt.Println()
 	return nil
 }
 
@@ -193,11 +215,45 @@ func (c *thinkingChat) processResponse(eventChan <-chan *event.Event) error {
 			}
 		}
 		if e.IsFinalResponse() {
+			// Print timing information at the end
+			c.printTimingInfo(e)
 			fmt.Printf("\n")
 			break
 		}
 	}
 	return nil
+}
+
+// printTimingInfo displays timing information from the final event.
+func (c *thinkingChat) printTimingInfo(event *event.Event) {
+	colorReset := "\033[0m"
+	colorYellow := "\033[33m" // For timing info
+	if event.Response == nil || event.Response.Usage == nil || event.Response.Usage.TimingInfo == nil {
+		return
+	}
+
+	timing := event.Response.Usage.TimingInfo
+	fmt.Printf("\n\n%s⏱️  Timing Info:%s\n", colorYellow, colorReset)
+
+	// Time to first token
+	if timing.FirstTokenDuration > 0 {
+		fmt.Printf("%s   • Time to first token: %v%s\n", colorYellow, timing.FirstTokenDuration, colorReset)
+	}
+
+	// Reasoning duration
+	if timing.ReasoningDuration > 0 {
+		fmt.Printf("%s   • Reasoning: %v%s\n", colorYellow, timing.ReasoningDuration, colorReset)
+	}
+
+	// Token usage
+	if event.Response.Usage.TotalTokens > 0 {
+		fmt.Printf("%s   • Tokens: %d (prompt: %d, completion: %d%s)\n",
+			colorYellow,
+			event.Response.Usage.TotalTokens,
+			event.Response.Usage.PromptTokens,
+			event.Response.Usage.CompletionTokens,
+			colorReset)
+	}
 }
 
 func (c *thinkingChat) extractContent(choice model.Choice) string {
@@ -256,6 +312,18 @@ func (c *thinkingChat) startNewSession() {
 	fmt.Printf("   Current:  %s\n", c.sessionID)
 	fmt.Printf("   (Conversation history has been reset)\n")
 	fmt.Println()
+}
+
+// resolveReasoningMode converts the flag value to llmagent constant.
+func resolveReasoningMode() string {
+	switch *reasoningMode {
+	case "discard_previous", "discard-previous":
+		return llmagent.ReasoningContentModeDiscardPreviousTurns
+	case "discard_all", "discard-all":
+		return llmagent.ReasoningContentModeDiscardAll
+	default:
+		return llmagent.ReasoningContentModeKeepAll
+	}
 }
 
 func intPtr(i int) *int           { return &i }

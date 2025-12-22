@@ -11,6 +11,7 @@ package openai
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,7 +27,9 @@ import (
 	openaigo "github.com/openai/openai-go"
 	openaiopt "github.com/openai/openai-go/option"
 	"github.com/openai/openai-go/packages/respjson"
+	agentlog "trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	imodel "trpc.group/trpc-go/trpc-agent-go/model/internal/model"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 
 	"github.com/stretchr/testify/assert"
@@ -240,6 +243,25 @@ type stubTool struct{ decl *tool.Declaration }
 func (s stubTool) Call(_ context.Context, _ []byte) (any, error) { return nil, nil }
 func (s stubTool) Declaration() *tool.Declaration                { return s.decl }
 
+type stubLogger struct {
+	errorfCalled bool
+	errorfMsg    string
+}
+
+func (stubLogger) Debug(args ...any)                 {}
+func (stubLogger) Debugf(format string, args ...any) {}
+func (stubLogger) Info(args ...any)                  {}
+func (stubLogger) Infof(format string, args ...any)  {}
+func (stubLogger) Warn(args ...any)                  {}
+func (stubLogger) Warnf(format string, args ...any)  {}
+func (stubLogger) Error(args ...any)                 {}
+func (l *stubLogger) Errorf(format string, args ...any) {
+	l.errorfCalled = true
+	l.errorfMsg = fmt.Sprintf(format, args...)
+}
+func (stubLogger) Fatal(args ...any)                 {}
+func (stubLogger) Fatalf(format string, args ...any) {}
+
 // TestModel_convertMessages verifies that messages are converted to the
 // openai-go request format with the expected roles and fields.
 func TestModel_convertMessages(t *testing.T) {
@@ -293,6 +315,106 @@ func TestModel_convertMessages(t *testing.T) {
 	require.NotEmpty(t, assistantUnion.GetToolCalls(), "assistant message should contain tool calls")
 }
 
+// TestModel_convertMessages_ReasoningContent verifies that reasoning_content
+// is passed to the OpenAI API via SetExtraFields for assistant messages.
+func TestModel_convertMessages_ReasoningContent(t *testing.T) {
+	m := New("dummy-model")
+
+	const testReasoningContent = "This is my step-by-step reasoning process."
+
+	t.Run("assistant message with reasoning_content", func(t *testing.T) {
+		msgs := []model.Message{
+			{
+				Role:             model.RoleAssistant,
+				Content:          "The answer is 42.",
+				ReasoningContent: testReasoningContent,
+			},
+		}
+
+		converted := m.convertMessages(msgs)
+		require.Len(t, converted, 1)
+		require.NotNil(t, converted[0].OfAssistant)
+
+		// Verify reasoning_content is included by marshaling to JSON.
+		data, err := json.Marshal(converted[0].OfAssistant)
+		require.NoError(t, err)
+
+		var parsed map[string]any
+		err = json.Unmarshal(data, &parsed)
+		require.NoError(t, err)
+
+		reasoningValue, ok := parsed[model.ReasoningContentKey]
+		require.True(t, ok, "reasoning_content should be present in serialized JSON")
+		assert.Equal(t, testReasoningContent, reasoningValue)
+	})
+
+	t.Run("assistant message without reasoning_content", func(t *testing.T) {
+		msgs := []model.Message{
+			{
+				Role:    model.RoleAssistant,
+				Content: "Simple response without reasoning.",
+			},
+		}
+
+		converted := m.convertMessages(msgs)
+		require.Len(t, converted, 1)
+		require.NotNil(t, converted[0].OfAssistant)
+
+		// Verify reasoning_content is NOT included when empty.
+		data, err := json.Marshal(converted[0].OfAssistant)
+		require.NoError(t, err)
+
+		var parsed map[string]any
+		err = json.Unmarshal(data, &parsed)
+		require.NoError(t, err)
+
+		_, ok := parsed[model.ReasoningContentKey]
+		assert.False(t, ok, "reasoning_content should NOT be present when empty")
+	})
+
+	t.Run("assistant message with tool calls and reasoning_content", func(t *testing.T) {
+		msgs := []model.Message{
+			{
+				Role:             model.RoleAssistant,
+				Content:          "",
+				ReasoningContent: "I need to call the calculator tool.",
+				ToolCalls: []model.ToolCall{
+					{
+						ID:   "call-123",
+						Type: "function",
+						Function: model.FunctionDefinitionParam{
+							Name:      "calculator",
+							Arguments: []byte(`{"expression":"2+2"}`),
+						},
+					},
+				},
+			},
+		}
+
+		converted := m.convertMessages(msgs)
+		require.Len(t, converted, 1)
+		require.NotNil(t, converted[0].OfAssistant)
+
+		// Verify both reasoning_content and tool_calls are present.
+		data, err := json.Marshal(converted[0].OfAssistant)
+		require.NoError(t, err)
+
+		var parsed map[string]any
+		err = json.Unmarshal(data, &parsed)
+		require.NoError(t, err)
+
+		// Check reasoning_content.
+		reasoningValue, ok := parsed[model.ReasoningContentKey]
+		require.True(t, ok, "reasoning_content should be present")
+		assert.Equal(t, "I need to call the calculator tool.", reasoningValue)
+
+		// Check tool_calls.
+		toolCalls, ok := parsed["tool_calls"]
+		require.True(t, ok, "tool_calls should be present")
+		require.NotNil(t, toolCalls)
+	})
+}
+
 // TestModel_convertTools ensures that tool declarations are mapped to the
 // expected OpenAI function definitions.
 func TestModel_convertTools(t *testing.T) {
@@ -319,6 +441,85 @@ func TestModel_convertTools(t *testing.T) {
 	require.True(t, fn.Description.Valid() && fn.Description.Value == toolDesc, "function description mismatch")
 
 	require.False(t, reflect.ValueOf(fn.Parameters).IsZero(), "expected parameters to be populated from schema")
+}
+
+func TestBuildToolDescription_AppendsOutputSchema(t *testing.T) {
+	schema := &tool.Schema{
+		Type: "object",
+		Properties: map[string]*tool.Schema{
+			"result": {Type: "string"},
+		},
+	}
+	decl := &tool.Declaration{
+		Name:         "example",
+		Description:  "base",
+		OutputSchema: schema,
+	}
+
+	desc := buildToolDescription(decl)
+
+	assert.Contains(t, desc, "base", "expected base description to be preserved")
+	assert.Contains(t, desc, "Output schema:", "expected output schema label to be present")
+	assert.Contains(t, desc, `"result"`, "expected output schema to be present in description")
+}
+
+func TestBuildToolDescription_MarshalError(t *testing.T) {
+	logger := &stubLogger{}
+	originalLogger := agentlog.Default
+	agentlog.Default = logger
+	defer func() { agentlog.Default = originalLogger }()
+
+	decl := &tool.Declaration{
+		Name:        "invalid",
+		Description: "desc",
+		OutputSchema: &tool.Schema{
+			Type:                 "object",
+			AdditionalProperties: func() {},
+		},
+	}
+
+	desc := buildToolDescription(decl)
+
+	assert.Equal(t, "desc", desc, "description should fall back when marshal fails")
+	assert.True(t, logger.errorfCalled, "expected marshal error to be logged")
+	assert.Contains(t, logger.errorfMsg, "marshal output schema", "expected marshal error message")
+}
+
+func TestBuildToolDescription_NoOutputSchema(t *testing.T) {
+	decl := &tool.Declaration{
+		Name:        "example",
+		Description: "only desc",
+	}
+
+	desc := buildToolDescription(decl)
+
+	assert.Equal(t, "only desc", desc, "description should remain unchanged without output schema")
+}
+
+func TestConvertTools_UsesOutputSchemaInDescription(t *testing.T) {
+	m := New("dummy")
+	outputSchema := &tool.Schema{
+		Type: "object",
+		Properties: map[string]*tool.Schema{
+			"value": {Type: "number"},
+		},
+	}
+	decl := &tool.Declaration{
+		Name:         "tool1",
+		Description:  "desc",
+		InputSchema:  &tool.Schema{Type: "object"},
+		OutputSchema: outputSchema,
+	}
+
+	params := m.convertTools(map[string]tool.Tool{
+		decl.Name: stubTool{decl: decl},
+	})
+
+	require.Len(t, params, 1)
+	expectedDesc := buildToolDescription(decl)
+	require.True(t, params[0].Function.Description.Valid(), "function description should be set")
+	assert.Equal(t, expectedDesc, params[0].Function.Description.Value)
+	assert.Contains(t, params[0].Function.Description.Value, `"value"`, "output schema JSON should be embedded")
 }
 
 // TestModel_Callbacks tests that callback functions are properly called with
@@ -874,10 +1075,12 @@ func TestWithEnableTokenTailoring_SimpleMode(t *testing.T) {
 	)
 
 	// Create many messages to trigger tailoring.
-	// With gpt-4o-mini (contextWindow=200000), maxInputTokens=130000 (65% ratio).
-	// Need ~500 messages * 300 tokens each = ~150000 tokens to exceed limit.
+	// With gpt-4o-mini (contextWindow=200000), maxInputTokens calculated as:
+	// safetyMargin = 200000 * 0.10 = 20000
+	// maxInputTokens = 200000 - 2048 - 512 - 20000 = 177440 (~88.7% of context)
+	// Need ~600 messages * 300 tokens each = ~180000 tokens to exceed limit.
 	messages := []model.Message{model.NewSystemMessage("You are a helpful assistant.")}
-	for i := 0; i < 500; i++ {
+	for i := 0; i < 600; i++ {
 		messages = append(messages, model.NewUserMessage(fmt.Sprintf("Message %d: %s", i, strings.Repeat("lorem ipsum ", 100))))
 	}
 
@@ -1272,6 +1475,37 @@ func TestWithOpenAIOptions_CombinedOptions(t *testing.T) {
 	assert.NotNil(t, m.chatResponseCallback, "expected chat response callback to be set")
 
 	assert.NotNil(t, m.chatChunkCallback, "expected chat chunk callback to be set")
+}
+
+func TestWithHeaders_AppendsOptions(t *testing.T) {
+	opts := &options{}
+	source := map[string]string{
+		"X-Custom":   "a",
+		"X-Request":  "req-1",
+		"User-Agent": "ua",
+	}
+
+	WithHeaders(source)(opts)
+	assert.Len(t, opts.OpenAIOptions, 3, "expected headers to expand into OpenAI options")
+
+	// Mutation after application should not affect already captured values.
+	source["X-Custom"] = "changed"
+	WithHeaders(map[string]string{"X-Another": "extra"})(opts)
+	assert.Len(t, opts.OpenAIOptions, 4, "expected additional headers to append")
+
+	opts1 := &options{}
+	WithHeaders(nil)(opts1)
+	assert.Len(t, opts1.OpenAIOptions, 0, "expected no headers to be applied")
+
+}
+
+func TestWithShowToolCallDelta(t *testing.T) {
+	opts := &options{}
+	WithShowToolCallDelta(true)(opts)
+	assert.True(t, opts.ShowToolCallDelta, "expected showToolCallDelta to be true")
+
+	WithShowToolCallDelta(false)(opts)
+	assert.False(t, opts.ShowToolCallDelta, "expected showToolCallDelta to be false")
 }
 
 func TestConvertSystemMessageContent(t *testing.T) {
@@ -2184,12 +2418,11 @@ func TestOpenAI_TokenCounterInitialization(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Create OpenAI client
-			client := &Model{
-				name:                 "gpt-3.5-turbo",
-				apiKey:               "test-api-key",
-				enableTokenTailoring: true, // Enable token tailoring to trigger initialization
-				tokenCounter:         tt.initialTokenCounter,
-			}
+			client := New("gpt-3.5-turbo",
+				WithAPIKey("test-api-key"),
+				WithEnableTokenTailoring(true),
+				WithTokenCounter(tt.initialTokenCounter),
+			)
 
 			// Create a simple conversation to trigger the initialization logic
 			conv := []model.Message{
@@ -2269,12 +2502,11 @@ func TestOpenAI_TailoringStrategyInitialization(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Create OpenAI client
-			client := &Model{
-				name:                 "gpt-3.5-turbo",
-				apiKey:               "test-api-key",
-				enableTokenTailoring: true, // Enable token tailoring to trigger initialization
-				tailoringStrategy:    tt.initialTailoringStrategy,
-			}
+			client := New("gpt-3.5-turbo",
+				WithAPIKey("test-api-key"),
+				WithEnableTokenTailoring(true),
+				WithTailoringStrategy(tt.initialTailoringStrategy),
+			)
 
 			// Create a simple conversation to trigger the initialization logic
 			conv := []model.Message{
@@ -2335,12 +2567,11 @@ func TestOpenAI_TailoringStrategyInitialization(t *testing.T) {
 
 func TestOpenAI_ConcurrentInitialization(t *testing.T) {
 	// Test concurrent access to ensure sync.Once works correctly
-	client := &Model{
-		name:                 "gpt-3.5-turbo",
-		apiKey:               "test-api-key",
-		enableTokenTailoring: true, // Enable token tailoring to trigger initialization
-		// Don't set tokenCounter or tailoringStrategy to test default initialization
-	}
+	client := New(
+		"gpt-3.5-turbo",
+		WithAPIKey("test-api-key"),
+		WithEnableTokenTailoring(true),
+	)
 
 	// Create a mock HTTP server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2535,6 +2766,10 @@ func TestWithBatchCompletionWindow(t *testing.T) {
 	WithBatchCompletionWindow(window)(opts)
 
 	assert.Equal(t, window, opts.BatchCompletionWindow, "expected BatchCompletionWindow to be set")
+
+	opts1 := &options{}
+	WithBatchCompletionWindow("")(opts1)
+	assert.Equal(t, openai.BatchNewParamsCompletionWindow(defaultBatchCompletionWindow), opts1.BatchCompletionWindow, "expected BatchCompletionWindow to be set")
 }
 
 // TestWithBatchMetadata tests the WithBatchMetadata option.
@@ -2817,6 +3052,219 @@ func TestWithChatStreamCompleteCallback_OptionSetting(t *testing.T) {
 	WithChatStreamCompleteCallback(callbackFunc)(opts)
 
 	assert.NotNil(t, opts.ChatStreamCompleteCallback, "expected ChatStreamCompleteCallback to be set")
+}
+
+// TestWithAccumulateChunkTokenUsage tests that the accumulate chunk usage function is properly set.
+func TestWithAccumulateChunkTokenUsage(t *testing.T) {
+	t.Run("custom accumulate function is set", func(t *testing.T) {
+		customAccumulateFunc := func(u model.Usage, delta model.Usage) model.Usage {
+			return model.Usage{
+				PromptTokens:     u.PromptTokens + delta.PromptTokens,
+				CompletionTokens: u.CompletionTokens + delta.CompletionTokens,
+				TotalTokens:      u.TotalTokens + delta.TotalTokens,
+			}
+		}
+
+		opts := &options{}
+		WithAccumulateChunkTokenUsage(customAccumulateFunc)(opts)
+
+		assert.NotNil(t, opts.accumulateChunkUsage, "expected accumulateChunkUsage to be set")
+	})
+
+	t.Run("accumulate function works correctly", func(t *testing.T) {
+		customAccumulateFunc := func(u model.Usage, delta model.Usage) model.Usage {
+			return model.Usage{
+				PromptTokens:     u.PromptTokens + delta.PromptTokens*2,
+				CompletionTokens: u.CompletionTokens + delta.CompletionTokens*2,
+				TotalTokens:      u.TotalTokens + delta.TotalTokens*2,
+			}
+		}
+
+		opts := &options{}
+		WithAccumulateChunkTokenUsage(customAccumulateFunc)(opts)
+
+		// Test the function behavior
+		currentUsage := model.Usage{
+			PromptTokens:     10,
+			CompletionTokens: 20,
+			TotalTokens:      30,
+		}
+		delta := model.Usage{
+			PromptTokens:     5,
+			CompletionTokens: 10,
+			TotalTokens:      15,
+		}
+
+		result := opts.accumulateChunkUsage(currentUsage, delta)
+		assert.Equal(t, 20, result.PromptTokens, "expected prompt tokens to be 20 (10 + 5*2)")
+		assert.Equal(t, 40, result.CompletionTokens, "expected completion tokens to be 40 (20 + 10*2)")
+		assert.Equal(t, 60, result.TotalTokens, "expected total tokens to be 60 (30 + 15*2)")
+	})
+
+	t.Run("nil function is set", func(t *testing.T) {
+		opts := &options{}
+		WithAccumulateChunkTokenUsage(nil)(opts)
+
+		assert.Nil(t, opts.accumulateChunkUsage, "expected accumulateChunkUsage to be nil")
+	})
+}
+
+// TestInverseOPENAISKDAddChunkUsage tests the inverse accumulation of chunk usage.
+func TestInverseOPENAISKDAddChunkUsage(t *testing.T) {
+	t.Run("subtracts delta from current usage", func(t *testing.T) {
+		currentUsage := model.Usage{
+			PromptTokens:     100,
+			CompletionTokens: 50,
+			TotalTokens:      150,
+		}
+		delta := model.Usage{
+			PromptTokens:     10,
+			CompletionTokens: 5,
+			TotalTokens:      15,
+		}
+
+		result := inverseOPENAISKDAddChunkUsage(currentUsage, delta)
+
+		assert.Equal(t, 90, result.PromptTokens, "expected prompt tokens to be 90 (100 - 10)")
+		assert.Equal(t, 45, result.CompletionTokens, "expected completion tokens to be 45 (50 - 5)")
+		assert.Equal(t, 135, result.TotalTokens, "expected total tokens to be 135 (150 - 15)")
+	})
+
+	t.Run("handles zero delta", func(t *testing.T) {
+		currentUsage := model.Usage{
+			PromptTokens:     100,
+			CompletionTokens: 50,
+			TotalTokens:      150,
+		}
+		delta := model.Usage{
+			PromptTokens:     0,
+			CompletionTokens: 0,
+			TotalTokens:      0,
+		}
+
+		result := inverseOPENAISKDAddChunkUsage(currentUsage, delta)
+
+		assert.Equal(t, 100, result.PromptTokens, "expected prompt tokens to remain 100")
+		assert.Equal(t, 50, result.CompletionTokens, "expected completion tokens to remain 50")
+		assert.Equal(t, 150, result.TotalTokens, "expected total tokens to remain 150")
+	})
+
+	t.Run("handles negative result", func(t *testing.T) {
+		currentUsage := model.Usage{
+			PromptTokens:     10,
+			CompletionTokens: 5,
+			TotalTokens:      15,
+		}
+		delta := model.Usage{
+			PromptTokens:     20,
+			CompletionTokens: 10,
+			TotalTokens:      30,
+		}
+
+		result := inverseOPENAISKDAddChunkUsage(currentUsage, delta)
+
+		assert.Equal(t, -10, result.PromptTokens, "expected prompt tokens to be -10 (10 - 20)")
+		assert.Equal(t, -5, result.CompletionTokens, "expected completion tokens to be -5 (5 - 10)")
+		assert.Equal(t, -15, result.TotalTokens, "expected total tokens to be -15 (15 - 30)")
+	})
+}
+
+// TestModelUsageToCompletionUsage tests conversion from model.Usage to openai.CompletionUsage.
+func TestModelUsageToCompletionUsage(t *testing.T) {
+	t.Run("converts all fields correctly", func(t *testing.T) {
+		modelUsage := model.Usage{
+			PromptTokens:     100,
+			CompletionTokens: 50,
+			TotalTokens:      150,
+			PromptTokensDetails: model.PromptTokensDetails{
+				CachedTokens: 20,
+			},
+		}
+
+		result := modelUsageToCompletionUsage(modelUsage)
+
+		assert.Equal(t, int64(100), result.PromptTokens, "expected prompt tokens to be 100")
+		assert.Equal(t, int64(50), result.CompletionTokens, "expected completion tokens to be 50")
+		assert.Equal(t, int64(150), result.TotalTokens, "expected total tokens to be 150")
+		assert.Equal(t, int64(20), result.PromptTokensDetails.CachedTokens, "expected cached tokens to be 20")
+	})
+
+	t.Run("converts zero values", func(t *testing.T) {
+		modelUsage := model.Usage{
+			PromptTokens:     0,
+			CompletionTokens: 0,
+			TotalTokens:      0,
+			PromptTokensDetails: model.PromptTokensDetails{
+				CachedTokens: 0,
+			},
+		}
+
+		result := modelUsageToCompletionUsage(modelUsage)
+
+		assert.Equal(t, int64(0), result.PromptTokens, "expected prompt tokens to be 0")
+		assert.Equal(t, int64(0), result.CompletionTokens, "expected completion tokens to be 0")
+		assert.Equal(t, int64(0), result.TotalTokens, "expected total tokens to be 0")
+		assert.Equal(t, int64(0), result.PromptTokensDetails.CachedTokens, "expected cached tokens to be 0")
+	})
+
+	t.Run("roundtrip conversion", func(t *testing.T) {
+		originalUsage := model.Usage{
+			PromptTokens:     123,
+			CompletionTokens: 456,
+			TotalTokens:      579,
+			PromptTokensDetails: model.PromptTokensDetails{
+				CachedTokens: 78,
+			},
+		}
+
+		// Convert to OpenAI format and back
+		openaiUsage := modelUsageToCompletionUsage(originalUsage)
+		backToModel := completionUsageToModelUsage(openaiUsage)
+
+		assert.Equal(t, originalUsage.PromptTokens, backToModel.PromptTokens, "expected prompt tokens to match after roundtrip")
+		assert.Equal(t, originalUsage.CompletionTokens, backToModel.CompletionTokens, "expected completion tokens to match after roundtrip")
+		assert.Equal(t, originalUsage.TotalTokens, backToModel.TotalTokens, "expected total tokens to match after roundtrip")
+		assert.Equal(t, originalUsage.PromptTokensDetails.CachedTokens, backToModel.PromptTokensDetails.CachedTokens, "expected cached tokens to match after roundtrip")
+	})
+}
+
+// TestCompletionUsageToModelUsage tests conversion from openai.CompletionUsage to model.Usage.
+func TestCompletionUsageToModelUsage(t *testing.T) {
+	t.Run("converts all fields correctly", func(t *testing.T) {
+		openaiUsage := openai.CompletionUsage{
+			PromptTokens:     int64(200),
+			CompletionTokens: int64(75),
+			TotalTokens:      int64(275),
+			PromptTokensDetails: openai.CompletionUsagePromptTokensDetails{
+				CachedTokens: int64(30),
+			},
+		}
+
+		result := completionUsageToModelUsage(openaiUsage)
+
+		assert.Equal(t, 200, result.PromptTokens, "expected prompt tokens to be 200")
+		assert.Equal(t, 75, result.CompletionTokens, "expected completion tokens to be 75")
+		assert.Equal(t, 275, result.TotalTokens, "expected total tokens to be 275")
+		assert.Equal(t, 30, result.PromptTokensDetails.CachedTokens, "expected cached tokens to be 30")
+	})
+
+	t.Run("converts zero values", func(t *testing.T) {
+		openaiUsage := openai.CompletionUsage{
+			PromptTokens:     int64(0),
+			CompletionTokens: int64(0),
+			TotalTokens:      int64(0),
+			PromptTokensDetails: openai.CompletionUsagePromptTokensDetails{
+				CachedTokens: int64(0),
+			},
+		}
+
+		result := completionUsageToModelUsage(openaiUsage)
+
+		assert.Equal(t, 0, result.PromptTokens, "expected prompt tokens to be 0")
+		assert.Equal(t, 0, result.CompletionTokens, "expected completion tokens to be 0")
+		assert.Equal(t, 0, result.TotalTokens, "expected total tokens to be 0")
+		assert.Equal(t, 0, result.PromptTokensDetails.CachedTokens, "expected cached tokens to be 0")
+	})
 }
 
 // TestWithChannelBufferSize_EdgeCases tests WithChannelBufferSize with edge cases.
@@ -3132,22 +3580,32 @@ func TestWithEnableTokenTailoring_SafetyMarginAndRatioLimit(t *testing.T) {
 	}
 
 	require.NotNil(t, captured, "expected request callback to capture request")
-	// After tailoring with safety margin and ratio limit, messages should be significantly reduced.
+	// After tailoring with safety margin, messages should be significantly reduced.
 	require.Less(t, len(captured.Messages), len(messages), "expected messages to be tailored, got %d (original: %d)", len(captured.Messages), len(messages))
-	// With 65% ratio limit (safetyMargin=10%, protocolOverhead=512, reserveOutput=2048),
-	// we expect roughly 55-65% of the original messages depending on token distribution.
-	require.LessOrEqual(t, len(captured.Messages), int(float64(len(messages))*0.70), "expected messages to be reduced to at most 70%% due to ratio limit, got %d (original: %d)", len(captured.Messages), len(messages))
+	// With 100% ratio limit and safety margin (10%), protocol overhead (512), reserve output (2048),
+	// we expect roughly 88-90% of the original messages to be kept, depending on token distribution.
+	// For 1201 messages, we expect ~940-1080 messages after tailoring.
+	require.GreaterOrEqual(t, len(captured.Messages), int(float64(len(messages))*0.70), "expected at least 70%% messages to be kept, got %d (original: %d)", len(captured.Messages), len(messages))
+	require.LessOrEqual(t, len(captured.Messages), int(float64(len(messages))*0.95), "expected at most 95%% messages to be kept due to safety margin, got %d (original: %d)", len(captured.Messages), len(messages))
 }
 
 // TestHasReasoningContent tests the hasReasoningContent method.
 func TestHasReasoningContent(t *testing.T) {
 	m := &Model{}
 
-	// Test with nil ExtraFields.
-	delta1 := openai.ChatCompletionChunkChoiceDelta{}
+	// Test with empty choices.
+	choices := []openai.ChatCompletionChunkChoice{}
 	// Since we can't easily construct the JSON field in tests,
-	// we'll test the method doesn't panic with empty delta.
-	assert.False(t, m.hasReasoningContent(delta1))
+	// we'll test the method doesn't panic with empty choices.
+	assert.False(t, m.hasReasoningContent(choices))
+
+	// Test with a choice that has an empty delta.
+	choicesWithDelta := []openai.ChatCompletionChunkChoice{
+		{
+			Delta: openai.ChatCompletionChunkChoiceDelta{},
+		},
+	}
+	assert.False(t, m.hasReasoningContent(choicesWithDelta))
 
 	// Note: Testing with actual reasoning content would require
 	// integration tests with real API responses, as the JSON field
@@ -3223,6 +3681,51 @@ func TestShouldSuppressChunk(t *testing.T) {
 		},
 	}
 	assert.False(t, m.shouldSuppressChunk(chunk2))
+}
+
+// TestShouldSuppressChunk_WithToolCallDeltaFlag verifies that tool_call
+// chunks are suppressed by default but forwarded when ShowToolCallDelta
+// is enabled.
+func TestShouldSuppressChunk_WithToolCallDeltaFlag(t *testing.T) {
+	t.Run("suppress tool_call delta by default", func(t *testing.T) {
+		m := &Model{}
+		chunk := openai.ChatCompletionChunk{
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Delta: openai.ChatCompletionChunkChoiceDelta{
+						ToolCalls: []openai.ChatCompletionChunkChoiceDeltaToolCall{
+							{
+								ID:   "call-1",
+								Type: "function",
+							},
+						},
+					},
+				},
+			},
+		}
+		assert.True(t, m.shouldSuppressChunk(chunk))
+	})
+
+	t.Run("forward tool_call delta when enabled", func(t *testing.T) {
+		m := &Model{
+			showToolCallDelta: true,
+		}
+		chunk := openai.ChatCompletionChunk{
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Delta: openai.ChatCompletionChunkChoiceDelta{
+						ToolCalls: []openai.ChatCompletionChunkChoiceDeltaToolCall{
+							{
+								ID:   "call-1",
+								Type: "function",
+							},
+						},
+					},
+				},
+			},
+		}
+		assert.False(t, m.shouldSuppressChunk(chunk))
+	})
 }
 
 // TestCreatePartialResponse tests basic partial response creation.
@@ -3367,9 +3870,13 @@ func TestReasoningContentIntegration(t *testing.T) {
 func TestReasoningContentChunkHandling(t *testing.T) {
 	m := &Model{}
 
-	t.Run("hasReasoningContent returns false for empty delta", func(t *testing.T) {
-		delta := openai.ChatCompletionChunkChoiceDelta{}
-		assert.False(t, m.hasReasoningContent(delta))
+	t.Run("hasReasoningContent returns false for empty choices", func(t *testing.T) {
+		choices := []openai.ChatCompletionChunkChoice{
+			{
+				Delta: openai.ChatCompletionChunkChoiceDelta{},
+			},
+		}
+		assert.False(t, m.hasReasoningContent(choices))
 	})
 
 	t.Run("shouldSkipEmptyChunk handles chunks without choices", func(t *testing.T) {
@@ -3431,6 +3938,18 @@ func TestEmptyChunkHandling(t *testing.T) {
 		assert.True(t, m.shouldSkipEmptyChunk(chunk))
 	})
 
+	t.Run("shouldSkipEmptyChunk with finish reason", func(t *testing.T) {
+		chunk := openai.ChatCompletionChunk{
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					FinishReason: "stop",
+				},
+			},
+		}
+		// Should not skip chunks that only carry a finish reason.
+		assert.False(t, m.shouldSkipEmptyChunk(chunk))
+	})
+
 	t.Run("shouldSuppressChunk with empty delta", func(t *testing.T) {
 		chunk := openai.ChatCompletionChunk{
 			Choices: []openai.ChatCompletionChunkChoice{
@@ -3455,10 +3974,88 @@ func TestEmptyChunkHandling(t *testing.T) {
 		assert.False(t, m.shouldSuppressChunk(chunk))
 	})
 
-	t.Run("hasReasoningContent returns false for empty delta", func(t *testing.T) {
-		delta := openai.ChatCompletionChunkChoiceDelta{}
-		assert.False(t, m.hasReasoningContent(delta))
+	t.Run("hasReasoningContent returns false for empty choices", func(t *testing.T) {
+		choices := []openai.ChatCompletionChunkChoice{
+			{
+				Delta: openai.ChatCompletionChunkChoiceDelta{},
+			},
+		}
+		assert.False(t, m.hasReasoningContent(choices))
 	})
+
+	t.Run("createPartialResponse includes tool calls when enabled", func(t *testing.T) {
+		mWithToolDelta := &Model{
+			showToolCallDelta: true,
+		}
+		chunk := openai.ChatCompletionChunk{
+			ID:    "chunk-tool",
+			Model: "test-model",
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Delta: openai.ChatCompletionChunkChoiceDelta{
+						ToolCalls: []openai.ChatCompletionChunkChoiceDeltaToolCall{
+							{
+								Index: 1,
+								ID:    "call-1",
+								Type:  "function",
+								Function: openai.ChatCompletionChunkChoiceDeltaToolCallFunction{
+									Name:      "generate_document",
+									Arguments: "{\"content\":\"partial\"}",
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		response := mWithToolDelta.createPartialResponse(chunk)
+		require.NotNil(t, response)
+		require.Len(t, response.Choices, 1)
+		deltaMsg := response.Choices[0].Delta
+		require.Len(t, deltaMsg.ToolCalls, 1)
+		tc := deltaMsg.ToolCalls[0]
+		assert.Equal(t, "call-1", tc.ID)
+		if tc.Index == nil {
+			t.Fatalf("expected non-nil Index for tool call")
+		}
+		assert.Equal(t, 1, *tc.Index)
+		assert.Equal(t, "function", tc.Type)
+		assert.Equal(t, "generate_document", tc.Function.Name)
+		assert.Equal(t, "{\"content\":\"partial\"}",
+			string(tc.Function.Arguments))
+	})
+}
+
+// TestCreateFinalResponseFinishReason verifies that finish reasons from the
+// accumulated choices are propagated to the final aggregated response.
+func TestCreateFinalResponseFinishReason(t *testing.T) {
+	m := &Model{}
+
+	var acc openai.ChatCompletionAccumulator
+	chunk := openai.ChatCompletionChunk{
+		ID:    "acc-id",
+		Model: "test-model",
+		Choices: []openai.ChatCompletionChunkChoice{
+			{
+				Index: 0,
+				Delta: openai.ChatCompletionChunkChoiceDelta{
+					Content: "Hello",
+				},
+				FinishReason: "stop",
+			},
+		},
+	}
+
+	acc.AddChunk(chunk)
+
+	finalResponse := m.createFinalResponse(
+		acc, false, nil, "")
+	require.NotNil(t, finalResponse)
+	require.Len(t, finalResponse.Choices, 1)
+	require.NotNil(t, finalResponse.Choices[0].FinishReason)
+	assert.Equal(t, "stop",
+		*finalResponse.Choices[0].FinishReason)
 }
 
 // TestToolCallIndexMapping tests the tool call index mapping functionality.
@@ -3509,6 +4106,121 @@ func TestToolCallIndexMapping(t *testing.T) {
 		m.updateToolCallIndexMapping(chunk, idToIndexMap)
 		assert.Empty(t, idToIndexMap)
 	})
+}
+
+// TestChatCompletionAccumulator_ToolCallsEmpty_Panics verifies that the
+// upstream openai-go accumulator panics when JSON.ToolCalls is marked
+// present but the typed ToolCalls slice is empty. This documents the
+// panic behavior that our framework needs to defensively guard against.
+func TestChatCompletionAccumulator_ToolCallsEmpty_Panics(t *testing.T) {
+	// This JSON mimics a streaming chunk where the provider sends an empty
+	// tool_calls array together with a tool_calls finish_reason.
+	raw := []byte(`{
+		"id": "test",
+		"object": "chat.completion.chunk",
+		"created": 1699200000,
+		"model": "gpt-3.5-turbo",
+		"choices": [
+			{
+				"index": 0,
+				"delta": {
+					"tool_calls": []
+				},
+				"finish_reason": "tool_calls"
+			}
+		]
+	}`)
+
+	var chunk openai.ChatCompletionChunk
+	require.NoError(t, json.Unmarshal(raw, &chunk), "failed to unmarshal test chunk")
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("expected panic when adding chunk with JSON.ToolCalls valid and empty ToolCalls slice, but no panic occurred")
+		}
+	}()
+
+	var acc openai.ChatCompletionAccumulator
+	acc.AddChunk(chunk)
+}
+
+// TestSanitizeChunkForAccumulator_FinishReasonToolCalls verifies that
+// sanitizeChunkForAccumulator clears JSON.ToolCalls metadata for chunks
+// that have a finish_reason and an empty ToolCalls slice, which would
+// otherwise cause the upstream accumulator to panic.
+func TestSanitizeChunkForAccumulator_FinishReasonToolCalls(t *testing.T) {
+	raw := []byte(`{
+		"id": "test",
+		"object": "chat.completion.chunk",
+		"created": 1699200000,
+		"model": "gpt-3.5-turbo",
+		"choices": [
+			{
+				"index": 0,
+				"delta": {
+					"content": "",
+					"tool_calls": []
+				},
+				"finish_reason": "tool_calls"
+			}
+		]
+	}`)
+
+	var chunk openai.ChatCompletionChunk
+	require.NoError(t, json.Unmarshal(raw, &chunk))
+	require.Len(t, chunk.Choices, 1)
+	require.Equal(t, "tool_calls", chunk.Choices[0].FinishReason)
+	require.True(t, chunk.Choices[0].Delta.JSON.ToolCalls.Valid())
+	require.Len(t, chunk.Choices[0].Delta.ToolCalls, 0)
+
+	sanitized := sanitizeChunkForAccumulator(chunk)
+
+	// Original chunk should remain unchanged.
+	require.True(t, chunk.Choices[0].Delta.JSON.ToolCalls.Valid())
+
+	// Sanitized chunk should have ToolCalls metadata cleared but still carry
+	// the same finish_reason and an empty typed ToolCalls slice.
+	require.Len(t, sanitized.Choices, 1)
+	assert.Equal(t, "tool_calls", sanitized.Choices[0].FinishReason)
+	assert.False(t, sanitized.Choices[0].Delta.JSON.ToolCalls.Valid())
+	assert.Len(t, sanitized.Choices[0].Delta.ToolCalls, 0)
+}
+
+// TestSanitizeChunkForAccumulator_NoFinishReason ensures that chunks without
+// a finish_reason are left untouched even if they carry an empty ToolCalls
+// array, since these are safe for the accumulator (it will use the content
+// branch instead of the tool_calls branch).
+func TestSanitizeChunkForAccumulator_NoFinishReason(t *testing.T) {
+	raw := []byte(`{
+		"id": "test",
+		"object": "chat.completion.chunk",
+		"created": 1699200000,
+		"model": "gpt-3.5-turbo",
+		"choices": [
+			{
+				"index": 0,
+				"delta": {
+					"content": "hello",
+					"tool_calls": []
+				},
+				"finish_reason": null
+			}
+		]
+	}`)
+
+	var chunk openai.ChatCompletionChunk
+	require.NoError(t, json.Unmarshal(raw, &chunk))
+	require.Len(t, chunk.Choices, 1)
+	require.Equal(t, "", chunk.Choices[0].FinishReason)
+	require.True(t, chunk.Choices[0].Delta.JSON.ToolCalls.Valid())
+	require.Len(t, chunk.Choices[0].Delta.ToolCalls, 0)
+
+	sanitized := sanitizeChunkForAccumulator(chunk)
+
+	// Chunks without finish_reason should not be modified.
+	assert.Equal(t, chunk, sanitized)
+	assert.True(t, sanitized.Choices[0].Delta.JSON.ToolCalls.Valid())
+	assert.Len(t, sanitized.Choices[0].Delta.ToolCalls, 0)
 }
 
 // TestStreamingCallbackIntegration tests the integration of streaming callbacks.
@@ -3777,6 +4489,306 @@ func TestQwen(t *testing.T) {
 			assert.Equal(t, tt.modelName, m.name, "expected model name %s, got %s", tt.modelName, m.name)
 			assert.Equal(t, o.APIKey, m.apiKey, "expected api key %s, got %s", o.APIKey, m.apiKey)
 			assert.Equal(t, o.BaseURL, m.baseURL, "expected base url %s, got %s", o.BaseURL, m.baseURL)
+		})
+	}
+}
+
+func TestModel_buildChatRequest(t *testing.T) {
+	type args struct {
+		request *model.Request
+	}
+	tokens := 2048
+	tests := []struct {
+		name  string
+		model *Model
+		args  args
+		want  openaigo.ChatCompletionNewParams
+		want1 []openaiopt.RequestOption
+	}{
+		{
+			name:  "qwen thinking",
+			model: New("qwen-plus", WithVariant(VariantQwen)),
+			args: args{
+				request: &model.Request{
+					Messages: []model.Message{},
+					GenerationConfig: model.GenerationConfig{
+						Stream:          true,
+						ThinkingEnabled: openai.BoolPtr(true),
+						ThinkingTokens:  &tokens,
+					},
+				},
+			},
+			want1: []openaiopt.RequestOption{
+				openaiopt.WithJSONSet(model.EnabledThinkingKey, true),
+				openaiopt.WithJSONSet(model.ThinkingTokensKey, tokens),
+			},
+		},
+		{
+			name:  "qwen thinking no thinking",
+			model: New("qwen-plus", WithVariant(VariantQwen)),
+			args: args{
+				request: &model.Request{
+					Messages: []model.Message{},
+					GenerationConfig: model.GenerationConfig{
+						Stream: true,
+					},
+				},
+			},
+			want1: []openaiopt.RequestOption{},
+		},
+		{
+			name:  "deepseek thinking",
+			model: New("deepseek-chat"),
+			args: args{
+				request: &model.Request{
+					Messages: []model.Message{},
+					GenerationConfig: model.GenerationConfig{
+						Stream:          true,
+						ThinkingEnabled: openai.BoolPtr(true),
+					},
+				},
+			},
+			want1: []openaiopt.RequestOption{
+				openaiopt.WithJSONSet(model.ThinkingEnabledKey, true),
+			},
+		},
+		{
+			name:  "unknown variant",
+			model: New("qwen-plus", WithVariant(Variant("unknown"))),
+			args: args{
+				request: &model.Request{
+					Messages: []model.Message{},
+					GenerationConfig: model.GenerationConfig{
+						Stream: true, ThinkingEnabled: openai.BoolPtr(true),
+					},
+				},
+			},
+			want1: []openaiopt.RequestOption{
+				openaiopt.WithJSONSet(model.ThinkingEnabledKey, true),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, got1 := tt.model.buildChatRequest(tt.args.request)
+			assert.Equalf(t, len(tt.want1), len(got1), "buildChatRequest(%v)", tt.args.request)
+		})
+	}
+}
+
+func TestWithTokenTailoringConfig(t *testing.T) {
+	tests := []struct {
+		name        string
+		inputConfig *model.TokenTailoringConfig
+		initialOpts *options
+		wantCfg     *model.TokenTailoringConfig
+	}{
+		{
+			name:        "nil config",
+			inputConfig: nil,
+			initialOpts: &options{
+				TokenTailoringConfig: &model.TokenTailoringConfig{ProtocolOverheadTokens: 5},
+			},
+			wantCfg: &model.TokenTailoringConfig{ProtocolOverheadTokens: 5},
+		},
+		{
+			name:        "nil config - 1",
+			inputConfig: nil,
+			initialOpts: &options{},
+			wantCfg:     nil,
+		},
+		{
+			name: "empty value config",
+			inputConfig: &model.TokenTailoringConfig{
+				ProtocolOverheadTokens: 0,
+				ReserveOutputTokens:    0,
+				SafetyMarginRatio:      0,
+				InputTokensFloor:       0,
+				OutputTokensFloor:      0,
+				MaxInputTokensRatio:    0,
+			},
+			initialOpts: &options{},
+			wantCfg: &model.TokenTailoringConfig{
+				ProtocolOverheadTokens: imodel.DefaultProtocolOverheadTokens,
+				ReserveOutputTokens:    imodel.DefaultReserveOutputTokens,
+				SafetyMarginRatio:      imodel.DefaultSafetyMarginRatio,
+				InputTokensFloor:       imodel.DefaultInputTokensFloor,
+				OutputTokensFloor:      imodel.DefaultOutputTokensFloor,
+				MaxInputTokensRatio:    imodel.DefaultMaxInputTokensRatio,
+			},
+		},
+		{
+			name: "partial value config",
+			inputConfig: &model.TokenTailoringConfig{
+				ProtocolOverheadTokens: 15,
+				ReserveOutputTokens:    0,
+				SafetyMarginRatio:      0.2,
+				InputTokensFloor:       0,
+				OutputTokensFloor:      250,
+				MaxInputTokensRatio:    0,
+			},
+			initialOpts: &options{},
+			wantCfg: &model.TokenTailoringConfig{
+				ProtocolOverheadTokens: 15,
+				ReserveOutputTokens:    imodel.DefaultReserveOutputTokens,
+				SafetyMarginRatio:      0.2,
+				InputTokensFloor:       imodel.DefaultInputTokensFloor,
+				OutputTokensFloor:      250,
+				MaxInputTokensRatio:    imodel.DefaultMaxInputTokensRatio,
+			},
+		},
+		{
+			name: "all value config",
+			inputConfig: &model.TokenTailoringConfig{
+				ProtocolOverheadTokens: 20,
+				ReserveOutputTokens:    30,
+				SafetyMarginRatio:      0.3,
+				InputTokensFloor:       300,
+				OutputTokensFloor:      400,
+				MaxInputTokensRatio:    2.0,
+			},
+			initialOpts: &options{},
+			wantCfg: &model.TokenTailoringConfig{
+				ProtocolOverheadTokens: 20,
+				ReserveOutputTokens:    30,
+				SafetyMarginRatio:      0.3,
+				InputTokensFloor:       300,
+				OutputTokensFloor:      400,
+				MaxInputTokensRatio:    2.0,
+			},
+		},
+		{
+			name: "nil initialOpts",
+			inputConfig: &model.TokenTailoringConfig{
+				ProtocolOverheadTokens: 0,
+				ReserveOutputTokens:    0,
+			},
+			initialOpts: &options{
+				TokenTailoringConfig: &model.TokenTailoringConfig{
+					ProtocolOverheadTokens: 5,
+					ReserveOutputTokens:    10,
+				},
+			},
+			wantCfg: &model.TokenTailoringConfig{
+				ProtocolOverheadTokens: imodel.DefaultProtocolOverheadTokens,
+				ReserveOutputTokens:    imodel.DefaultReserveOutputTokens,
+				SafetyMarginRatio:      imodel.DefaultSafetyMarginRatio,
+				InputTokensFloor:       imodel.DefaultInputTokensFloor,
+				OutputTokensFloor:      imodel.DefaultOutputTokensFloor,
+				MaxInputTokensRatio:    imodel.DefaultMaxInputTokensRatio,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opt := WithTokenTailoringConfig(tt.inputConfig)
+			opt(tt.initialOpts)
+
+			if tt.wantCfg == nil {
+				assert.Nil(t, tt.initialOpts.TokenTailoringConfig, "expectation TokenTailoringConfig is nil")
+			} else {
+				require.NotNil(t, tt.initialOpts.TokenTailoringConfig, "TokenTailoringConfig is not nil")
+
+				assert.Equal(t, tt.wantCfg.ProtocolOverheadTokens, tt.initialOpts.TokenTailoringConfig.ProtocolOverheadTokens, "ProtocolOverheadTokensinconsistent")
+				assert.Equal(t, tt.wantCfg.ReserveOutputTokens, tt.initialOpts.TokenTailoringConfig.ReserveOutputTokens, "ReserveOutputTokensinconsistent")
+				assert.Equal(t, tt.wantCfg.SafetyMarginRatio, tt.initialOpts.TokenTailoringConfig.SafetyMarginRatio, "SafetyMarginRatio inconsistent")
+				assert.Equal(t, tt.wantCfg.InputTokensFloor, tt.initialOpts.TokenTailoringConfig.InputTokensFloor, "InputTokensFloor inconsistent")
+				assert.Equal(t, tt.wantCfg.OutputTokensFloor, tt.initialOpts.TokenTailoringConfig.OutputTokensFloor, "OutputTokensFloor inconsistent")
+				assert.Equal(t, tt.wantCfg.MaxInputTokensRatio, tt.initialOpts.TokenTailoringConfig.MaxInputTokensRatio, "MaxInputTokensRatioinconsistent")
+			}
+		})
+	}
+}
+
+// TestBuildThinkingOption tests the buildThinkingOption method for different variants.
+func TestBuildThinkingOption(t *testing.T) {
+	trueVal := true
+	falseVal := false
+	thinkingTokens := 1024
+
+	tests := []struct {
+		name            string
+		variant         Variant
+		thinkingEnabled *bool
+		thinkingTokens  *int
+		wantKeys        []string
+		wantValues      []any
+	}{
+		{
+			name:            "DeepSeek variant with thinking enabled",
+			variant:         VariantDeepSeek,
+			thinkingEnabled: &trueVal,
+			wantKeys:        []string{"thinking"},
+			wantValues:      []any{map[string]string{"type": "enabled"}},
+		},
+		{
+			name:            "DeepSeek variant with thinking disabled",
+			variant:         VariantDeepSeek,
+			thinkingEnabled: &falseVal,
+			wantKeys:        []string{"thinking"},
+			wantValues:      []any{map[string]string{"type": "disabled"}},
+		},
+		{
+			name:            "DeepSeek variant with thinking tokens",
+			variant:         VariantDeepSeek,
+			thinkingEnabled: &trueVal,
+			thinkingTokens:  &thinkingTokens,
+			wantKeys:        []string{model.ThinkingTokensKey, "thinking"},
+			wantValues:      []any{1024, map[string]string{"type": "enabled"}},
+		},
+		{
+			name:            "OpenAI variant with thinking enabled",
+			variant:         VariantOpenAI,
+			thinkingEnabled: &trueVal,
+			wantKeys:        []string{model.ThinkingEnabledKey},
+			wantValues:      []any{true},
+		},
+		{
+			name:            "OpenAI variant with thinking disabled",
+			variant:         VariantOpenAI,
+			thinkingEnabled: &falseVal,
+			wantKeys:        []string{model.ThinkingEnabledKey},
+			wantValues:      []any{false},
+		},
+		{
+			name:            "Qwen variant with thinking enabled",
+			variant:         VariantQwen,
+			thinkingEnabled: &trueVal,
+			wantKeys:        []string{model.EnabledThinkingKey},
+			wantValues:      []any{true},
+		},
+		{
+			name:            "nil thinking enabled returns empty opts",
+			variant:         VariantDeepSeek,
+			thinkingEnabled: nil,
+			wantKeys:        nil,
+			wantValues:      nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := &Model{
+				variant:       tt.variant,
+				variantConfig: variantConfigs[tt.variant],
+			}
+
+			request := &model.Request{
+				GenerationConfig: model.GenerationConfig{
+					ThinkingEnabled: tt.thinkingEnabled,
+					ThinkingTokens:  tt.thinkingTokens,
+				},
+			}
+
+			opts := m.buildThinkingOption(request)
+
+			if tt.wantKeys == nil {
+				assert.Empty(t, opts, "expected empty opts")
+				return
+			}
+
+			assert.Len(t, opts, len(tt.wantKeys), "expected %d opts", len(tt.wantKeys))
 		})
 	}
 }

@@ -45,45 +45,26 @@ type Service struct {
 
 // NewService creates a new mysql memory service.
 func NewService(options ...ServiceOpt) (*Service, error) {
-	opts := ServiceOpts{
-		memoryLimit:  imemory.DefaultMemoryLimit,
-		toolCreators: make(map[string]memory.ToolCreator),
-		enabledTools: make(map[string]bool),
-		tableName:    "memories",
-	}
-	// Enable default tools.
-	for name, creator := range imemory.DefaultEnabledTools {
-		opts.toolCreators[name] = creator
-		opts.enabledTools[name] = true
-	}
+	opts := defaultOptions.clone()
 	for _, option := range options {
 		option(&opts)
 	}
 
-	builder := storage.GetClientBuilder()
-	var (
-		db  storage.Client
-		err error
-	)
-
-	// If instance name set, and dsn not set, use instance name to create mysql client.
+	builderOpts := []storage.ClientBuilderOpt{
+		storage.WithClientBuilderDSN(opts.dsn),
+		storage.WithExtraOptions(opts.extraOptions...),
+	}
+	// Priority: dsn > instanceName.
 	if opts.dsn == "" && opts.instanceName != "" {
-		builderOpts, ok := storage.GetMySQLInstance(opts.instanceName)
-		if !ok {
+		var ok bool
+		if builderOpts, ok = storage.GetMySQLInstance(opts.instanceName); !ok {
 			return nil, fmt.Errorf("mysql instance %s not found", opts.instanceName)
 		}
-		db, err = builder(builderOpts...)
-		if err != nil {
-			return nil, fmt.Errorf("create mysql client from instance name failed: %w", err)
-		}
-	} else {
-		db, err = builder(
-			storage.WithClientBuilderDSN(opts.dsn),
-			storage.WithExtraOptions(opts.extraOptions...),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("create mysql client from dsn failed: %w", err)
-		}
+	}
+
+	db, err := storage.GetClientBuilder()(builderOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("create mysql client failed: %w", err)
 	}
 
 	s := &Service{
@@ -93,35 +74,16 @@ func NewService(options ...ServiceOpt) (*Service, error) {
 		cachedTools: make(map[string]tool.Tool),
 	}
 
-	// Always initialize table.
-	if err := s.initTable(context.Background()); err != nil {
-		panic(fmt.Sprintf("failed to initialize table: %v", err))
+	// Initialize database if needed
+	if !opts.skipDBInit {
+		ctx, cancel := context.WithTimeout(context.Background(), defaultDBInitTimeout)
+		defer cancel()
+		if err := s.initDB(ctx); err != nil {
+			return nil, fmt.Errorf("init database failed: %w", err)
+		}
 	}
 
 	return s, nil
-}
-
-// initTable creates the memories table if it doesn't exist.
-func (s *Service) initTable(ctx context.Context) error {
-	// Table name is validated in WithTableName.
-	// #nosec G201
-	query := fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS %s (
-			app_name VARCHAR(255) NOT NULL,
-			user_id VARCHAR(255) NOT NULL,
-			memory_id VARCHAR(64) NOT NULL,
-			memory_data JSON NOT NULL,
-			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			deleted_at TIMESTAMP NULL DEFAULT NULL,
-			PRIMARY KEY (app_name, user_id, memory_id),
-			INDEX idx_app_user (app_name, user_id),
-			INDEX idx_deleted_at (deleted_at)
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-	`, s.tableName)
-
-	_, err := s.db.Exec(ctx, query)
-	return err
 }
 
 // AddMemory adds a new memory for a user.
@@ -132,8 +94,6 @@ func (s *Service) AddMemory(ctx context.Context, userKey memory.UserKey, memoryS
 
 	// Enforce memory limit.
 	if s.opts.memoryLimit > 0 {
-		// Table name is validated in WithTableName.
-		// #nosec G201
 		countQuery := fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE app_name = ? AND user_id = ?", s.tableName)
 		if s.opts.softDelete {
 			countQuery += " AND deleted_at IS NULL"
@@ -168,8 +128,6 @@ func (s *Service) AddMemory(ctx context.Context, userKey memory.UserKey, memoryS
 		return fmt.Errorf("marshal memory entry failed: %w", err)
 	}
 
-	// Table name is validated in WithTableName.
-	// #nosec G201
 	insertQuery := fmt.Sprintf(
 		"INSERT INTO `%s` (app_name, user_id, memory_id, memory_data, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
 		s.tableName,
@@ -189,8 +147,6 @@ func (s *Service) UpdateMemory(ctx context.Context, memoryKey memory.Key, memory
 	}
 
 	// Get existing entry.
-	// Table name is validated in WithTableName.
-	// #nosec G201
 	selectQuery := fmt.Sprintf(
 		"SELECT memory_data FROM %s WHERE app_name = ? AND user_id = ? AND memory_id = ?",
 		s.tableName,
@@ -223,8 +179,6 @@ func (s *Service) UpdateMemory(ctx context.Context, memoryKey memory.Key, memory
 		return fmt.Errorf("marshal updated memory entry failed: %w", err)
 	}
 
-	// Table name is validated in WithTableName.
-	// #nosec G201
 	updateQuery := fmt.Sprintf(
 		"UPDATE %s SET memory_data = ?, updated_at = ? WHERE app_name = ? AND user_id = ? AND memory_id = ?",
 		s.tableName,
@@ -246,8 +200,6 @@ func (s *Service) DeleteMemory(ctx context.Context, memoryKey memory.Key) error 
 		return err
 	}
 
-	// Table name is validated in WithTableName.
-	// #nosec G201
 	var (
 		query string
 		args  []any
@@ -280,8 +232,6 @@ func (s *Service) ClearMemories(ctx context.Context, userKey memory.UserKey) err
 		return err
 	}
 
-	// Table name is validated in WithTableName.
-	// #nosec G201
 	var err error
 	if s.opts.softDelete {
 		now := time.Now()
@@ -310,8 +260,6 @@ func (s *Service) ReadMemories(ctx context.Context, userKey memory.UserKey, limi
 		return nil, err
 	}
 
-	// Table name is validated in WithTableName.
-	// #nosec G201
 	query := fmt.Sprintf(
 		"SELECT memory_data FROM %s WHERE app_name = ? AND user_id = ?",
 		s.tableName,
@@ -353,8 +301,6 @@ func (s *Service) SearchMemories(ctx context.Context, userKey memory.UserKey, qu
 	}
 
 	// Get all memories for the user.
-	// Table name is validated in WithTableName.
-	// #nosec G201
 	selectQuery := fmt.Sprintf(
 		"SELECT memory_data FROM %s WHERE app_name = ? AND user_id = ?",
 		s.tableName,
@@ -399,9 +345,9 @@ func (s *Service) SearchMemories(ctx context.Context, userKey memory.UserKey, qu
 // Tools returns the list of available memory tools.
 func (s *Service) Tools() []tool.Tool {
 	// Concurrency-safe and stable order by name.
-	// Protect tool creators/enabled flags and cache with a single lock at call-site
-	// by converting to a local snapshot first (no struct-level mutex exists).
-	// We assume opts are immutable after construction.
+	// Protect tool creators/enabled flags and cache with a single lock at
+	// call-site by converting to a local snapshot first (no struct-level
+	// mutex exists). We assume opts are immutable after construction.
 	names := make([]string, 0, len(s.opts.toolCreators))
 	for name := range s.opts.toolCreators {
 		if s.opts.enabledTools[name] {

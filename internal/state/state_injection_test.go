@@ -24,6 +24,7 @@ func TestInjectSessionState(t *testing.T) {
 		state       map[string]any
 		expected    string
 		expectError bool
+		invState    map[string]any
 	}{
 		{
 			name:        "empty template",
@@ -116,6 +117,13 @@ func TestInjectSessionState(t *testing.T) {
 			expected:    "Enabled: true, Active: false",
 			expectError: false,
 		},
+		{
+			name:        "invocation values",
+			template:    "Enabled: {invocation:enabled}, name: {invocation:name}",
+			invState:    map[string]any{"enabled": true, "name": "name-123"},
+			expected:    "Enabled: true, name: name-123",
+			expectError: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -133,6 +141,11 @@ func TestInjectSessionState(t *testing.T) {
 				Session: &session.Session{
 					State: stateMap,
 				},
+			}
+			if tt.invState != nil {
+				for k, v := range tt.invState {
+					invocation.SetState(k, v)
+				}
 			}
 
 			result, err := InjectSessionState(tt.template, invocation)
@@ -246,5 +259,38 @@ func TestInjectSessionState_MustachePlaceholders(t *testing.T) {
 	s, err = InjectSessionState("bad {{invalid-name}}", inv)
 	if err != nil || s != "bad {{invalid-name}}" {
 		t.Fatalf("InjectSessionState invalid mustache: got %q err=%v", s, err)
+	}
+}
+
+func TestInjectSessionState_RawNumericString(t *testing.T) {
+	// Prepare invocation session state with a raw numeric-looking string value.
+	sm := make(session.StateMap)
+	sm["code"] = []byte("123456789012345678901234567890")
+	inv := &agent.Invocation{Session: &session.Session{State: sm}}
+
+	s, err := InjectSessionState("Code: {code}", inv)
+	if err != nil {
+		t.Fatalf("InjectSessionState raw numeric string: unexpected error: %v", err)
+	}
+	const want = "Code: 123456789012345678901234567890"
+	if s != want {
+		t.Fatalf("InjectSessionState raw numeric string: got %q, want %q", s, want)
+	}
+}
+
+func TestInjectSessionState_JSONObjectAndArray(t *testing.T) {
+	sm := make(session.StateMap)
+	sm["obj"] = []byte(`{"a":1,"b":[2,3]}`)
+	sm["arr"] = []byte(`[{"x":1},{"x":2}]`)
+	inv := &agent.Invocation{Session: &session.Session{State: sm}}
+
+	got, err := InjectSessionState("O={obj}; A={arr}", inv)
+	if err != nil {
+		t.Fatalf("InjectSessionState json: unexpected error: %v", err)
+	}
+
+	const want = `O={"a":1,"b":[2,3]}; A=[{"x":1},{"x":2}]`
+	if got != want {
+		t.Fatalf("InjectSessionState json: got %q, want %q", got, want)
 	}
 }

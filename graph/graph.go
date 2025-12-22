@@ -55,10 +55,44 @@ type NodeResult any
 
 // ConditionalFunc is a function that determines the next node(s) based on state.
 // Conditional edge function signature.
-type ConditionalFunc func(ctx context.Context, state State) (string, error)
+type ConditionalFunc = func(ctx context.Context, state State) (string, error)
 
 // MultiConditionalFunc returns multiple next nodes for parallel execution.
-type MultiConditionalFunc func(ctx context.Context, state State) ([]string, error)
+type MultiConditionalFunc = func(ctx context.Context, state State) ([]string, error)
+
+// UniversalCondFunc is a function that determines the next node(s) based on state.
+type UniversalCondFunc = func(ctx context.Context, state State) (ConditionResult, error)
+
+// ConditionResult represents the result of executing a conditional edge function.
+type ConditionResult struct {
+	NextNodes []string
+}
+
+func wrapperCondFunc(condFunc any) UniversalCondFunc {
+	if condFunc == nil {
+		panic("conditional function is nil")
+	}
+
+	var uniFunc UniversalCondFunc
+	switch cdFunc := condFunc.(type) {
+	case ConditionalFunc:
+		uniFunc = func(ctx context.Context, state State) (ConditionResult, error) {
+			nextNode, err := cdFunc(ctx, state)
+			return ConditionResult{NextNodes: []string{nextNode}}, err
+		}
+	case MultiConditionalFunc:
+		uniFunc = func(ctx context.Context, state State) (ConditionResult, error) {
+			nextNodes, err := cdFunc(ctx, state)
+			return ConditionResult{NextNodes: nextNodes}, err
+		}
+	case UniversalCondFunc:
+		uniFunc = cdFunc
+	default:
+		panic(fmt.Sprintf("unsupported conditional function type: %T", condFunc))
+	}
+
+	return uniFunc
+}
 
 // channelWriteEntry represents a write operation to a channel.
 type channelWriteEntry struct {
@@ -77,7 +111,8 @@ type Node struct {
 	Function    NodeFunc
 	Type        NodeType // Type of the node (function, llm, tool, etc.)
 
-	toolSets []tool.ToolSet
+	toolSets             []tool.ToolSet
+	refreshToolSetsOnRun bool
 	// Per-node callbacks for fine-grained control
 	callbacks *NodeCallbacks
 	// Optional per-node cache policy. If nil, graph-level policy applies.
@@ -148,11 +183,8 @@ type Edge struct {
 // ConditionalEdge represents a conditional edge with routing logic.
 type ConditionalEdge struct {
 	From      string
-	Condition ConditionalFunc
-	// MultiCondition allows returning multiple next nodes for fan-out.
-	// Exactly one of Condition or MultiCondition should be non-nil.
-	MultiCondition MultiConditionalFunc
-	PathMap        map[string]string // Maps condition result to target node.
+	Condition UniversalCondFunc
+	PathMap   map[string]string // Maps condition result to target node.
 }
 
 // Graph represents a directed graph of nodes and edges.
@@ -337,6 +369,11 @@ type ExecutionContext struct {
 	EventChan    chan<- *event.Event
 	InvocationID string
 
+	// channels holds the per-execution Pregel channels. These are constructed
+	// from the Graph's static channel definitions when the execution starts
+	// and are never shared across concurrent runs.
+	channels *channel.Manager
+
 	// stateMutex protects State reads/writes.
 	stateMutex sync.RWMutex
 	State      State
@@ -414,9 +451,8 @@ func (g *Graph) addConditionalEdge(condEdge *ConditionalEdge) error {
 		return fmt.Errorf("conditional edge from cannot be empty")
 	}
 	// Validate condition presence and exclusivity.
-	if (condEdge.Condition == nil && condEdge.MultiCondition == nil) ||
-		(condEdge.Condition != nil && condEdge.MultiCondition != nil) {
-		return fmt.Errorf("exactly one of Condition or MultiCondition must be set")
+	if condEdge.Condition == nil {
+		return fmt.Errorf("exactly conditionFunc must be set")
 	}
 	if condEdge.From != Start {
 		if _, exists := g.nodes[condEdge.From]; !exists {
@@ -455,12 +491,17 @@ func (g *Graph) addChannel(name string, channelType channel.Behavior) {
 	g.channelManager.AddChannel(name, channelType)
 }
 
-// getChannel retrieves a channel by name.
+// getChannel retrieves a channel definition by name. This is primarily used
+// during graph construction and in tests. Runtime execution should operate on
+// the per-execution channels stored in ExecutionContext.
 func (g *Graph) getChannel(name string) (*channel.Channel, bool) {
 	return g.channelManager.GetChannel(name)
 }
 
-// getAllChannels returns all channels in the graph.
+// getAllChannels returns all channel definitions in the graph. Callers must
+// treat the returned channels as immutable templates (name + behavior).
+// Per-execution channel state (values, versions, availability) is stored in
+// ExecutionContext.channels.
 func (g *Graph) getAllChannels() map[string]*channel.Channel {
 	return g.channelManager.GetAllChannels()
 }

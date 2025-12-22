@@ -22,7 +22,6 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"sync"
 	"time"
 
 	openai "github.com/openai/openai-go"
@@ -39,20 +38,8 @@ import (
 const (
 	functionToolType string = "function"
 
-	// defaultChannelBufferSize is the default channel buffer size.
-	defaultChannelBufferSize = 256
-	// defaultBatchCompletionWindow is the default batch completion window.
-	defaultBatchCompletionWindow = "24h"
 	// defaultBatchEndpoint is the default batch endpoint.
 	defaultBatchEndpoint = openai.BatchNewParamsEndpointV1ChatCompletions
-	// Default budget constants for token tailoring.
-	defaultProtocolOverheadTokens = 512  // Protocol overhead tokens for request/response formatting.
-	defaultReserveOutputTokens    = 2048 // Reserved tokens for output generation (~1-2% of typical context window).
-	defaultInputTokensFloor       = 1024 // Minimum input tokens to ensure reasonable processing.
-	defaultOutputTokensFloor      = 256  // Minimum output tokens to ensure meaningful response.
-	defaultSafetyMarginRatio      = 0.10 // Safety margin ratio (10%) to account for token counting inaccuracies.
-	defaultMaxInputTokensRatio    = 0.65 // Maximum input tokens ratio (65%) of context window for stability.
-
 	//nolint:gosec
 	deepSeekAPIKeyName     string = "DEEPSEEK_API_KEY"
 	defaultDeepSeekBaseURL string = "https://api.deepseek.com"
@@ -76,6 +63,27 @@ const (
 	VariantQwen Variant = "qwen"
 )
 
+// thinkingValueConvertor converts ThinkingEnabled bool to the variant-specific value.
+type thinkingValueConvertor func(enabled bool) any
+
+// defaultThinkingValueConvertor returns the bool value as-is.
+var defaultThinkingValueConvertor = func(enabled bool) any {
+	return enabled
+}
+
+// deepSeekThinkingValueConvertor converts to DeepSeek 3.2 format: {"type": "enabled"/"disabled"}.
+var deepSeekThinkingValueConvertor = func(enabled bool) any {
+	const (
+		thinkingTypeEnabled  = "enabled"
+		thinkingTypeDisabled = "disabled"
+	)
+	thinkingType := thinkingTypeDisabled
+	if enabled {
+		thinkingType = thinkingTypeEnabled
+	}
+	return map[string]string{"type": thinkingType}
+}
+
 // variantConfig holds configuration for different variants.
 type variantConfig struct {
 	// Default file upload path for this variant.
@@ -94,6 +102,10 @@ type variantConfig struct {
 	defaultBaseURL string
 	// Default API key name for this variant.
 	apiKeyName string
+	// Thinking key for this variant.
+	thinkingEnabledKey string
+	// thinkingValueConvertor converts ThinkingEnabled to variant-specific format.
+	thinkingValueConvertor thinkingValueConvertor
 }
 type fileDeletionBodyConvertor func(body []byte, fileID string) []byte
 
@@ -112,6 +124,8 @@ var variantConfigs = map[Variant]variantConfig{
 		fileDeletionMethod:        http.MethodDelete,
 		skipFileTypeInContent:     false,
 		fileDeletionBodyConvertor: defaultFileDeletionBodyConvertor,
+		thinkingEnabledKey:        model.ThinkingEnabledKey,
+		thinkingValueConvertor:    defaultThinkingValueConvertor,
 	},
 	VariantDeepSeek: {
 		fileUploadPath:            "/openapi/v1/files",
@@ -121,6 +135,9 @@ var variantConfigs = map[Variant]variantConfig{
 		fileDeletionBodyConvertor: defaultFileDeletionBodyConvertor,
 		apiKeyName:                deepSeekAPIKeyName,
 		defaultBaseURL:            defaultDeepSeekBaseURL,
+		// DeepSeek 3.2 uses {"thinking": {"type": "enabled"}} format.
+		thinkingEnabledKey:     "thinking",
+		thinkingValueConvertor: deepSeekThinkingValueConvertor,
 	},
 	VariantHunyuan: {
 		fileUploadPath:        "/openapi/v1/files/uploads",
@@ -168,6 +185,8 @@ var variantConfigs = map[Variant]variantConfig{
 			r.ContentLength = int64(body.Len())
 			return r, nil
 		},
+		thinkingEnabledKey:     model.ThinkingEnabledKey,
+		thinkingValueConvertor: defaultThinkingValueConvertor,
 	},
 	VariantQwen: {
 		fileUploadPath:            "/openapi/v1/files",
@@ -177,49 +196,10 @@ var variantConfigs = map[Variant]variantConfig{
 		fileDeletionBodyConvertor: defaultFileDeletionBodyConvertor,
 		apiKeyName:                qwenAPIKeyName,
 		defaultBaseURL:            defaultQwenBaseURL,
+		// refer:https://help.aliyun.com/zh/model-studio/deep-thinking
+		thinkingEnabledKey:     model.EnabledThinkingKey,
+		thinkingValueConvertor: defaultThinkingValueConvertor,
 	},
-}
-
-// HTTPClient is the interface for the HTTP client.
-type HTTPClient interface {
-	Do(*http.Request) (*http.Response, error)
-}
-
-// HTTPClientNewFunc is the function type for creating a new HTTP client.
-type HTTPClientNewFunc func(opts ...HTTPClientOption) HTTPClient
-
-// DefaultNewHTTPClient is the default HTTP client for OpenAI.
-var DefaultNewHTTPClient HTTPClientNewFunc = func(opts ...HTTPClientOption) HTTPClient {
-	options := &HTTPClientOptions{}
-	for _, opt := range opts {
-		opt(options)
-	}
-	return &http.Client{
-		Transport: options.Transport,
-	}
-}
-
-// HTTPClientOption is the option for the HTTP client.
-type HTTPClientOption func(*HTTPClientOptions)
-
-// WithHTTPClientName is the option for the HTTP client name.
-func WithHTTPClientName(name string) HTTPClientOption {
-	return func(options *HTTPClientOptions) {
-		options.Name = name
-	}
-}
-
-// WithHTTPClientTransport is the option for the HTTP client transport.
-func WithHTTPClientTransport(transport http.RoundTripper) HTTPClientOption {
-	return func(options *HTTPClientOptions) {
-		options.Transport = transport
-	}
-}
-
-// HTTPClientOptions is the options for the HTTP client.
-type HTTPClientOptions struct {
-	Name      string
-	Transport http.RoundTripper
 }
 
 // Model implements the model.Model interface for OpenAI API.
@@ -228,6 +208,7 @@ type Model struct {
 	name                       string
 	baseURL                    string
 	apiKey                     string
+	showToolCallDelta          bool
 	channelBufferSize          int
 	chatRequestCallback        ChatRequestCallbackFunc
 	chatResponseCallback       ChatResponseCallbackFunc
@@ -241,262 +222,24 @@ type Model struct {
 	batchBaseURL               string
 	enableTokenTailoring       bool                    // Enable automatic token tailoring.
 	maxInputTokens             int                     // Max input tokens for token tailoring.
-	tokenCounterOnce           sync.Once               // sync.Once for lazy initialization of tokenCounter.
 	tokenCounter               model.TokenCounter      // Token counter for token tailoring.
-	tailoringStrategyOnce      sync.Once               // sync.Once for lazy initialization of tailoringStrategy.
 	tailoringStrategy          model.TailoringStrategy // Tailoring strategy for token tailoring.
-}
+	// Token tailoring budget parameters (instance-level overrides).
+	protocolOverheadTokens int
+	reserveOutputTokens    int
+	inputTokensFloor       int
+	outputTokensFloor      int
+	safetyMarginRatio      float64
+	maxInputTokensRatio    float64
 
-// ChatRequestCallbackFunc is the function type for the chat request callback.
-type ChatRequestCallbackFunc func(
-	ctx context.Context,
-	chatRequest *openai.ChatCompletionNewParams,
-)
-
-// ChatResponseCallbackFunc is the function type for the chat response callback.
-type ChatResponseCallbackFunc func(
-	ctx context.Context,
-	chatRequest *openai.ChatCompletionNewParams,
-	chatResponse *openai.ChatCompletion,
-)
-
-// ChatChunkCallbackFunc is the function type for the chat chunk callback.
-type ChatChunkCallbackFunc func(
-	ctx context.Context,
-	chatRequest *openai.ChatCompletionNewParams,
-	chatChunk *openai.ChatCompletionChunk,
-)
-
-// ChatStreamCompleteCallbackFunc is the function type for the chat stream completion callback.
-// This callback is invoked when streaming is completely finished (success or error).
-type ChatStreamCompleteCallbackFunc func(
-	ctx context.Context,
-	chatRequest *openai.ChatCompletionNewParams,
-	accumulator *openai.ChatCompletionAccumulator, // nil if streamErr is not nil
-	streamErr error, // nil if streaming completed successfully
-)
-
-// options contains configuration options for creating a Model.
-type options struct {
-	// API key for the OpenAI client.
-	APIKey string
-	// Base URL for the OpenAI client. It is optional for OpenAI-compatible APIs.
-	BaseURL string
-	// Buffer size for response channels (default: 256)
-	ChannelBufferSize int
-	// Options for the HTTP client.
-	HTTPClientOptions []HTTPClientOption
-	// Callback for the chat request.
-	ChatRequestCallback ChatRequestCallbackFunc
-	// Callback for the chat response.
-	ChatResponseCallback ChatResponseCallbackFunc
-	// Callback for the chat chunk.
-	ChatChunkCallback ChatChunkCallbackFunc
-	// Callback for the chat stream completion.
-	ChatStreamCompleteCallback ChatStreamCompleteCallbackFunc
-	// Options for the OpenAI client.
-	OpenAIOptions []openaiopt.RequestOption
-	// Extra fields to be added to the HTTP request body.
-	ExtraFields map[string]any
-	// Variant for model-specific behavior.
-	Variant Variant
-	// Batch completion window for batch processing.
-	BatchCompletionWindow openai.BatchNewParamsCompletionWindow
-	// Batch metadata for batch processing.
-	BatchMetadata map[string]string
-	// BatchBaseURL overrides the base URL for batch requests (batches/files).
-	BatchBaseURL string
-	// EnableTokenTailoring enables automatic token tailoring based on model context window.
-	EnableTokenTailoring bool
-	// TokenCounter count tokens for token tailoring.
-	TokenCounter model.TokenCounter
-	// TailoringStrategy defines the strategy for token tailoring.
-	TailoringStrategy model.TailoringStrategy
-	// MaxInputTokens is the max input tokens for token tailoring.
-	MaxInputTokens int
-}
-
-// Option is a function that configures an OpenAI model.
-type Option func(*options)
-
-// WithAPIKey sets the API key for the OpenAI client.
-func WithAPIKey(key string) Option {
-	return func(opts *options) {
-		opts.APIKey = key
-	}
-}
-
-// WithBaseURL sets the base URL for the OpenAI client.
-func WithBaseURL(url string) Option {
-	return func(opts *options) {
-		opts.BaseURL = url
-	}
-}
-
-// WithChannelBufferSize sets the channel buffer size for the OpenAI client.
-func WithChannelBufferSize(size int) Option {
-	return func(opts *options) {
-		if size <= 0 {
-			size = defaultChannelBufferSize
-		}
-		opts.ChannelBufferSize = size
-	}
-}
-
-// WithChatRequestCallback sets the function to be called before sending a chat request.
-func WithChatRequestCallback(fn ChatRequestCallbackFunc) Option {
-	return func(opts *options) {
-		opts.ChatRequestCallback = fn
-	}
-}
-
-// WithChatResponseCallback sets the function to be called after receiving a chat response.
-// Used for non-streaming responses.
-func WithChatResponseCallback(fn ChatResponseCallbackFunc) Option {
-	return func(opts *options) {
-		opts.ChatResponseCallback = fn
-	}
-}
-
-// WithChatChunkCallback sets the function to be called after receiving a chat chunk.
-// Used for streaming responses.
-func WithChatChunkCallback(fn ChatChunkCallbackFunc) Option {
-	return func(opts *options) {
-		opts.ChatChunkCallback = fn
-	}
-}
-
-// WithChatStreamCompleteCallback sets the function to be called when streaming is completed.
-// Called for both successful and failed streaming completions.
-func WithChatStreamCompleteCallback(fn ChatStreamCompleteCallbackFunc) Option {
-	return func(opts *options) {
-		opts.ChatStreamCompleteCallback = fn
-	}
-}
-
-// WithHTTPClientOptions sets the HTTP client options for the OpenAI client.
-func WithHTTPClientOptions(httpOpts ...HTTPClientOption) Option {
-	return func(opts *options) {
-		opts.HTTPClientOptions = httpOpts
-	}
-}
-
-// WithOpenAIOptions sets the OpenAI options for the OpenAI client.
-// E.g. use its middleware option:
-//
-//	import (
-//		openai "github.com/openai/openai-go"
-//		openaiopt "github.com/openai/openai-go/option"
-//	)
-//
-//	WithOpenAIOptions(openaiopt.WithMiddleware(
-//		func(req *http.Request, next openaiopt.MiddlewareNext) (*http.Response, error) {
-//			// do something
-//			return next(req)
-//		}
-//	)))
-func WithOpenAIOptions(openaiOpts ...openaiopt.RequestOption) Option {
-	return func(opts *options) {
-		opts.OpenAIOptions = append(opts.OpenAIOptions, openaiOpts...)
-	}
-}
-
-// WithExtraFields sets extra fields to be added to the HTTP request body.
-// These fields will be included in every chat completion request.
-// E.g.:
-//
-//	WithExtraFields(map[string]any{
-//		"custom_metadata": map[string]string{
-//			"session_id": "abc",
-//		},
-//	})
-//
-// and "session_id" : "abc" will be added to the HTTP request json body.
-func WithExtraFields(extraFields map[string]any) Option {
-	return func(opts *options) {
-		if opts.ExtraFields == nil {
-			opts.ExtraFields = make(map[string]any)
-		}
-		for k, v := range extraFields {
-			opts.ExtraFields[k] = v
-		}
-	}
-}
-
-// WithVariant sets the model variant for specific behavior.
-// The default variant is VariantOpenAI.
-// Optional variants are:
-// - VariantHunyuan: Hunyuan variant with specific file handling.
-func WithVariant(variant Variant) Option {
-	return func(opts *options) {
-		opts.Variant = variant
-	}
-}
-
-// WithBatchCompletionWindow sets the batch completion window.
-func WithBatchCompletionWindow(window openai.BatchNewParamsCompletionWindow) Option {
-	return func(opts *options) {
-		opts.BatchCompletionWindow = window
-	}
-}
-
-// WithBatchMetadata sets the batch metadata.
-func WithBatchMetadata(metadata map[string]string) Option {
-	return func(opts *options) {
-		opts.BatchMetadata = metadata
-	}
-}
-
-// WithBatchBaseURL sets a base URL override for batch requests (batches/files).
-// When set, batch operations will use this base URL via per-request override.
-func WithBatchBaseURL(url string) Option {
-	return func(opts *options) {
-		opts.BatchBaseURL = url
-	}
-}
-
-// WithEnableTokenTailoring enables automatic token tailoring based on model context window.
-// When enabled, the system will automatically calculate max input tokens using the model's
-// context window minus reserved tokens and protocol overhead.
-func WithEnableTokenTailoring(enabled bool) Option {
-	return func(opts *options) {
-		opts.EnableTokenTailoring = enabled
-	}
-}
-
-// WithMaxInputTokens sets only the input token limit for token tailoring.
-// The counter/strategy will be lazily initialized if not provided.
-// Defaults to SimpleTokenCounter and MiddleOutStrategy.
-func WithMaxInputTokens(limit int) Option {
-	return func(opts *options) {
-		opts.MaxInputTokens = limit
-	}
-}
-
-// WithTokenCounter sets the TokenCounter used for token tailoring.
-// If not provided and token limit is enabled, a SimpleTokenCounter will be used.
-func WithTokenCounter(counter model.TokenCounter) Option {
-	return func(opts *options) {
-		opts.TokenCounter = counter
-	}
-}
-
-// WithTailoringStrategy sets the TailoringStrategy used for token tailoring.
-// If not provided and token limit is enabled, a MiddleOutStrategy will be used.
-func WithTailoringStrategy(strategy model.TailoringStrategy) Option {
-	return func(opts *options) {
-		opts.TailoringStrategy = strategy
-	}
+	accumulateChunkUsage AccumulateChunkUsage
 }
 
 // New creates a new OpenAI-like model.
 func New(name string, opts ...Option) *Model {
-	o := &options{
-		Variant:           VariantOpenAI, // The default variant is VariantOpenAI.
-		ChannelBufferSize: defaultChannelBufferSize,
-	}
+	o := defaultOptions
 	for _, opt := range opts {
-		opt(o)
+		opt(&o)
 	}
 
 	// Set default API key and base URL if not specified.
@@ -519,26 +262,13 @@ func New(name string, opts ...Option) *Model {
 		clientOpts = append(clientOpts, openaiopt.WithBaseURL(o.BaseURL))
 	}
 
-	clientOpts = append(clientOpts, openaiopt.WithHTTPClient(DefaultNewHTTPClient(o.HTTPClientOptions...)))
+	clientOpts = append(clientOpts, openaiopt.WithHTTPClient(model.DefaultNewHTTPClient(o.HTTPClientOptions...)))
 	clientOpts = append(clientOpts, o.OpenAIOptions...)
 
 	client := openai.NewClient(clientOpts...)
 
-	// Set default batch completion window if not specified.
-	batchCompletionWindow := o.BatchCompletionWindow
-	if batchCompletionWindow == "" {
-		batchCompletionWindow = defaultBatchCompletionWindow
-	}
-
-	// Provide defaults at construction time when token tailoring is enabled.
-	// These are best-effort defaults; user-provided counter/strategy always take priority.
-	if o.MaxInputTokens > 0 {
-		if o.TokenCounter == nil {
-			o.TokenCounter = model.NewSimpleTokenCounter()
-		}
-		if o.TailoringStrategy == nil {
-			o.TailoringStrategy = model.NewMiddleOutStrategy(o.TokenCounter)
-		}
+	if o.TailoringStrategy == nil {
+		o.TailoringStrategy = model.NewMiddleOutStrategy(o.TokenCounter)
 	}
 
 	return &Model{
@@ -546,6 +276,7 @@ func New(name string, opts ...Option) *Model {
 		name:                       name,
 		baseURL:                    o.BaseURL,
 		apiKey:                     o.APIKey,
+		showToolCallDelta:          o.ShowToolCallDelta,
 		channelBufferSize:          o.ChannelBufferSize,
 		chatRequestCallback:        o.ChatRequestCallback,
 		chatResponseCallback:       o.ChatResponseCallback,
@@ -554,13 +285,20 @@ func New(name string, opts ...Option) *Model {
 		extraFields:                o.ExtraFields,
 		variant:                    o.Variant,
 		variantConfig:              variantConfigs[o.Variant],
-		batchCompletionWindow:      batchCompletionWindow,
+		batchCompletionWindow:      o.BatchCompletionWindow,
 		batchMetadata:              o.BatchMetadata,
 		batchBaseURL:               o.BatchBaseURL,
 		enableTokenTailoring:       o.EnableTokenTailoring,
 		tokenCounter:               o.TokenCounter,
 		tailoringStrategy:          o.TailoringStrategy,
 		maxInputTokens:             o.MaxInputTokens,
+		protocolOverheadTokens:     o.TokenTailoringConfig.ProtocolOverheadTokens,
+		reserveOutputTokens:        o.TokenTailoringConfig.ReserveOutputTokens,
+		inputTokensFloor:           o.TokenTailoringConfig.InputTokensFloor,
+		outputTokensFloor:          o.TokenTailoringConfig.OutputTokensFloor,
+		safetyMarginRatio:          o.TokenTailoringConfig.SafetyMarginRatio,
+		maxInputTokensRatio:        o.TokenTailoringConfig.MaxInputTokensRatio,
+		accumulateChunkUsage:       o.accumulateChunkUsage,
 	}
 }
 
@@ -605,27 +343,7 @@ func (m *Model) GenerateContent(
 }
 
 // applyTokenTailoring performs best-effort token tailoring if configured.
-//
-// Formula:
-//
-//	safetyMargin = contextWindow × safetyMarginRatio (10%)
-//	calculatedMax = contextWindow - reserveOutputTokens - protocolOverheadTokens - safetyMargin
-//	ratioLimit = contextWindow × maxInputTokensRatio (65%)
-//	maxInputTokens = max(min(calculatedMax, ratioLimit), inputTokensFloor)
-//
-// Example for deepseek-chat (contextWindow = 131072):
-//
-//	safetyMargin = 131072 × 0.10 = 13107 tokens
-//	calculatedMax = 131072 - 2048 - 512 - 13107 = 115405 tokens
-//	ratioLimit = 131072 × 0.65 = 85196 tokens
-//	maxInputTokens = max(min(115405, 85196), 1024) = 85196 tokens (~65% of context window)
-//
-// This ensures:
-//   - 65% of context window for input messages
-//   - ~1.5% (2048 tokens) reserved for output generation
-//   - 10% safety margin for token counting inaccuracies
-//   - Protocol overhead (512 tokens) for request/response formatting
-//   - Remaining ~23.5% buffer for stability and API overhead
+// It uses the token tailoring strategy defined in imodel package.
 func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request) {
 	// Early return if token tailoring is disabled or no messages to process.
 	if !m.enableTokenTailoring || len(request.Messages) == 0 {
@@ -635,64 +353,85 @@ func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request)
 	// Determine max input tokens using priority: user config > auto calculation > default.
 	maxInputTokens := m.maxInputTokens
 	if maxInputTokens <= 0 {
-		// Auto-calculate based on model context window with safety margin and ratio limit.
+		// Auto-calculate based on model context window with custom or default parameters.
 		contextWindow := imodel.ResolveContextWindow(m.name)
-		safetyMargin := int(float64(contextWindow) * defaultSafetyMarginRatio)
-		calculatedMax := max(contextWindow-defaultReserveOutputTokens-defaultProtocolOverheadTokens-safetyMargin, 0)
-		ratioLimit := int(float64(contextWindow) * defaultMaxInputTokensRatio)
-		maxInputTokens = max(min(calculatedMax, ratioLimit), defaultInputTokensFloor)
-		log.Debugf("auto-calculated max input tokens: model=%s, contextWindow=%d, safetyMargin=%d, calculatedMax=%d, ratioLimit=%d, maxInputTokens=%d",
-			m.name, contextWindow, safetyMargin, calculatedMax, ratioLimit, maxInputTokens)
-	}
-
-	// Determine token counter using priority: user config > default.
-	tokenCounter := m.tokenCounter
-	if tokenCounter == nil {
-		m.tokenCounterOnce.Do(func() {
-			if m.tokenCounter == nil {
-				m.tokenCounter = model.NewSimpleTokenCounter()
-			}
-		})
-		tokenCounter = m.tokenCounter
-	}
-
-	// Determine tailoring strategy using priority: user config > default.
-	tailoringStrategy := m.tailoringStrategy
-	if tailoringStrategy == nil {
-		m.tailoringStrategyOnce.Do(func() {
-			if m.tailoringStrategy == nil {
-				m.tailoringStrategy = model.NewMiddleOutStrategy(tokenCounter)
-			}
-		})
-		tailoringStrategy = m.tailoringStrategy
+		if m.protocolOverheadTokens > 0 || m.reserveOutputTokens > 0 {
+			// Use custom parameters if any are set.
+			maxInputTokens = imodel.CalculateMaxInputTokensWithParams(
+				contextWindow,
+				m.protocolOverheadTokens,
+				m.reserveOutputTokens,
+				m.inputTokensFloor,
+				m.safetyMarginRatio,
+				m.maxInputTokensRatio,
+			)
+		} else {
+			// Use default parameters.
+			maxInputTokens = imodel.CalculateMaxInputTokens(contextWindow)
+		}
+		log.DebugfContext(
+			ctx,
+			"auto-calculated max input tokens: model=%s, "+
+				"contextWindow=%d, maxInputTokens=%d",
+			m.name,
+			contextWindow,
+			maxInputTokens,
+		)
 	}
 
 	// Apply token tailoring.
-	tailored, err := tailoringStrategy.TailorMessages(ctx, request.Messages, maxInputTokens)
+	tailored, err := m.tailoringStrategy.TailorMessages(ctx, request.Messages, maxInputTokens)
 	if err != nil {
-		log.Warn("token tailoring failed in openai.Model", err)
+		log.WarnContext(
+			ctx,
+			"token tailoring failed in openai.Model",
+			err,
+		)
 		return
 	}
 
 	request.Messages = tailored
 
-	// Calculate remaining tokens for output and set max output tokens.
-	usedTokens, err := tokenCounter.CountTokensRange(ctx, request.Messages, 0, len(request.Messages))
+	// Calculate remaining tokens for output based on context window.
+	usedTokens, err := m.tokenCounter.CountTokensRange(ctx, request.Messages, 0, len(request.Messages))
 	if err != nil {
-		log.Warn("failed to count tokens after tailoring", err)
-		return
-	}
-
-	remainingTokens := maxInputTokens - usedTokens
-	if remainingTokens <= 0 {
+		log.WarnContext(
+			ctx,
+			"failed to count tokens after tailoring",
+			err,
+		)
 		return
 	}
 
 	// Set max output tokens only if user hasn't specified it.
 	// This respects user's explicit configuration while providing a safe default.
 	if request.GenerationConfig.MaxTokens == nil {
-		maxOutputTokens := max(remainingTokens, defaultOutputTokensFloor)
-		request.GenerationConfig.MaxTokens = &maxOutputTokens
+		contextWindow := imodel.ResolveContextWindow(m.name)
+		var maxOutputTokens int
+		if m.protocolOverheadTokens > 0 || m.outputTokensFloor > 0 {
+			// Use custom parameters if any are set.
+			maxOutputTokens = imodel.CalculateMaxOutputTokensWithParams(
+				contextWindow,
+				usedTokens,
+				m.protocolOverheadTokens,
+				m.outputTokensFloor,
+				m.safetyMarginRatio,
+			)
+		} else {
+			// Use default parameters.
+			maxOutputTokens = imodel.CalculateMaxOutputTokens(contextWindow, usedTokens)
+		}
+		if maxOutputTokens > 0 {
+			request.GenerationConfig.MaxTokens = &maxOutputTokens
+			log.DebugfContext(
+				ctx,
+				"token tailoring: contextWindow=%d, usedTokens=%d, "+
+					"maxOutputTokens=%d",
+				contextWindow,
+				usedTokens,
+				maxOutputTokens,
+			)
+		}
 	}
 }
 
@@ -747,14 +486,7 @@ func (m *Model) buildChatRequest(request *model.Request) (openai.ChatCompletionN
 	if request.ReasoningEffort != nil {
 		chatRequest.ReasoningEffort = shared.ReasoningEffort(*request.ReasoningEffort)
 	}
-	var opts []openaiopt.RequestOption
-	if request.ThinkingEnabled != nil {
-		opts = append(opts, openaiopt.WithJSONSet(model.ThinkingEnabledKey, *request.ThinkingEnabled))
-	}
-	if request.ThinkingTokens != nil {
-		opts = append(opts, openaiopt.WithJSONSet(model.ThinkingTokensKey, *request.ThinkingTokens))
-	}
-
+	opts := m.buildThinkingOption(request)
 	// Add extra fields to the request
 	for key, value := range m.extraFields {
 		opts = append(opts, openaiopt.WithJSONSet(key, value))
@@ -767,6 +499,29 @@ func (m *Model) buildChatRequest(request *model.Request) (openai.ChatCompletionN
 		}
 	}
 	return chatRequest, opts
+}
+
+// buildThinkingOption converts our Request to OpenAI request RequestOption.
+func (m *Model) buildThinkingOption(request *model.Request) []openaiopt.RequestOption {
+	var opts []openaiopt.RequestOption
+	if request.ThinkingTokens != nil {
+		opts = append(opts, openaiopt.WithJSONSet(model.ThinkingTokensKey, *request.ThinkingTokens))
+	}
+	if request.ThinkingEnabled == nil {
+		return opts
+	}
+	// Use variant-specific key and value convertor.
+	cfg := m.variantConfig
+	key := cfg.thinkingEnabledKey
+	if key == "" {
+		key = model.ThinkingEnabledKey
+	}
+	convertor := cfg.thinkingValueConvertor
+	if convertor == nil {
+		convertor = defaultThinkingValueConvertor
+	}
+	opts = append(opts, openaiopt.WithJSONSet(key, convertor(*request.ThinkingEnabled)))
+	return opts
 }
 
 // convertMessages converts our Message format to OpenAI's format.
@@ -794,11 +549,19 @@ func (m *Model) convertMessages(messages []model.Message) []openai.ChatCompletio
 				},
 			}
 		case model.RoleAssistant:
+			assistantMsg := &openai.ChatCompletionAssistantMessageParam{
+				Content:   m.convertAssistantMessageContent(msg),
+				ToolCalls: m.convertToolCalls(msg.ToolCalls),
+			}
+			// Pass reasoning_content to API if present (required by DeepSeek for
+			// tool call scenarios within the same request turn).
+			if msg.ReasoningContent != "" {
+				assistantMsg.SetExtraFields(map[string]any{
+					model.ReasoningContentKey: msg.ReasoningContent,
+				})
+			}
 			result[i] = openai.ChatCompletionMessageParamUnion{
-				OfAssistant: &openai.ChatCompletionAssistantMessageParam{
-					Content:   m.convertAssistantMessageContent(msg),
-					ToolCalls: m.convertToolCalls(msg.ToolCalls),
-				},
+				OfAssistant: assistantMsg,
 			}
 		case model.RoleTool:
 			result[i] = openai.ChatCompletionMessageParamUnion{
@@ -1029,12 +792,28 @@ func (m *Model) convertTools(tools map[string]tool.Tool) []openai.ChatCompletion
 		result = append(result, openai.ChatCompletionToolParam{
 			Function: openai.FunctionDefinitionParam{
 				Name:        declaration.Name,
-				Description: openai.String(declaration.Description),
+				Description: openai.String(buildToolDescription(declaration)),
 				Parameters:  parameters,
 			},
 		})
 	}
 	return result
+}
+
+// buildToolDescription builds the description for a tool.
+// It appends the output schema to the description.
+func buildToolDescription(declaration *tool.Declaration) string {
+	desc := declaration.Description
+	if declaration.OutputSchema == nil {
+		return desc
+	}
+	schemaJSON, err := json.Marshal(declaration.OutputSchema)
+	if err != nil {
+		log.Errorf("marshal output schema for tool %s: %v", declaration.Name, err)
+		return desc
+	}
+	desc += "\nOutput schema: " + string(schemaJSON)
+	return desc
 }
 
 // handleStreamingResponse handles streaming chat completion responses.
@@ -1067,8 +846,20 @@ func (m *Model) handleStreamingResponse(
 
 		// Always accumulate for correctness (tool call deltas are assembled later),
 		// but skip chunks with reasoning content that would cause the SDK accumulator to panic.
-		if len(chunk.Choices) > 0 && !m.hasReasoningContent(chunk.Choices[0].Delta) {
-			acc.AddChunk(chunk)
+		if !m.hasReasoningContent(chunk.Choices) {
+			// Sanitize chunks before feeding them into the upstream accumulator to
+			// avoid known panics when JSON.ToolCalls is marked present but the
+			// typed ToolCalls slice is empty, especially on finish_reason chunks.
+			sanitizedChunk := sanitizeChunkForAccumulator(chunk)
+
+			acc.AddChunk(sanitizedChunk)
+			if m.accumulateChunkUsage != nil {
+				accUsage, chunkUsage := completionUsageToModelUsage(acc.Usage), completionUsageToModelUsage(chunk.Usage)
+				usage := inverseOPENAISKDAddChunkUsage(accUsage, chunkUsage)
+				usage = m.accumulateChunkUsage(usage, chunkUsage)
+				acc.Usage = modelUsageToCompletionUsage(usage)
+
+			}
 		}
 
 		// Aggregate reasoning delta (if any) for final response fallback.
@@ -1082,7 +873,7 @@ func (m *Model) handleStreamingResponse(
 		// tool_call deltas, which we'll surface only in the final response).
 		// Note: reasoning content chunks are not suppressed even if they have no other content.
 		if m.shouldSuppressChunk(chunk) {
-			if len(chunk.Choices) == 0 || !m.hasReasoningContent(chunk.Choices[0].Delta) {
+			if !m.hasReasoningContent(chunk.Choices) {
 				continue
 			}
 		}
@@ -1113,6 +904,44 @@ func (m *Model) handleStreamingResponse(
 	}
 }
 
+// sanitizeChunkForAccumulator returns a defensive copy of the given chunk that
+// avoids structures known to cause panics in the upstream OpenAI SDK
+// accumulator. In particular, it clears JSON.ToolCalls metadata when it is
+// marked present but the typed ToolCalls slice is empty on a finish_reason
+// chunk, which would otherwise lead to an out-of-range access in
+// chatCompletionResponseState.update.
+func sanitizeChunkForAccumulator(chunk openai.ChatCompletionChunk) openai.ChatCompletionChunk {
+	if len(chunk.Choices) == 0 {
+		return chunk
+	}
+
+	choice := chunk.Choices[0]
+	delta := choice.Delta
+
+	// Only sanitize the specific pattern that is known to be unsafe for the
+	// accumulator:
+	//   - finish_reason is set (e.g. "tool_calls" or "stop")
+	//   - JSON.ToolCalls is marked present
+	//   - but the typed ToolCalls slice is empty
+	if choice.FinishReason == "" ||
+		!delta.JSON.ToolCalls.Valid() ||
+		len(delta.ToolCalls) != 0 {
+		return chunk
+	}
+
+	sanitized := chunk
+	sanitized.Choices = make([]openai.ChatCompletionChunkChoice, len(chunk.Choices))
+	copy(sanitized.Choices, chunk.Choices)
+
+	// Clear the JSON metadata for ToolCalls on the first choice only. This
+	// preserves finish_reason and usage semantics while preventing the
+	// accumulator from treating this as a tool-call delta that must have at
+	// least one element.
+	sanitized.Choices[0].Delta.JSON.ToolCalls = respjson.Field{}
+
+	return sanitized
+}
+
 // updateToolCallIndexMapping updates the tool call index mapping.
 func (m *Model) updateToolCallIndexMapping(chunk openai.ChatCompletionChunk, idToIndexMap map[string]int) {
 	if len(chunk.Choices) > 0 && len(chunk.Choices[0].Delta.ToolCalls) > 0 {
@@ -1131,6 +960,11 @@ func (m *Model) shouldSuppressChunk(chunk openai.ChatCompletionChunk) bool {
 	if len(chunk.Choices) == 0 {
 		return true
 	}
+	// Check for reasoning content - if present, don't suppress.
+	if m.hasReasoningContent(chunk.Choices) {
+		return false
+	}
+
 	choice := chunk.Choices[0]
 	delta := choice.Delta
 
@@ -1139,16 +973,16 @@ func (m *Model) shouldSuppressChunk(chunk openai.ChatCompletionChunk) bool {
 		return false
 	}
 
-	// Check for reasoning content - if present, don't suppress.
-	if m.hasReasoningContent(delta) {
-		return false
+	// If this chunk is a tool_calls delta, optionally suppress emission.
+	// By default we only expose tool calls in the final aggregated response
+	// to avoid noisy blank chunks. When showToolCallDelta is enabled, treat
+	// tool_call chunks as meaningful streaming payload.
+	hasToolCall := delta.JSON.ToolCalls.Valid() ||
+		len(delta.ToolCalls) > 0
+	if hasToolCall {
+		return !m.showToolCallDelta
 	}
 
-	// If this chunk is a tool_calls delta, suppress emission. We'll only expose
-	// tool calls in the final aggregated response to avoid noisy blank chunks.
-	if delta.JSON.ToolCalls.Valid() {
-		return true
-	}
 	if choice.FinishReason != "" {
 		return false
 	}
@@ -1164,20 +998,29 @@ func (m *Model) shouldSuppressChunk(chunk openai.ChatCompletionChunk) bool {
 // 2. Check content - if valid, don't skip (even if empty string)
 // 3. Check refusal - if valid, don't skip
 // 4. Check toolcalls - if valid but array is empty, skip (defensive against panic)
-// 5. Otherwise, skip
+// 5. Check usage - if valid, don't skip
+// 6. Otherwise, skip
 func (m *Model) shouldSkipEmptyChunk(chunk openai.ChatCompletionChunk) bool {
+	// Chunks that carry a finish reason are meaningful and should not be
+	// skipped, even if they have no content or usage. This ensures that
+	// streaming clients can observe termination semantics.
+	if len(chunk.Choices) > 0 &&
+		chunk.Choices[0].FinishReason != "" {
+		return false
+	}
+
 	// No choices available, don't skip (let it be processed normally).
 	if len(chunk.Choices) == 0 {
 		return false
 	}
 
-	// Extract delta for inspection.
-	delta := chunk.Choices[0].Delta
-
 	// Reasoning content is meaningful even if other fields are empty.
-	if m.hasReasoningContent(delta) {
+	if m.hasReasoningContent(chunk.Choices) {
 		return false
 	}
+
+	// Extract delta for inspection.
+	delta := chunk.Choices[0].Delta
 
 	// Content or refusal indicates meaningful output.
 	if delta.JSON.Content.Valid() || delta.JSON.Refusal.Valid() {
@@ -1189,13 +1032,20 @@ func (m *Model) shouldSkipEmptyChunk(chunk openai.ChatCompletionChunk) bool {
 		return len(delta.ToolCalls) == 0
 	}
 
+	if chunk.Usage.CompletionTokens > 0 || chunk.Usage.PromptTokens > 0 || chunk.Usage.TotalTokens > 0 {
+		return false
+	}
+
 	// Otherwise there is no meaningful delta, skip the chunk.
 	return true
 }
 
-// hasReasoningContent checks if the delta contains reasoning content.
-func (m *Model) hasReasoningContent(delta openai.ChatCompletionChunkChoiceDelta) bool {
-	return extractReasoningContent(delta.JSON.ExtraFields) != ""
+// hasReasoningContent checks if the choices contains reasoning content.
+func (m *Model) hasReasoningContent(choices []openai.ChatCompletionChunkChoice) bool {
+	if len(choices) == 0 {
+		return false
+	}
+	return extractReasoningContent(choices[0].Delta.JSON.ExtraFields) != ""
 }
 
 // extractReasoningContent extracts reasoning content from ExtraFields.
@@ -1239,12 +1089,37 @@ func (m *Model) createPartialResponse(chunk openai.ChatCompletionChunk) *model.R
 			response.Choices = make([]model.Choice, 1)
 		}
 
-		reasoningContent := extractReasoningContent(chunk.Choices[0].Delta.JSON.ExtraFields)
+		reasoningContent := extractReasoningContent(
+			chunk.Choices[0].Delta.JSON.ExtraFields)
+		var toolCalls []model.ToolCall
+		if m.showToolCallDelta &&
+			len(chunk.Choices[0].Delta.ToolCalls) > 0 {
+			toolCalls = make(
+				[]model.ToolCall, 0,
+				len(chunk.Choices[0].Delta.ToolCalls))
+			for _, toolCall := range chunk.Choices[0].Delta.ToolCalls {
+				var indexPtr *int
+				if toolCall.Index != 0 {
+					index := int(toolCall.Index)
+					indexPtr = &index
+				}
+				toolCalls = append(toolCalls, model.ToolCall{
+					Type: string(toolCall.Type),
+					Function: model.FunctionDefinitionParam{
+						Name:      toolCall.Function.Name,
+						Arguments: []byte(toolCall.Function.Arguments),
+					},
+					ID:    toolCall.ID,
+					Index: indexPtr,
+				})
+			}
+		}
 
 		response.Choices[0].Delta = model.Message{
 			Role:             model.RoleAssistant,
 			Content:          chunk.Choices[0].Delta.Content,
 			ReasoningContent: reasoningContent,
+			ToolCalls:        toolCalls,
 		}
 
 		// Handle finish reason - FinishReason is a plain string.
@@ -1377,20 +1252,14 @@ func (m *Model) createFinalResponse(
 	accumulatedToolCalls []model.ToolCall,
 	aggregatedReasoning string,
 ) *model.Response {
+	usage := completionUsageToModelUsage(acc.Usage)
 	finalResponse := &model.Response{
-		Object:  model.ObjectTypeChatCompletion,
-		ID:      acc.ID,
-		Created: acc.Created,
-		Model:   acc.Model,
-		Choices: make([]model.Choice, len(acc.Choices)),
-		Usage: &model.Usage{
-			PromptTokens:     int(acc.Usage.PromptTokens),
-			CompletionTokens: int(acc.Usage.CompletionTokens),
-			TotalTokens:      int(acc.Usage.TotalTokens),
-			PromptTokensDetails: model.PromptTokensDetails{
-				CachedTokens: int(acc.Usage.PromptTokensDetails.CachedTokens),
-			},
-		},
+		Object:    model.ObjectTypeChatCompletion,
+		ID:        acc.ID,
+		Created:   acc.Created,
+		Model:     acc.Model,
+		Choices:   make([]model.Choice, len(acc.Choices)),
+		Usage:     &usage,
 		Timestamp: time.Now(),
 		Done:      !hasToolCall,
 		IsPartial: false,
@@ -1416,6 +1285,14 @@ func (m *Model) createFinalResponse(
 		// If there are tool calls, add them to the final response.
 		if hasToolCall && i == 0 { // Usually only the first choice contains tool calls.
 			finalResponse.Choices[i].Message.ToolCalls = accumulatedToolCalls
+		}
+
+		// Propagate finish reason from the accumulated choice so that the final
+		// aggregated response exposes the same termination semantics as the
+		// underlying provider.
+		if choice.FinishReason != "" {
+			finishReason := choice.FinishReason
+			finalResponse.Choices[i].FinishReason = &finishReason
 		}
 	}
 
@@ -1447,10 +1324,6 @@ func (m *Model) handleNonStreamingResponse(
 		}
 		return
 	}
-	if m.chatResponseCallback != nil {
-		m.chatResponseCallback(ctx, &chatRequest, chatCompletion)
-	}
-
 	// Call response callback on successful completion.
 	if m.chatResponseCallback != nil {
 		m.chatResponseCallback(ctx, &chatRequest, chatCompletion)
@@ -1508,14 +1381,8 @@ func (m *Model) handleNonStreamingResponse(
 
 	// Convert usage information.
 	if chatCompletion.Usage.PromptTokens > 0 || chatCompletion.Usage.CompletionTokens > 0 {
-		response.Usage = &model.Usage{
-			PromptTokens:     int(chatCompletion.Usage.PromptTokens),
-			CompletionTokens: int(chatCompletion.Usage.CompletionTokens),
-			TotalTokens:      int(chatCompletion.Usage.TotalTokens),
-			PromptTokensDetails: model.PromptTokensDetails{
-				CachedTokens: int(chatCompletion.Usage.PromptTokensDetails.CachedTokens),
-			},
-		}
+		usage := completionUsageToModelUsage(chatCompletion.Usage)
+		response.Usage = &usage
 	}
 
 	// Set system fingerprint if available.

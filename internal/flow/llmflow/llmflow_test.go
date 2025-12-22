@@ -19,10 +19,12 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
 	"trpc.group/trpc-go/trpc-agent-go/internal/flow"
+	"trpc.group/trpc-go/trpc-agent-go/internal/flow/processor"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
+	"trpc.group/trpc-go/trpc-agent-go/tool/function"
 )
 
 // Additional unit tests for long-running tool tracking and preprocess
@@ -453,4 +455,287 @@ func TestRun_NoPanicWhenModelReturnsNoResponses(t *testing.T) {
 		count++
 	}
 	require.Equal(t, 1, count)
+}
+
+// TestRunAfterModelCallbacks_ErrorPassing tests that modelErr is correctly passed to callbacks
+// when response.Error is not nil.
+func TestRunAfterModelCallbacks_ErrorPassing(t *testing.T) {
+	tests := []struct {
+		name       string
+		response   *model.Response
+		wantErr    bool
+		wantErrMsg string
+	}{
+		{
+			name: "response with error",
+			response: &model.Response{
+				Error: &model.ResponseError{
+					Type:    model.ErrorTypeAPIError,
+					Message: "rate limit exceeded",
+				},
+			},
+			wantErr:    true,
+			wantErrMsg: "api_error: rate limit exceeded",
+		},
+		{
+			name: "response without error",
+			response: &model.Response{
+				Choices: []model.Choice{{Index: 0, Message: model.NewAssistantMessage("ok")}},
+			},
+			wantErr:    false,
+			wantErrMsg: "",
+		},
+		{
+			name:       "nil response",
+			response:   nil,
+			wantErr:    false,
+			wantErrMsg: "",
+		},
+		{
+			name: "response with nil error field",
+			response: &model.Response{
+				Error: nil,
+			},
+			wantErr:    false,
+			wantErrMsg: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var receivedErr error
+			callbacks := model.NewCallbacks().RegisterAfterModel(
+				func(ctx context.Context, req *model.Request, rsp *model.Response, modelErr error) (*model.Response, error) {
+					receivedErr = modelErr
+					return nil, nil
+				},
+			)
+
+			flow := &Flow{
+				modelCallbacks: callbacks,
+			}
+
+			_, _, err := flow.runAfterModelCallbacks(context.Background(), &model.Request{}, tt.response)
+			require.NoError(t, err)
+
+			if tt.wantErr {
+				require.NotNil(t, receivedErr, "expected callback to receive error, but got nil")
+				require.Equal(t, tt.wantErrMsg, receivedErr.Error(), "error message mismatch")
+			} else {
+				require.Nil(t, receivedErr, "expected callback to receive nil error, but got: %v", receivedErr)
+			}
+		})
+	}
+}
+
+// blockingModel emits one response then waits for ctx cancellation.
+type blockingModel struct{}
+
+func (m *blockingModel) Info() model.Info {
+	return model.Info{Name: "blocking"}
+}
+
+func (m *blockingModel) GenerateContent(
+	ctx context.Context,
+	req *model.Request,
+) (<-chan *model.Response, error) {
+	ch := make(chan *model.Response, 1)
+	ch <- &model.Response{
+		Choices: []model.Choice{
+			{
+				Message: model.NewAssistantMessage("hi"),
+			},
+		},
+	}
+	go func() {
+		defer close(ch)
+		<-ctx.Done()
+	}()
+	return ch, nil
+}
+
+func TestFlow_Run_ContextCanceledIsGraceful(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	f := New(nil, nil, Options{})
+	inv := agent.NewInvocation(
+		agent.WithInvocationAgent(&minimalAgent{}),
+		agent.WithInvocationModel(&blockingModel{}),
+	)
+
+	ch, err := f.Run(ctx, inv)
+	require.NoError(t, err)
+
+	var sawLLMEvent bool
+	for evt := range ch {
+		if evt.RequiresCompletion {
+			key := agent.AppendEventNoticeKeyPrefix + evt.ID
+			_ = inv.NotifyCompletion(ctx, key)
+		}
+		if evt.Response != nil {
+			sawLLMEvent = true
+			cancel()
+		}
+	}
+	require.True(t, sawLLMEvent)
+}
+
+func TestFlow_callLLM_NoModel(t *testing.T) {
+	f := New(nil, nil, Options{})
+	inv := agent.NewInvocation()
+	req := &model.Request{}
+
+	ch, err := f.callLLM(context.Background(), inv, req)
+	require.Error(t, err)
+	require.Nil(t, ch)
+}
+
+func TestFlow_callLLM_ModelError(t *testing.T) {
+	f := New(nil, nil, Options{})
+	inv := agent.NewInvocation(
+		agent.WithInvocationModel(&mockModel{ShouldError: true}),
+	)
+	req := &model.Request{}
+
+	ch, err := f.callLLM(context.Background(), inv, req)
+	require.Error(t, err)
+	require.Nil(t, ch)
+}
+
+func TestFlow_Postprocess_WithProcessor(t *testing.T) {
+	respProcessor := &mockResponseProcessor{}
+	f := New(nil, []flow.ResponseProcessor{respProcessor}, Options{})
+
+	ctx := context.Background()
+	inv := agent.NewInvocation()
+	req := &model.Request{}
+	resp := &model.Response{
+		Choices: []model.Choice{
+			{
+				Message: model.NewAssistantMessage("ok"),
+			},
+		},
+	}
+	eventCh := make(chan *event.Event, 2)
+
+	f.postprocess(ctx, inv, req, resp, eventCh)
+
+	var count int
+	for {
+		select {
+		case <-eventCh:
+			count++
+		default:
+			goto done
+		}
+	}
+
+done:
+	require.Equal(t, 1, count)
+}
+
+// Test that when RunOptions.Resume is enabled and the latest session event
+// is an assistant tool_call response, the flow executes the pending tool
+// before issuing a new LLM request.
+func TestRun_WithResumeExecutesPendingToolCalls(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	// Record invocations of the test tool.
+	var toolCalls []string
+	testTool := function.NewFunctionTool(
+		func(_ context.Context, req *struct {
+			Value string `json:"value"`
+		}) (*struct {
+			Value string `json:"value"`
+		}, error) {
+			toolCalls = append(toolCalls, req.Value)
+			return &struct {
+				Value string `json:"value"`
+			}{Value: "ok:" + req.Value}, nil
+		},
+		function.WithName("resume_tool"),
+		function.WithDescription("resume test tool"),
+	)
+
+	// Session contains a single assistant tool_call response.
+	sess := &session.Session{}
+	resp := &model.Response{
+		Done: true,
+		Choices: []model.Choice{
+			{
+				Message: model.Message{
+					Role: model.RoleAssistant,
+					ToolCalls: []model.ToolCall{
+						{
+							ID: "call-1",
+							Function: model.FunctionDefinitionParam{
+								Name:      "resume_tool",
+								Arguments: []byte(`{"value":"resume"}`),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	toolCallEvent := event.NewResponseEvent("inv-1", "agent-resume", resp)
+	sess.Events = append(sess.Events, *toolCallEvent)
+
+	// Agent with the test tool and a model that returns no responses.
+	agentWithTool := &mockAgentWithTools{
+		name:  "agent-resume",
+		tools: []tool.Tool{testTool},
+	}
+
+	inv := agent.NewInvocation(
+		agent.WithInvocationID("inv-1"),
+		agent.WithInvocationAgent(agentWithTool),
+		agent.WithInvocationSession(sess),
+		agent.WithInvocationModel(&noResponseModel{}),
+		agent.WithInvocationRunOptions(agent.RunOptions{
+			Resume: true,
+		}),
+	)
+
+	llmFlow := New(
+		nil,
+		[]flow.ResponseProcessor{
+			processor.NewFunctionCallResponseProcessor(false, nil),
+		},
+		Options{},
+	)
+
+	eventCh, err := llmFlow.Run(ctx, inv)
+	require.NoError(t, err)
+
+	var sawToolResult bool
+	for evt := range eventCh {
+		if evt.RequiresCompletion {
+			key := agent.AppendEventNoticeKeyPrefix + evt.ID
+			_ = inv.NotifyCompletion(ctx, key)
+		}
+		if evt.Response != nil && evt.Response.IsToolResultResponse() {
+			sawToolResult = true
+		}
+	}
+
+	require.True(t, sawToolResult, "expected tool result event when resuming")
+	require.Len(t, toolCalls, 1)
+	require.Equal(t, "resume", toolCalls[0])
+}
+
+func TestWaitEventTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	timeout := WaitEventTimeout(ctx)
+	require.InDelta(t, time.Second.Seconds(), timeout.Seconds(), 0.1)
+}
+
+func TestWaitEventTimeout_NoDeadline(t *testing.T) {
+	ctx := context.Background()
+	timeout := WaitEventTimeout(ctx)
+	require.Equal(t, 5*time.Second, timeout)
 }

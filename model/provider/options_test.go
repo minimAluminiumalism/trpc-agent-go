@@ -15,11 +15,13 @@ import (
 	"testing"
 
 	anthropicsdk "github.com/anthropics/anthropic-sdk-go"
+	"github.com/ollama/ollama/api"
 	openaisdk "github.com/openai/openai-go"
 	"github.com/stretchr/testify/assert"
 
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/model/anthropic"
+	"trpc.group/trpc-go/trpc-agent-go/model/ollama"
 	"trpc.group/trpc-go/trpc-agent-go/model/openai"
 )
 
@@ -34,6 +36,7 @@ func TestOptionsSetters(t *testing.T) {
 	WithHTTPClientName("client")(opts)
 	WithHTTPClientTransport(http.DefaultTransport)(opts)
 	WithChannelBufferSize(128)(opts)
+	WithHeaders(map[string]string{"X-Trace": "id"})(opts)
 	WithEnableTokenTailoring(true)(opts)
 	WithMaxInputTokens(512)(opts)
 	WithTokenCounter(counter)(opts)
@@ -45,6 +48,7 @@ func TestOptionsSetters(t *testing.T) {
 	assert.Equal(t, http.DefaultTransport, opts.HTTPClientTransport)
 	assert.NotNil(t, opts.ChannelBufferSize)
 	assert.Equal(t, 128, *opts.ChannelBufferSize)
+	assert.Equal(t, "id", opts.Headers["X-Trace"])
 	assert.NotNil(t, opts.EnableTokenTailoring)
 	assert.True(t, *opts.EnableTokenTailoring)
 	assert.NotNil(t, opts.MaxInputTokens)
@@ -66,6 +70,19 @@ func TestWithExtraFieldsMergesAndCopies(t *testing.T) {
 	assert.Equal(t, 2, len(opts.ExtraFields))
 }
 
+func TestWithHeadersMergesAndCopies(t *testing.T) {
+	opts := &Options{}
+	source := map[string]string{"X-Trace": "id"}
+	WithHeaders(source)(opts)
+	source["X-Trace"] = "changed"
+
+	assert.Equal(t, "id", opts.Headers["X-Trace"])
+
+	WithHeaders(map[string]string{"User-Agent": "agent"})(opts)
+	assert.Equal(t, "agent", opts.Headers["User-Agent"])
+	assert.Equal(t, 2, len(opts.Headers))
+}
+
 func TestWithCallbacksAllocatesAndOverwrites(t *testing.T) {
 	opts := &Options{}
 
@@ -75,6 +92,12 @@ func TestWithCallbacksAllocatesAndOverwrites(t *testing.T) {
 	}
 	cb2 := Callbacks{
 		AnthropicChatChunk: anthropic.ChatChunkCallbackFunc(func(context.Context, *anthropicsdk.MessageNewParams, *anthropicsdk.MessageStreamEventUnion) {}),
+	}
+	cb3 := Callbacks{
+		OllamaChatRequest:    ollama.ChatRequestCallbackFunc(func(context.Context, *api.ChatRequest) {}),
+		OllamaChatResponse:   ollama.ChatResponseCallbackFunc(func(context.Context, *api.ChatRequest, *api.ChatResponse) {}),
+		OllamaChatChunk:      ollama.ChatChunkCallbackFunc(func(context.Context, *api.ChatRequest, *api.ChatResponse) {}),
+		OllamaStreamComplete: ollama.ChatStreamCompleteCallbackFunc(func(context.Context, *api.ChatRequest, error) {}),
 	}
 
 	WithCallbacks(cb1)(opts)
@@ -87,6 +110,10 @@ func TestWithCallbacksAllocatesAndOverwrites(t *testing.T) {
 	assert.Equal(t, first, opts.Callbacks)
 	assert.NotNil(t, opts.Callbacks.AnthropicChatChunk)
 	assert.NotNil(t, opts.Callbacks.OpenAIChatRequest)
+
+	WithCallbacks(cb3)(opts)
+	assert.Equal(t, first, opts.Callbacks)
+	assert.NotNil(t, opts.Callbacks.OllamaChatChunk)
 }
 
 func TestWithOpenAIOption(t *testing.T) {
@@ -99,4 +126,24 @@ func TestWithAnthropicOption(t *testing.T) {
 	opts := &Options{}
 	WithAnthropicOption(anthropic.WithBaseURL("https://example.com"))(opts)
 	assert.Equal(t, 1, len(opts.AnthropicOption))
+}
+
+func TestWithTokenTailoringConfig(t *testing.T) {
+	opts := &Options{}
+	config := &model.TokenTailoringConfig{
+		ProtocolOverheadTokens: 1024,
+		ReserveOutputTokens:    4096,
+		InputTokensFloor:       2048,
+		OutputTokensFloor:      512,
+		SafetyMarginRatio:      0.15,
+		MaxInputTokensRatio:    0.90,
+	}
+	WithTokenTailoringConfig(config)(opts)
+	assert.NotNil(t, opts.TokenTailoringConfig)
+	assert.Equal(t, 1024, opts.TokenTailoringConfig.ProtocolOverheadTokens)
+	assert.Equal(t, 4096, opts.TokenTailoringConfig.ReserveOutputTokens)
+	assert.Equal(t, 2048, opts.TokenTailoringConfig.InputTokensFloor)
+	assert.Equal(t, 512, opts.TokenTailoringConfig.OutputTokensFloor)
+	assert.Equal(t, 0.15, opts.TokenTailoringConfig.SafetyMarginRatio)
+	assert.Equal(t, 0.90, opts.TokenTailoringConfig.MaxInputTokensRatio)
 }

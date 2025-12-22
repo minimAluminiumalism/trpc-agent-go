@@ -14,14 +14,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
+	"strings"
 	"time"
 
+	"trpc.group/trpc-go/trpc-agent-go/evaluation/epochtime"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/evalresult"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/evalset"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/evaluator"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/evaluator/registry"
-	"trpc.group/trpc-go/trpc-agent-go/evaluation/internal/epochtime"
 	istatus "trpc.group/trpc-go/trpc-agent-go/evaluation/internal/status"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/metric"
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/service"
@@ -29,6 +31,8 @@ import (
 	"trpc.group/trpc-go/trpc-agent-go/evaluation/status"
 	"trpc.group/trpc-go/trpc-agent-go/runner"
 )
+
+const reasonSeparator = ";"
 
 // local is a local implementation of service.Service.
 type local struct {
@@ -193,28 +197,45 @@ func (s *local) evaluatePerCase(ctx context.Context, inferenceResult *service.In
 	for _, evalMetric := range evaluateConfig.EvalMetrics {
 		result, err := s.evaluateMetric(ctx, evalMetric, inferenceResult.Inferences, evalCase.Conversation)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
 			return nil, fmt.Errorf("run evaluation for metric %s: %w", evalMetric.MetricName, err)
 		}
-		overallMetricResults = append(overallMetricResults, &evalresult.EvalMetricResult{
-			MetricName: evalMetric.MetricName,
-			Threshold:  evalMetric.Threshold,
-			Score:      result.OverallScore,
-			EvalStatus: result.OverallStatus,
-		})
 		if len(result.PerInvocationResults) != len(perInvocation) {
 			return nil, fmt.Errorf("metric %s returned %d per-invocation results, expected %d", evalMetric.MetricName,
 				len(result.PerInvocationResults), len(perInvocation))
 		}
+		reasons := make([]string, 0, len(result.PerInvocationResults))
 		for i, invocationResult := range result.PerInvocationResults {
 			// Record the metric outcome for the corresponding invocation.
 			evalMetricResult := &evalresult.EvalMetricResult{
 				MetricName: evalMetric.MetricName,
 				Threshold:  evalMetric.Threshold,
+				Criterion:  evalMetric.Criterion,
 				Score:      invocationResult.Score,
 				EvalStatus: invocationResult.Status,
 			}
+			if invocationResult.Details != nil {
+				evalMetricResult.Details = &evalresult.EvalMetricResultDetails{
+					Reason: invocationResult.Details.Reason,
+					Score:  invocationResult.Details.Score,
+				}
+				reasons = append(reasons, invocationResult.Details.Reason)
+			}
 			perInvocation[i].EvalMetricResults = append(perInvocation[i].EvalMetricResults, evalMetricResult)
 		}
+		overallMetricResults = append(overallMetricResults, &evalresult.EvalMetricResult{
+			MetricName: evalMetric.MetricName,
+			Threshold:  evalMetric.Threshold,
+			Criterion:  evalMetric.Criterion,
+			Score:      result.OverallScore,
+			EvalStatus: result.OverallStatus,
+			Details: &evalresult.EvalMetricResultDetails{
+				Reason: strings.Join(reasons, reasonSeparator),
+				Score:  result.OverallScore,
+			},
+		})
 	}
 	// Summarize the overall metric results and return the final eval status.
 	finalStatus, err := istatus.SummarizeMetricsStatus(overallMetricResults)

@@ -13,11 +13,13 @@ nav:
           - Multi Agent: multiagent.md
           - Graph Agent: graph.md
           - Custom Agent: custom-agent.md
+          - Dify Agent: dify.md
       - Runner: runner.md
       - Model: model.md
       - Callbacks: callbacks.md
       - Memory: memory.md
       - Artifact: artifact.md
+      - Skill: skill.md
       - Tool: tool.md
       - Session: session.md
       - Knowledge: knowledge.md
@@ -25,7 +27,6 @@ nav:
       - Event: event.md
       - Evaluation: evaluation.md
   - Server:
-    - Debug: debugserver.md
     - AG-UI: agui.md
     - A2A: a2a.md
   - Observability: observability.md
@@ -52,20 +53,20 @@ plugins:
                     - Multi Agent: multiagent.md
                     - Graph Agent: graph.md
                     - 自定义 Agent: custom-agent.md
+                    - Dify Agent: dify.md
                 - Runner: runner.md
                 - Model: model.md
                 - Callbacks: callbacks.md
                 - Memory: memory.md
                 - Artifact: artifact.md
+                - Skill: skill.md
                 - Tool: tool.md
                 - Session: session.md
                 - Knowledge: knowledge.md
                 - Planner: planner.md
-                - Graph: graph.md
                 - Event: event.md
                 - Evaluation: evaluation.md
             - 服务:
-              - 调试: debugserver.md
               - AG-UI: agui.md
               - A2A: a2a.md
             - 可观测: observability.md

@@ -69,6 +69,7 @@ func main() {
 
 	// 3. 创建 Runner
 	r := runner.NewRunner("my-app", a)
+	defer r.Close()  // 确保资源被清理 (trpc-agent-go >= v0.5.0)
 
 	// 4. 运行对话
 	ctx := context.Background()
@@ -157,10 +158,41 @@ r := runner.NewRunner("my-app", agent,
 ```go
 // 执行单次对话
 eventChan, err := r.Run(ctx, userID, sessionID, message, options...)
-
-// 带运行选项（当前 RunOptions 为空结构体，留作未来扩展）
-eventChan, err := r.Run(ctx, userID, sessionID, message, agent.WithRequestID("request-ID"))
 ```
+
+#### 中断恢复（工具优先继续执行）
+
+在真实业务里，用户可能在 Agent 还处于“工具调用阶段”时中断：
+
+- 会话里的最后一条消息是带 `tool_calls` 的 assistant 消息；
+- 但对应的工具结果（tool result）还没来得及写回 Session。
+
+之后如果你想在同一个 `sessionID` 上“继续上次的任务”，可以开启
+`WithResume(true)`，让 Runner 先把上次未完成的工具调用执行完，再进入
+下一轮 LLM 调用：
+
+```go
+eventChan, err := r.Run(
+    ctx,
+    userID,
+    sessionID,
+    model.Message{},          // 没有新的用户输入
+    agent.WithResume(true),   // 开启恢复模式
+)
+```
+
+开启 `WithResume(true)` 时，Runner 会：
+
+- 读取当前 Session 中最新的一条事件；
+- 如果最后一条是「带 `tool_calls` 的 assistant 回复」，且之后没有对应的
+  工具结果事件：
+  - 使用当前 Agent 注册的工具集合和回调，执行这些“未完成的工具调用”；
+  - 把工具执行结果写入 Session（作为 tool 消息事件）；
+- 工具执行结束后，再按正常流程发起新一轮 LLM 调用，此时模型能看到
+  “上一次的 tool_calls + 对应的工具结果”，不会重复要求调用同一工具。
+
+如果最后一条事件是 user / tool 消息，或者是普通的 assistant 文本回复，
+则 `WithResume(true)` 不会做任何额外处理，行为等同于普通的 `Run` 调用。
 
 #### 传入对话历史（auto-seed + 复用 Session）
 
@@ -284,6 +316,36 @@ agent := llmagent.New("assistant",
 // 使用 Runner 执行 Agent
 r := runner.NewRunner("my-app", agent)
 ```
+
+### 在请求级别切换 Agent
+
+Runner 支持在构造时注册多个可选 Agent，并在单次 Run 时切换。
+
+```go
+reader := llmagent.New("agent1", llmagent.WithModel(model))
+writer := llmagent.New("agent2", llmagent.WithModel(model))
+
+r := runner.NewRunner("appName", reader, // 使用 reader agent 作为默认 agent
+    runner.WithAgent("writer", writer),  // 按名称注册可选 Agent
+)
+
+// 使用 reader agent 作为默认 agent
+ch, err := r.Run(ctx, userID, sessionID, msg)
+
+// 通过 Agent Name 指定使用 writer agent
+ch, err := r.Run(ctx, userID, sessionID, msg, agent.WithAgentByName("writer"))
+
+// 直接传入实例，无需预注册。
+custom := llmagent.New("custom", llmagent.WithModel(model))
+ch, err := r.Run(ctx, userID, sessionID, msg, agent.WithAgent(custom))
+```
+
+- `runner.NewRunner("appName", agent)`：在创建 runner 时设置默认 Agent；
+- `runner.WithAgent("agentName", agent)`: 在创建 Runner 时预注册一个 Agent，供后续请求按名称切换；
+- `agent.WithAgentByName("agentName")`: 在单次请求里通过名称选用已注册的 Agent；
+- `agent.WithAgent(agent)`: 在单次请求里直接传入一个 Agent 实例临时覆盖，无需预注册。
+
+Agent 生效优先级：`agent.WithAgent` > `agent.WithAgentByName` > `runner.NewRunner` 设置的默认 Agent。
 
 ### 生成配置
 
@@ -478,24 +540,153 @@ for event := range eventChan {
 }
 ```
 
-### 资源管理
+### 安全中断执行
+
+- **取消上下文**：用 `context.WithCancel` 包裹 `runner.Run` 的 ctx，
+  当轮次或 token 超限时调用 `cancel()`。`llmflow` 将
+  `context.Canceled` 视为正常退出，会关闭 agent 事件通道，
+  runner 的消费循环也会正常结束，避免阻塞。
 
 ```go
-// 使用 context 控制生命周期
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+eventCh, err := r.Run(ctx, userID, sessionID, message)
+if err != nil {
+    return err
+}
+
+turns := 0
+for evt := range eventCh {
+    if evt.Error != nil {
+        log.Printf("事件错误: %s", evt.Error.Message)
+        continue
+    }
+    // ... 处理事件 ...
+    if evt.IsFinalResponse() {
+        break
+    }
+    turns++
+    if turns >= maxTurns {
+        cancel() // 停止后续模型或工具调用
+    }
+}
+```
+
+- **发送停止事件**：在自定义处理器或工具内部返回 `agent.NewStopError("原因")`。`llmflow` 会把它转换为 `stop_agent_error` 事件并停止流程。
+  仍建议配合 ctx cancel 进行硬截止。详见 [回调中的停止用法](https://trpc-group.github.io/trpc-agent-go/zh/callbacks/#stop-agent-via-callbacks)。
+
+- **避免直接 break 事件循环**：直接在 runner 的事件消费循环里 break 会让 agent goroutine 继续运行并可能在写通道时阻塞。
+  优先使用上下文取消或 `StopError`。
+
+### 资源管理
+
+#### 🔒 关闭 Runner（重要）
+
+**Runner 在不使用时必须调用 `Close()` 方法，否则会导致 goroutine 泄漏（要求 `trpc-agent-go >= v0.5.0`）。**
+
+**Runner 只关闭它自己创建的资源**
+
+当 Runner 创建时如果未提供 Session Service，会自动创建默认的 inmemory Session Service。该 Service 内部会启动后台 goroutines（用于异步处理 summary、基于 TTL 的会话清理等任务）。**Runner 只管理这个自己创建的 inmemory Session Service 的生命周期。** 如果你通过 `WithSessionService()` 提供了自己的 Session Service，你需要自己管理它的生命周期——Runner 不会关闭它。
+
+如果不调用拥有 inmemory Session Service 的 Runner 的 `Close()`，这些后台 goroutines 将永远运行，造成资源泄漏。
+
+**推荐做法**：
+
+```go
+// ✅ 推荐：使用 defer 确保资源被清理
+r := runner.NewRunner("my-app", agent)
+defer r.Close()  // 确保在函数退出时关闭 (trpc-agent-go >= v0.5.0)
+
+// 使用 runner
+eventChan, err := r.Run(ctx, userID, sessionID, message)
+if err != nil {
+	return err
+}
+
+for event := range eventChan {
+	// 处理事件
+	if event.IsRunnerCompletion() {
+		break
+	}
+}
+```
+
+**当你提供自己的 Session Service 时**：
+
+```go
+// 你创建并管理 session service 的生命周期
+sessionService := redis.NewService(redis.WithRedisClientURL("redis://localhost:6379"))
+defer sessionService.Close()  // 你负责关闭它
+
+// Runner 使用但不拥有这个 session service
+r := runner.NewRunner("my-app", agent,
+	runner.WithSessionService(sessionService))
+defer r.Close()  // 这不会关闭 sessionService（因为是你提供的） (trpc-agent-go >= v0.5.0)
+
+// ... 使用 runner
+```
+
+**长期运行的服务**：
+
+```go
+type Service struct {
+	runner runner.Runner
+	sessionService session.Service  // 如果你自己管理它
+}
+
+func NewService() *Service {
+	r := runner.NewRunner("my-app", agent)
+	return &Service{runner: r}
+}
+
+func (s *Service) Start() error {
+	// 启动服务逻辑
+	return nil
+}
+
+// 在服务关闭时调用 Close
+func (s *Service) Stop() error {
+	// 关闭 runner（它会关闭自己拥有的 inmemory session service）
+    // 要求 trpc-agent-go >= v0.5.0
+	if err := s.runner.Close(); err != nil {
+		return err
+	}
+
+	// 如果你提供了自己的 session service，在这里关闭它
+	if s.sessionService != nil {
+		return s.sessionService.Close()
+	}
+
+	return nil
+}
+```
+
+**注意事项**：
+
+- ✅ `Close()` 是幂等的，多次调用是安全的
+- ✅ **Runner 只关闭它默认创建的 inmemory Session Service**
+- ✅ 如果你通过 `WithSessionService()` 提供了自己的 Session Service，Runner 不会关闭它（你需要自己管理）
+- ❌ 如果 Runner 拥有 inmemory Session Service 但不调用 `Close()`，会导致 goroutine 泄漏
+
+#### Context 生命周期控制
+
+```go
+// 使用 context 控制单次运行的生命周期
 ctx, cancel := context.WithCancel(context.Background())
 defer cancel()
 
 // 确保消费完所有事件
 eventChan, err := r.Run(ctx, userID, sessionID, message)
 if err != nil {
-    return err
+	return err
 }
 
 for event := range eventChan {
-    // 处理事件
-    if event.Done {
-        break
-    }
+	// 处理事件
+	if event.Done {
+		break
+	}
 }
 ```
 

@@ -147,6 +147,9 @@ func run() error {
 	sessSvc := inmemory.NewSessionService()
 	r := runner.NewRunner(appName, parentGA, runner.WithSessionService(sessSvc))
 
+	// Ensure runner resources are cleaned up (trpc-agent-go >= v0.5.0)
+	defer r.Close()
+
 	user := "user"
 	session := fmt.Sprintf("sess-%d", time.Now().Unix())
 	fmt.Printf("✅ Ready. Session: %s\n", session)
@@ -385,10 +388,6 @@ func stream(ch <-chan *event.Event, verbose bool) error {
 		if e == nil {
 			continue
 		}
-		if e.Error != nil {
-			fmt.Printf("\n[error:%s] %s\n", e.Error.Type, e.Error.Message)
-			continue
-		}
 		// Print streaming deltas.
 		if e.Response != nil && len(e.Response.Choices) > 0 {
 			choice := e.Response.Choices[0]
@@ -408,7 +407,10 @@ func stream(ch <-chan *event.Event, verbose bool) error {
 		// Verbose: print tool/model metadata and filter key.
 		if verbose && e.StateDelta != nil {
 			if e.FilterKey != "" {
-				fmt.Printf("\n[filter] %s\n", e.FilterKey)
+				fmt.Printf(
+					"\n[filter] %s\n",
+					e.FilterKey,
+				)
 			}
 			if b, ok := e.StateDelta[graph.MetadataKeyModel]; ok && len(b) > 0 {
 				fmt.Printf("\n[model] %s\n", string(b))
@@ -422,6 +424,13 @@ func stream(ch <-chan *event.Event, verbose bool) error {
 			if b, ok := e.StateDelta[keyFinal]; ok && len(b) > 0 {
 				fmt.Printf("\n[final] %s\n", string(b))
 			}
+		}
+		if e.Error != nil {
+			fmt.Printf(
+				"\n[error:%s] %s\n",
+				e.Error.Type, e.Error.Message,
+			)
+			continue
 		}
 	}
 	return nil

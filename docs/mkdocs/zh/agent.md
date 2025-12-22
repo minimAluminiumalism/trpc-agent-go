@@ -69,23 +69,6 @@ llmAgent := llmagent.New(
     llmagent.WithDescription("A helpful AI assistant for demonstrations"),              // 设置描述
     llmagent.WithInstruction("Be helpful, concise, and informative in your responses"), // 设置指令
     llmagent.WithGenerationConfig(genConfig),                                           // 设置生成参数
-    
-    // 设置传给模型的消息过滤模式，最终传给模型的消息需同时满足WithMessageTimelineFilterMode与WithMessageBranchFilterMode条件
-    // 时间维度过滤条件
-    // 默认值: llmagent.TimelineFilterAll
-    // 可选值: 
-    //  - llmagent.TimelineFilterAll: 包含历史消息以及当前请求中所生成的消息
-    //  - llmagent.TimelineFilterCurrentRequest: 仅包含当前请求中所生成的消息
-    //  - llmagent.TimelineFilterCurrentInvocation: 仅包含当前invocation上下文中生成的消息
-    llmagent.WithMessageTimelineFilterMode(llmagent.BranchFilterModeAll),
-    // 分支维度过滤条件
-    // 默认值: llmagent.BranchFilterModePrefix
-    // 可选值: 
-    //  - llmagent.BranchFilterModeAll: 包含所有agent的消息, 当前agent与模型交互时,如需将所有agent生成的有效内容消息同步给模型时可设置该值
-    //  - llmagent.BranchFilterModePrefix: 通过Event.FilterKey与Invocation.eventFilterKey做前缀匹配过滤消息, 期望将与当前agent以及相关上下游agent生成的消息传递给模型时，可设置该值
-    //  - llmagent.BranchFilterModeExact: 通过Event.FilterKey==Invocation.eventFilterKey过滤消息，当前agent与模型交互时,仅需使用当前agent生成的消息时可设置该值
-    llmagent.WithMessageBranchFilterMode(llmagent.TimelineFilterAll),
-    
 )
 ```
 
@@ -96,6 +79,7 @@ LLMAgent 会自动在 `Instruction` 和可选的 `SystemPrompt` 中注入会话�
 - `{key}`：替换为 `session.State["key"]` 的字符串值
 - `{key?}`：可选；如果不存在，替换为空字符串
 - `{user:subkey}` / `{app:subkey}` / `{temp:subkey}`：访问用户/应用/临时命名空间（SessionService 会把 app/user 作用域的状态合并进 session，并带上前缀）
+- `{invocation:subkey}` ：替换为fmt.Sprintf("%+v",`invocation.state["subkey"]`)的值，（可以通过invocation.SetState(k,v)来设置）。
 
 注意：
 
@@ -110,9 +94,13 @@ llm := llmagent.New(
   llmagent.WithModel(modelInstance),
   llmagent.WithInstruction(
     "You are a research assistant. Focus: {research_topics}. " +
-    "User interests: {user:topics?}. App banner: {app:banner?}.",
+    "User interests: {user:topics?}. App banner: {app:banner?}." +
+    "Invocation case: {invocation:case}",
   ),
 )
+
+inv := agent.NewInvoction()
+inv.SetState("case", "case-1")
 
 // 通过 SessionService 初始化状态（用户态/应用态 + 会话本地键）
 _ = sessionService.UpdateUserState(ctx, session.UserKey{AppName: app, UserID: user}, session.StateMap{
@@ -149,6 +137,147 @@ if err != nil {
     log.Fatalf("执行 Agent 失败: %v", err)
 }
 ```
+
+### 消息可见性选项
+当前Agent可在需要时根据不同场景控制其对其他Agent生成的消息以及历史会话消息的可见性进行管理，可通过相关选项配置进行管理。
+在与model交互时仅将可见的内容输入给模型。 
+
+TIPS:
+ - 不同sessionID的消息在任何场景下都是互不可见的，以下管控策略均针对同一个sessionID的消息
+ - invocation.Message在任何场景下均可见
+ - 未配置选项时，默认值为FullContext
+
+配置:
+- `llmagent.WithMessageFilterMode(MessageFilterMode)`:
+  - `FullContext`: 所有能通过filterKey做前缀匹配的消息
+  - `RequestContext`: 仅包含当前请求周期内通过filterKey前缀匹配的消息
+  - `IsolatedRequest`: 仅包含当前请求周期内通过filterKey完全匹配的消息
+  - `IsolatedInvocation`: 仅包含当前invocation周期内通过filterKey完全匹配的消息
+
+推荐用法示例（该用法仅基于高级用法基础之上做了简化配置）:
+
+```go
+taskagentA := llmagent.New(
+  "coordinator",
+  llmagent.WithModel(modelInstance),
+  // 对taskagentA、taskagentB生成的所有消息可见（包含同一sessionID的历史会话消息）
+  llmagent.WithMessageFilterMode(llmagent.FullContext)
+  // 对taskagentA、taskagentB当前runner.Run期间生成的所有消息可见（不包含历史会话消息）
+  llmagent.WithMessageFilterMode(llmagent.RequestContext)
+  // 仅对taskagentA当前runner.Run期间生成的消息可见（不包含自己的历史会话消息）
+  llmagent.WithMessageFilterMode(llmagent.IsolatedRequest)
+  // agent执性顺序：taskagentA-invocation1 -> taskagentB-invocation2 -> taskagentA-invocation3(当前执行阶段)
+  // 仅对taskagentA当前taskagentA-invocation3期间生成的消息可见（不包含自己的历史会话消息以及taskagentA-invocation1期间生成的消息）
+  llmagent.WithMessageFilterMode(llmagent.IsolatedInvocation)
+)
+
+taskagentB := llmagent.New(
+  "coordinator",
+  llmagent.WithModel(modelInstance),
+  // 对taskagentA、taskagentB生成的所有消息可见（包含同一sessionID的历史会话消息）
+  llmagent.WithMessageFilterMode(llmagent.FullContext),
+  // 对taskagentA、taskagentB当前runner.Run期间生成的所有消息可见（不包含历史会话消息）
+  llmagent.WithMessageFilterMode(llmagent.RequestContext),
+  // 仅对taskagentB当前runner.Run期间生成的消息可见（不包含自己的历史会话消息）
+  llmagent.WithMessageFilterMode(llmagent.IsolatedRequest),
+  // agent执性顺序：taskagentA-invocation1 -> taskagentB-invocation2 -> taskagentA-invocation3 -> taskagentB-invocation4(当前执行阶段)
+  // 仅对taskagentB当前taskagentB-invocation4期间生成的消息可见（不包含自己的历史会话消息以及taskagentB-invocation2期间生成的消息）
+  llmagent.WithMessageFilterMode(llmagent.IsolatedInvocation),
+)
+
+// 循环执行taskagentA、taskagentB
+cycleAgent := cycleagent.New(
+  "coordinator",
+  llmagent.WithModel(modelInstance),
+  llmagent.WithSubAgents([]agent.Agent{taskagentA, taskagentB}),
+  llmagent.WithMessageFilterMode(llmagent.FullContext)
+)
+
+// 创建 Runner
+runner := runner.NewRunner("demo-app", cycleAgent)
+
+// 直接发送消息，无需创建复杂的 Invocation
+message := model.NewUserMessage("Hello! Can you tell me about yourself?")
+eventChan, err := runner.Run(ctx, "user-001", "session-001", message)
+if err != nil {
+    log.Fatalf("执行 Agent 失败: %v", err)
+}
+```
+
+高阶用法示例：
+可以单独通过 `WithMessageTimelineFilterMode`、`WithMessageBranchFilterMode`控制当前agent对历史消息与其他agent生成的消息可见性。
+当前agent在与模型交互时，最终将同时满足两个条件的消息输入给模型。
+
+`配置:`
+- `WithMessageTimelineFilterMode`: 时间维度可见性控制
+  - `TimelineFilterAll`: 包含历史消息以及当前请求中所生成的消息
+  - `TimelineFilterCurrentRequest`: 仅包含当前请求(一次runner.Run为一次请求)中所生成的消息
+  - `TimelineFilterCurrentInvocation`: 仅包含当前invocation上下文中生成的消息
+- `WithMessageBranchFilterMode`: 分支维度可见性控制（用于控制对其他agent生成消息的可见性）
+  - `BranchFilterModePrefix`: 通过Event.FilterKey与Invocation.eventFilterKey做前缀匹配
+  - `BranchFilterModeAll`: 所有agent的均消息
+  - `BranchFilterModeExact`: 仅自己生成的消息可见
+  
+```go
+llmAgent := llmagent.New(
+    "demo-agent",                      // Agent 名称
+    llmagent.WithModel(modelInstance), // 设置模型
+    llmagent.WithDescription("A helpful AI assistant for demonstrations"),              // 设置描述
+    llmagent.WithInstruction("Be helpful, concise, and informative in your responses"), // 设置指令
+    llmagent.WithGenerationConfig(genConfig),                                           // 设置生成参数
+
+    // 设置传给模型的消息过滤模式，最终传给模型的消息需同时满足WithMessageTimelineFilterMode与WithMessageBranchFilterMode条件
+    // 时间维度过滤条件
+    // 默认值: llmagent.TimelineFilterAll
+    // 可选值:
+    //  - llmagent.TimelineFilterAll: 包含历史消息以及当前请求中所生成的消息
+    //  - llmagent.TimelineFilterCurrentRequest: 仅包含当前请求中所生成的消息
+    //  - llmagent.TimelineFilterCurrentInvocation: 仅包含当前invocation上下文中生成的消息
+    llmagent.WithMessageTimelineFilterMode(llmagent.TimelineFilterAll),
+    // 分支维度过滤条件
+    // 默认值: llmagent.BranchFilterModePrefix
+    // 可选值:
+    //  - llmagent.BranchFilterModeAll: 包含所有agent的消息, 当前agent与模型交互时,如需将所有agent生成的有效内容消息同步给模型时可设置该值
+    //  - llmagent.BranchFilterModePrefix: 通过Event.FilterKey与Invocation.eventFilterKey做前缀匹配过滤消息, 期望将与当前agent以及相关上下游agent生成的消息传递给模型时，可设置该值
+    //  - llmagent.BranchFilterModeExact: 通过Event.FilterKey==Invocation.eventFilterKey过滤消息，当前agent与模型交互时,仅需使用当前agent生成的消息时可设置该值
+    llmagent.WithMessageBranchFilterMode(llmagent.BranchFilterModePrefix),
+)
+```
+
+### 推理内容模式（DeepSeek 思考模式）
+
+当使用具有思考/推理能力的模型（如 DeepSeek）时，模型会同时输出 `reasoning_content`（思维链）和 `content`（最终回答）。根据 [DeepSeek API 文档](https://api-docs.deepseek.com/zh-cn/guides/thinking_mode)，在多轮对话中，不应将上一轮的 `reasoning_content` 发送给模型。
+
+LLMAgent 提供 `WithReasoningContentMode` 来控制对话历史中 `reasoning_content` 的处理方式：
+
+**可用模式：**
+
+| 模式 | 常量 | 描述 |
+|------|------|------|
+| 丢弃之前轮次 | `ReasoningContentModeDiscardPreviousTurns` | 丢弃之前请求轮次的 `reasoning_content`，保留当前请求的。**（默认，推荐）** |
+| 保留全部 | `ReasoningContentModeKeepAll` | 保留历史中的所有 `reasoning_content`（用于调试）。 |
+| 全部丢弃 | `ReasoningContentModeDiscardAll` | 丢弃历史中的所有 `reasoning_content`，以最大化节省带宽。 |
+
+**使用示例：**
+
+```go
+// DeepSeek 思考模式的推荐配置。
+agent := llmagent.New(
+    "deepseek-agent",
+    llmagent.WithModel(deepseekModel),
+    llmagent.WithInstruction("You are a helpful assistant."),
+    // 丢弃之前轮次的 reasoning_content（推荐用于 DeepSeek）。
+    llmagent.WithReasoningContentMode(llmagent.ReasoningContentModeDiscardPreviousTurns),
+)
+```
+
+**工作原理：**
+
+- **`keep_all`**：所有 `reasoning_content` 都保留在会话历史中。如果需要保留思维链用于调试或分析，请使用此模式。
+- **`discard_previous_turns`**：在构建新请求的消息列表时，属于之前请求的消息的 `reasoning_content` 会被清除。当前请求内的消息（例如在工具调用循环期间）保留其 `reasoning_content`。这遵循 DeepSeek 的建议。
+- **`discard_all`**：在发送给模型之前，所有历史消息的 `reasoning_content` 都会被清除。
+
+**注意：** 此选项仅影响发送给模型之前对历史消息的处理方式。当前响应的 `reasoning_content` 始终会被捕获并存储在会话事件中。
 
 ### 委托可见性选项
 
@@ -271,36 +400,57 @@ if err != nil {
 - 调试和测试场景
 
 ```go
-// Invocation 是 Agent 执行流程的上下文对象，包含了单次调用所需的所有信息
+// Invocation 是 Agent 执行流程的上下文对象，包含单次调用所需的全部信息
 type Invocation struct {
-	// Agent 指定要调用的 Agent 实例
-	Agent Agent
-	// AgentName 标识要调用的 Agent 实例名称
-	AgentName string
-	// InvocationID 为每次调用提供唯一标识
-	InvocationID string
-	// Branch 用于分层事件过滤的分支标识符
-	Branch string
-	// EndInvocation 标识是否结束调用的标志
-	EndInvocation bool
-	// Session 维护对话的上下文状态
-	Session *session.Session
-	// Model 指定要使用的模型实例
-	Model model.Model
-	// Message 是用户发送给 Agent 的具体内容
-	Message model.Message
-	// RunOptions 是 Run 方法的选项配置
-	RunOptions RunOptions
-	// TransferInfo 支持 Agent 之间的控制权转移
-	TransferInfo *TransferInfo
-	// ModelCallbacks 允许在模型调用的不同阶段插入自定义逻辑
-	ModelCallbacks *model.ModelCallbacks
-	// ToolCallbacks 允许在工具调用的不同阶段插入自定义逻辑
-	ToolCallbacks *tool.ToolCallbacks
+    // Agent 指定要调用的 Agent 实例
+    Agent Agent
+    // AgentName 标识要调用的 Agent 实例名称
+    AgentName string
+    // InvocationID 为每次调用提供唯一标识
+    InvocationID string
+    // Branch 用于分层事件过滤的分支标识符
+    Branch string
+    // EndInvocation 标识是否结束调用
+    EndInvocation bool
 
-    // notice
-	noticeChanMap map[string]chan any
-	noticeMu      *sync.Mutex
+    // Session 维护对话上下文状态
+    Session *session.Session
+    // Model 指定要使用的模型实例
+    Model model.Model
+    // Message 是用户发送给 Agent 的具体内容
+    Message model.Message
+    // RunOptions 是 Run 方法的选项配置
+    RunOptions RunOptions
+    // TransferInfo 支持 Agent 间的控制权转移
+    TransferInfo *TransferInfo
+
+    // 结构化输出配置（可选）
+    StructuredOutput     *model.StructuredOutput
+    StructuredOutputType reflect.Type
+
+    // 为本次调用注入的服务
+    MemoryService   memory.Service
+    ArtifactService artifact.Service
+
+    // 内部通知：当事件写入会话时发出通知
+    noticeChanMap map[string]chan any
+    noticeMu      *sync.Mutex
+
+    // 内部：事件过滤键与父调用（用于嵌套流程）
+    eventFilterKey string
+    parent         *Invocation
+
+    // 调用级状态（延迟初始化，通过 stateMu 保护并发）
+    state   map[string]any
+    stateMu sync.RWMutex
+
+    // 可选的调用级安全限制（通常由 LLMAgent 在 setupInvocation 中设置）。
+    MaxLLMCalls      int
+    MaxToolIterations int
+
+    // 与 MaxLLMCalls / MaxToolIterations 配套使用的内部计数器。
+    llmCallCount       int
+    toolIterationCount int
 }
 ```
 
@@ -330,23 +480,28 @@ inv.DeleteState(key string)
 
 **使用示例：**
 
+> **版本要求**  
+> 结构化回调 API（推荐）需要 **trpc-agent-go >= 0.6.0**。
+
 ```go
 // 在 BeforeAgentCallback 中存储数据
-func(ctx context.Context, inv *agent.Invocation) (*model.Response, error) {
-    inv.SetState("agent:start_time", time.Now())
-    inv.SetState("custom:request_id", "req-123")
+// 注意：结构化回调 API 需要 trpc-agent-go >= 0.6.0
+callbacks := agent.NewCallbacks()
+callbacks.RegisterBeforeAgent(func(ctx context.Context, args *agent.BeforeAgentArgs) (*agent.BeforeAgentResult, error) {
+    args.Invocation.SetState("agent:start_time", time.Now())
+    args.Invocation.SetState("custom:request_id", "req-123")
     return nil, nil
-}
+})
 
 // 在 AfterAgentCallback 中读取数据
-func(ctx context.Context, inv *agent.Invocation, runErr error) (*model.Response, error) {
-    if startTime, ok := inv.GetState("agent:start_time"); ok {
+callbacks.RegisterAfterAgent(func(ctx context.Context, args *agent.AfterAgentArgs) (*agent.AfterAgentResult, error) {
+    if startTime, ok := args.Invocation.GetState("agent:start_time"); ok {
         duration := time.Since(startTime.(time.Time))
         log.Printf("Execution took: %v", duration)
-        inv.DeleteState("agent:start_time")
+        args.Invocation.DeleteState("agent:start_time")
     }
     return nil, nil
-}
+})
 ```
 
 **推荐的键名约定：**
@@ -357,7 +512,7 @@ func(ctx context.Context, inv *agent.Invocation, runErr error) (*model.Response,
 - 中间件：`"middleware:xxx"`
 - 自定义逻辑：`"custom:xxx"`
 
-详细的使用说明和更多示例请参考 [Callbacks](./callbacks.md#invocation-state在回调间共享状态)。
+详细的使用说明和更多示例请参考 [Callbacks](./callbacks.md#invocation-state)。
 
 ### Event
 
@@ -420,6 +575,9 @@ type Agent interface {
 
 Callbacks 提供了丰富的回调机制，让你能够在 Agent 执行的关键节点注入自定义逻辑。
 
+> **版本要求**  
+> 结构化回调 API（推荐）需要 **trpc-agent-go >= 0.6.0**。
+
 ### 回调类型
 
 框架提供了三种类型的回调：
@@ -427,54 +585,44 @@ Callbacks 提供了丰富的回调机制，让你能够在 Agent 执行的关键
 **Agent Callbacks**：在 Agent 执行前后触发
 
 ```go
-type AgentCallbacks struct {
-    BeforeAgent []BeforeAgentCallback  // Agent 运行前的回调
-    AfterAgent  []AfterAgentCallback   // Agent 运行后的回调
-}
+// 使用 agent.NewCallbacks() 创建回调
+callbacks := agent.NewCallbacks()
 ```
 
 **Model Callbacks**：在模型调用前后触发
 
 ```go
-type ModelCallbacks struct {
-    BeforeModel []BeforeModelCallback  // 模型调用前的回调
-    AfterModel  []AfterModelCallback   // 模型调用后的回调
-}
+// 使用 model.NewCallbacks() 创建回调
+callbacks := model.NewCallbacks()
 ```
 
 **Tool Callbacks**：在工具调用前后触发
 
 ```go
-type ToolCallbacks struct {
-	BeforeTool []BeforeToolCallback  // 工具调用前的回调
-	AfterTool []AfterToolCallback    // 工具调用后的回调
-}
+// 使用 tool.NewCallbacks() 创建回调
+callbacks := tool.NewCallbacks()
 ```
 
 ### 使用示例
 
 ```go
-// 创建 Agent 回调
-callbacks := &agent.AgentCallbacks{
-    BeforeAgent: []agent.BeforeAgentCallback{
-        func(ctx context.Context, invocation *agent.Invocation) (*model.Response, error) {
-            log.Printf("Agent %s 开始执行", invocation.AgentName)
-            return nil, nil
-        },
-    },
-    AfterAgent: []agent.AfterAgentCallback{
-        func(ctx context.Context, invocation *agent.Invocation, runErr error) (*model.Response, error) {
-            if runErr != nil {
-                log.Printf("Agent %s 执行出错: %v", invocation.AgentName, runErr)
-            } else {
-                log.Printf("Agent %s 执行完成", invocation.AgentName)
-            }
-            return nil, nil
-        },
-    },
-}
+// 创建 Agent 回调（使用结构化 API）
+// 注意：结构化回调 API 需要 trpc-agent-go >= 0.6.0
+callbacks := agent.NewCallbacks()
+callbacks.RegisterBeforeAgent(func(ctx context.Context, args *agent.BeforeAgentArgs) (*agent.BeforeAgentResult, error) {
+    log.Printf("Agent %s 开始执行", args.Invocation.AgentName)
+    return nil, nil
+})
+callbacks.RegisterAfterAgent(func(ctx context.Context, args *agent.AfterAgentArgs) (*agent.AfterAgentResult, error) {
+    if args.Error != nil {
+        log.Printf("Agent %s 执行出错: %v", args.Invocation.AgentName, args.Error)
+    } else {
+        log.Printf("Agent %s 执行完成", args.Invocation.AgentName)
+    }
+    return nil, nil
+})
 
-// 在 llmAgent中使用回掉
+// 在 llmAgent 中使用回调
 llmagent := llmagent.New("llmagent", llmagent.WithAgentCallbacks(callbacks))
 ```
 
@@ -585,24 +733,27 @@ _, _ = run.Run(context.Background(), user, sid, model.NewUserMessage("Hi!"))
 
 示例：通过前置回调注入本轮临时值（temp）
 
+> **版本要求**  
+> 结构化回调 API（推荐）需要 **trpc-agent-go >= 0.6.0**。
+
 ```go
-callbacks := &agent.AgentCallbacks{
-  BeforeAgent: []agent.BeforeAgentCallback{
-    func(ctx context.Context, inv *agent.Invocation) (*model.Response, error) {
-      if inv != nil && inv.Session != nil {
-        if inv.Session.State == nil { inv.Session.State = make(map[string][]byte) }
-        // 为“本轮”临时指定指令
-        inv.Session.State["temp:sys"] = []byte("Translate to French.")
-      }
-      return nil, nil
-    },
-  },
-}
+// 注意：结构化回调 API 需要 trpc-agent-go >= 0.6.0
+callbacks := agent.NewCallbacks()
+callbacks.RegisterBeforeAgent(func(ctx context.Context, args *agent.BeforeAgentArgs) (*agent.BeforeAgentResult, error) {
+  if args.Invocation != nil && args.Invocation.Session != nil {
+    if args.Invocation.Session.State == nil {
+      args.Invocation.Session.State = make(map[string][]byte)
+    }
+    // 为"本轮"临时指定指令
+    args.Invocation.Session.State["temp:sys"] = []byte("Translate to French.")
+  }
+  return nil, nil
+})
 
 llm := llmagent.New(
   "temp-agent",
   llmagent.WithInstruction("{temp:sys}"),
-  llmagent.WithAgentCallbacks(callbacks),
+  llmagent.WithAgentCallbacks(callbacks), // 需要 trpc-agent-go >= 0.6.0
 )
 ```
 

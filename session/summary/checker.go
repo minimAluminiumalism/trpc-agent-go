@@ -22,7 +22,7 @@ import (
 type Checker func(sess *session.Session) bool
 
 // CheckEventThreshold creates a checker that triggers when the total number of
-// events in the session is greater than or equal to the specified threshold.
+// events in the session is greater than the specified threshold.
 // This is a simple proxy for conversation growth and is inexpensive to compute.
 // Example: CheckEventThreshold(30) will trigger once there are at least 30 events.
 func CheckEventThreshold(eventCount int) Checker {
@@ -32,7 +32,7 @@ func CheckEventThreshold(eventCount int) Checker {
 }
 
 // CheckTimeThreshold creates a checker that triggers when the time elapsed since
-// the last event is greater than or equal to the given interval.
+// the last event is greater than to the given interval.
 // This is useful to ensure periodic summarization in long-running sessions.
 // Example: CheckTimeThreshold(5*time.Minute) triggers if no events occurred in five minutes.
 func CheckTimeThreshold(interval time.Duration) Checker {
@@ -55,12 +55,20 @@ func CheckTokenThreshold(tokenCount int) Checker {
 			return false
 		}
 
-		totalTokens := 0
+		invocationTokens := make(map[string]int)
 		for _, event := range sess.Events {
 			if event.Response == nil || event.Response.Usage == nil {
 				continue
 			}
-			totalTokens += event.Response.Usage.TotalTokens
+			invocationID := event.InvocationID
+			if event.Response.Usage.TotalTokens > 0 {
+				invocationTokens[invocationID] = event.Response.Usage.TotalTokens
+			}
+		}
+
+		totalTokens := 0
+		for _, tokens := range invocationTokens {
+			totalTokens += tokens
 		}
 
 		return totalTokens > tokenCount

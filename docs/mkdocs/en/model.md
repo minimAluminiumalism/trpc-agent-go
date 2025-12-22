@@ -237,6 +237,31 @@ type ResponseError struct {
 
 ## OpenAI Model
 
+### Model Name Parameter
+
+When creating an OpenAI model instance using `openai.New(name string, opts ...Option)`, the first parameter is the actual model name that gets sent to the OpenAI API, as the **specific model identifier** that tells the API which language model to use.
+
+Since the framework supports different models compatible with the OpenAI API, you can obtain the base URL, API key, and model name from various model providers:
+
+**1. OpenAI Official**
+
+- Base URL: `https://api.openai.com/v1`
+- Model Names: `gpt-4o`, `gpt-4o-mini`, etc.
+
+**2. DeepSeek**
+
+- Base URL: `https://api.deepseek.com`
+- Model Names: `deepseek-chat`, `deepseek-reasoner`
+
+**3. Tencent Hunyuan**
+
+- Base URL: `https://api.hunyuan.cloud.tencent.com/v1`
+- Model Names: `hunyuan-2.0-thinking-20251109`, `hunyuan-2.0-instruct-20251111`, etc.
+
+**4. Other Providers**
+
+- **Qwen**: Base URL `https://dashscope.aliyuncs.com/compatible-mode/v1`, Model Names: various qwen models
+
 The OpenAI Model is used to interface with OpenAI and its compatible platforms. It supports streaming output, multimodal and advanced parameter configuration, and provides rich callback mechanisms, batch processing and retry capabilities. It also allows for flexible setting of custom HTTP headers.
 
 ### Configuration Method
@@ -456,7 +481,234 @@ model := openai.New("deepseek-chat",
 )
 ```
 
-#### 2. Batch Processing (Batch API)
+#### 2. Model Switching
+
+Model switching allows dynamically changing the LLM model used by an Agent at runtime. The framework provides two approaches: agent-level switching (affects all subsequent requests) and per-request switching (affects only a single request).
+
+##### Agent-level Switching
+
+Agent-level switching changes the Agent's default model, affecting all subsequent requests.
+
+###### Approach 1: Direct Model Instance
+
+Set the model directly by passing a model instance to `SetModel`:
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
+)
+
+// Create Agent.
+agent := llmagent.New("my-agent",
+    llmagent.WithModel(openai.New("gpt-4o-mini")),
+)
+
+// Switch to another model.
+agent.SetModel(openai.New("gpt-4o"))
+```
+
+**Use Cases**:
+
+```go
+// Select model based on task complexity.
+if isComplexTask {
+    agent.SetModel(openai.New("gpt-4o"))  // Use powerful model.
+} else {
+    agent.SetModel(openai.New("gpt-4o-mini"))  // Use fast model.
+}
+```
+
+###### Approach 2: Switch by Name
+
+Pre-register multiple models with `WithModels`, then switch by name using `SetModelByName`:
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
+)
+
+// Create multiple model instances.
+gpt4 := openai.New("gpt-4o")
+gpt4mini := openai.New("gpt-4o-mini")
+deepseek := openai.New("deepseek-chat")
+
+// Register all models when creating the Agent.
+agent := llmagent.New("my-agent",
+    llmagent.WithModels(map[string]model.Model{
+        "smart": gpt4,
+        "fast":  gpt4mini,
+        "cheap": deepseek,
+    }),
+    llmagent.WithModel(gpt4mini), // Specify initial model.
+    llmagent.WithInstruction("You are an intelligent assistant."),
+)
+
+// Switch models by name at runtime.
+err := agent.SetModelByName("smart")
+if err != nil {
+    log.Fatal(err)
+}
+
+// Switch to another model.
+err = agent.SetModelByName("cheap")
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+**Use Cases**:
+
+```go
+// Select model based on user tier.
+modelName := "fast" // Default to fast model.
+if user.IsPremium() {
+    modelName = "smart" // Premium users get advanced model.
+}
+if err := agent.SetModelByName(modelName); err != nil {
+    log.Printf("Failed to switch model: %v", err)
+}
+
+// Select model based on time of day (cost optimization).
+hour := time.Now().Hour()
+if hour >= 22 || hour < 8 {
+    // Use cheap model at night.
+    agent.SetModelByName("cheap")
+} else {
+    // Use fast model during the day.
+    agent.SetModelByName("fast")
+}
+```
+
+##### Per-request Switching
+
+Per-request switching allows temporarily specifying a model for a single request without affecting the Agent's default model or other requests. This is useful for scenarios where different models are needed for specific tasks.
+
+###### Approach 1: Using WithModel Option
+
+Use `agent.WithModel` to specify a model instance for a single request:
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent"
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
+)
+
+// Use a specific model for this request only.
+eventChan, err := runner.Run(ctx, userID, sessionID, message,
+    agent.WithModel(openai.New("gpt-4o")),
+)
+```
+
+###### Approach 2: Using WithModelName Option (Recommended)
+
+Use `agent.WithModelName` to specify a pre-registered model name for a single request:
+
+```go
+// Pre-register multiple models when creating the Agent.
+agent := llmagent.New("my-agent",
+    llmagent.WithModels(map[string]model.Model{
+        "smart": openai.New("gpt-4o"),
+        "fast":  openai.New("gpt-4o-mini"),
+        "cheap": openai.New("deepseek-chat"),
+    }),
+    llmagent.WithModel(openai.New("gpt-4o-mini")), // Default model.
+)
+
+runner := runner.NewRunner("app", agent)
+
+// Temporarily use "smart" model for this request only.
+eventChan, err := runner.Run(ctx, userID, sessionID, message,
+    agent.WithModelName("smart"),
+)
+
+// Next request still uses the default model "gpt-4o-mini".
+eventChan2, err := runner.Run(ctx, userID, sessionID, message2)
+```
+
+**Use Cases**:
+
+```go
+// Dynamically select model based on message complexity.
+var opts []agent.RunOption
+if isComplexQuery(message) {
+    opts = append(opts, agent.WithModelName("smart")) // Use powerful model for complex queries.
+}
+
+eventChan, err := runner.Run(ctx, userID, sessionID, message, opts...)
+
+// Use specialized reasoning model for reasoning tasks.
+eventChan, err := runner.Run(ctx, userID, sessionID, reasoningMessage,
+    agent.WithModelName("deepseek-reasoner"),
+)
+```
+
+##### Configuration Details
+
+**WithModels Option**:
+
+- Accepts a `map[string]model.Model` where key is the model name and value is the model instance
+- If both `WithModel` and `WithModels` are set, `WithModel` specifies the initial model
+- If only `WithModels` is set, the first model in the map will be used as the initial model (note: map iteration order is not guaranteed, so it's recommended to explicitly specify the initial model)
+- Reserved name: `__default__` is used internally by the framework and should not be used
+
+**SetModelByName Method**:
+
+- Parameter: model name (string)
+- Returns: error if the model name is not found
+- The model must be pre-registered via `WithModels`
+
+**Per-request Options**:
+
+- `agent.RunOptions.Model`: Directly specify a model instance
+- `agent.RunOptions.ModelName`: Specify a pre-registered model name
+- Priority: `Model` > `ModelName` > Agent default model
+- If the model specified by `ModelName` is not found, it falls back to the Agent's default model
+
+##### Agent-level vs Per-request Comparison
+
+| Feature          | Agent-level Switching        | Per-request Switching          |
+| ---------------- | ---------------------------- | ------------------------------ |
+| Scope            | All subsequent requests      | Current request only           |
+| Usage            | `SetModel`/`SetModelByName`  | `RunOptions.Model`/`ModelName` |
+| State Change     | Changes Agent default model  | Does not change Agent state    |
+| Use Case         | Global strategy adjustment   | Specific task temporary needs  |
+| Concurrency      | Affects all concurrent reqs  | Does not affect other requests |
+| Typical Examples | User tier, time-based policy | Complex queries, reasoning     |
+
+##### Agent-level Approach Comparison
+
+| Feature          | SetModel                     | SetModelByName                            |
+| ---------------- | ---------------------------- | ----------------------------------------- |
+| Usage            | Pass model instance          | Pass model name                           |
+| Pre-registration | Not required                 | Required via WithModels                   |
+| Error Handling   | None                         | Returns error                             |
+| Use Case         | Simple switching             | Complex scenarios, multi-model management |
+| Code Maintenance | Need to hold model instances | Only need to remember names               |
+
+##### Important Notes
+
+**Agent-level Switching**:
+
+- **Immediate Effect**: After calling `SetModel` or `SetModelByName`, the next request immediately uses the new model
+- **Session Persistence**: Switching models does not clear session history
+- **Independent Configuration**: Each model retains its own configuration (temperature, max tokens, etc.)
+- **Concurrency Safe**: Both switching approaches are concurrency-safe
+
+**Per-request Switching**:
+
+- **Temporary Override**: Only affects the current request, does not change the Agent's default model
+- **Higher Priority**: Per-request model settings take precedence over the Agent's default model
+- **No Side Effects**: Does not affect other concurrent requests or subsequent requests
+- **Flexible Combination**: Can be used in combination with agent-level switching
+
+##### Usage Example
+
+For a complete interactive example, see [examples/model/switch](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/switch), which demonstrates both agent-level and per-request switching approaches.
+
+#### 3. Batch Processing (Batch API)
 
 Batch API is an asynchronous batch processing technique for efficiently handling large volumes of requests. This feature is particularly suitable for scenarios requiring large-scale data processing, significantly reducing costs and improving processing efficiency.
 
@@ -652,7 +904,7 @@ Key design:
 
 For a complete interactive example, see [examples/model/batch](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/batch).
 
-#### 3. Retry Mechanism
+#### 4. Retry Mechanism
 
 The retry mechanism is an automatic error recovery technique that automatically retries failed requests. This feature is provided by the underlying OpenAI SDK, with the framework passing retry parameters to the SDK through configuration options.
 
@@ -771,23 +1023,37 @@ Key design:
 
 For a complete interactive example, see [examples/model/retry](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/retry).
 
-#### 4. Custom HTTP Headers
+#### 5. Custom HTTP Headers
 
 In some enterprise or proxy scenarios, the model provider requires
 additional HTTP headers (for example, organization ID, tenant routing,
 or custom authentication). The Model module supports setting headers in
-two reliable ways that apply to all model requests, including
+three reliable ways that apply to all model requests, including
 non-streaming, streaming, file upload, and batch APIs.
 
 Recommended order:
 
-- Global header via OpenAI RequestOption (simple, built-in)
+- Global header via `openai.WithHeaders` (simplest for static headers)
+- Global header via OpenAI RequestOption (flexible, middleware-friendly)
 - Custom `http.RoundTripper` (advanced, cross-cutting)
 
-Both methods affect streaming too because the same client is used for
+All methods affect streaming too because the same client is used for
 `New` and `NewStreaming` calls.
 
-##### 1. Global headers using OpenAI RequestOption
+##### 1. Using openai.WithHeaders for headers
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/model/openai"
+
+llm := openai.New("deepseek-chat",
+    openai.WithHeaders(map[string]string{
+        "X-Custom-Header": "custom-value",
+        "X-Request-ID":    "req-123",
+    }),
+)
+```
+
+##### 2. Global headers using OpenAI RequestOption
 
 Use `WithOpenAIOptions` with `openaiopt.WithHeader` or
 `openaiopt.WithMiddleware` to inject headers for every request created
@@ -842,7 +1108,7 @@ Notes for authentication variants:
 - Azure/OpenAI‑compatible that use `api-key`: omit `WithAPIKey` and set
   `openaiopt.WithHeader("api-key", "<key>")` instead.
 
-##### 2. Custom http.RoundTripper (advanced)
+##### 3. Custom http.RoundTripper (advanced)
 
 Inject headers across all requests at the HTTP layer by wrapping the
 transport. This is useful when you also need custom proxy, TLS, or
@@ -871,6 +1137,275 @@ Per-request headers
   read values from `req.Context()` to inject per-invocation headers.
 - Chat completion per-request base URL override is not exposed; create a
   second model with a different base URL or alter `r.URL` in middleware.
+
+#### 6. Token Tailoring
+
+Token Tailoring is an intelligent message management technique designed to automatically trim messages when they exceed the model's context window limits, ensuring requests can be successfully sent to the LLM API. This feature is particularly useful for long conversation scenarios, allowing you to keep the message list within the model's token limits while preserving key context.
+
+**Automatic Mode (Recommended)**:
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/model/openai"
+)
+
+// Enable token tailoring with automatic configuration
+model := openai.New("deepseek-chat",
+    openai.WithEnableTokenTailoring(true),
+)
+```
+
+**Advanced Mode**:
+
+```go
+// Custom token limit and strategy
+model := openai.New("deepseek-chat",
+    openai.WithEnableTokenTailoring(true),               // Required: enable token tailoring
+    openai.WithMaxInputTokens(10000),                    // Custom token limit
+    openai.WithTokenCounter(customCounter),              // Optional: custom counter
+    openai.WithTailoringStrategy(customStrategy),        // Optional: custom strategy
+)
+```
+
+**Token Calculation Formula**:
+
+The framework automatically calculates "maxInputTokens" based on the model's context window:
+
+```
+safetyMargin = contextWindow × 10%
+calculatedMax = contextWindow - 2048 (output reserve) - 512 (protocol overhead) - safetyMargin
+ratioLimit = contextWindow × 100% (max input ratio)
+maxInputTokens = max(min(calculatedMax, ratioLimit), 1024 (minimum))
+```
+
+For example, "gpt-4o" (contextWindow = 128000):
+
+```
+safetyMargin = 128000 × 0.10 = 12800 tokens
+calculatedMax = 128000 - 2048 - 512 - 12800 = 112640 tokens
+ratioLimit = 128000 × 1.0 = 128000 tokens
+maxInputTokens = 112640 tokens (approximately 88% of context window)
+```
+
+**Default Budget Parameters**:
+
+The framework uses the following default values for token allocation (**it is recommended to keep the defaults**):
+
+- **Protocol Overhead (ProtocolOverheadTokens)**: 512 tokens - reserved for request/response formatting
+- **Output Reserve (ReserveOutputTokens)**: 2048 tokens - reserved for output generation
+- **Input Floor (InputTokensFloor)**: 1024 tokens - ensures proper model processing
+- **Output Floor (OutputTokensFloor)**: 256 tokens - ensures meaningful responses
+- **Safety Margin Ratio (SafetyMarginRatio)**: 10% - buffer for token counting inaccuracies
+- **Max Input Ratio (MaxInputTokensRatio)**: 100% - maximum input ratio of context window
+
+**Tailoring Strategy**:
+
+The framework provides a default tailoring strategy that preserves messages according to the following priorities:
+
+1. **System Messages**: Highest priority, always preserved
+2. **Latest User Message**: Ensures the current conversation turn is complete
+3. **Tool Call Related Messages**: Maintains tool call context integrity
+4. **Historical Messages**: Retains as much conversation history as possible based on remaining space
+
+**Custom Tailoring Strategy**:
+
+You can implement the `TailoringStrategy` interface to customize the trimming logic:
+
+```go
+type CustomStrategy struct{}
+
+func (s *CustomStrategy) Tailor(
+    ctx context.Context,
+    messages []model.Message,
+    maxTokens int,
+    counter tokencounter.Counter,
+) ([]model.Message, error) {
+    // Implement custom tailoring logic
+    // e.g., keep only the most recent N conversation rounds
+    return messages, nil
+}
+
+model := openai.New("deepseek-chat",
+    openai.WithEnableTokenTailoring(true),
+    openai.WithTailoringStrategy(&CustomStrategy{}),
+)
+```
+
+**Advanced Configuration (Custom Budget Parameters)**:
+
+If the default token allocation strategy does not meet your needs, you can customize the budget parameters using `WithTokenTailoringConfig`. **Note: It is recommended to keep the default values unless you have specific requirements.**
+
+```go
+model := openai.New("deepseek-chat",
+    openai.WithEnableTokenTailoring(true),
+    openai.WithTokenTailoringConfig(&model.TokenTailoringConfig{
+        ProtocolOverheadTokens: 1024,   // Custom protocol overhead
+        ReserveOutputTokens:    4096,   // Custom output reserve
+        InputTokensFloor:       2048,   // Custom input floor
+        OutputTokensFloor:      512,    // Custom output floor
+        SafetyMarginRatio:      0.15,   // Custom safety margin (15%)
+        MaxInputTokensRatio:    0.90,   // Custom max input ratio (90%)
+    }),
+)
+```
+
+For Anthropic models, you can use the same configuration:
+
+```go
+model := anthropic.New("claude-sonnet-4-0",
+    anthropic.WithEnableTokenTailoring(true),
+    anthropic.WithTokenTailoringConfig(&model.TokenTailoringConfig{
+        SafetyMarginRatio: 0.15,  // Increase safety margin to 15%
+    }),
+)
+```
+
+#### 7. Variant Optimization: Adapting to Platform-Specific Behaviors
+
+The Variant mechanism is an important optimization in the Model module, used to handle platform-specific behavioral differences across OpenAI-compatible providers. By specifying different Variants, the framework can automatically adapt to API differences between platforms, especially for file upload, deletion, and processing logic.
+
+##### 7.1. Supported Variant Types
+
+The framework currently supports the following Variants:
+
+**1. VariantOpenAI（default）**
+
+- Standard OpenAI API-compatible behavior
+- File upload path：`/openapi/v1/files`
+- File purpose:`user_data`
+- File deletion Http method:：`DELETE`
+
+**2. VariantHunyuan（hunyuan）**
+
+- Tencent Hunyuan platform-specific adaptation
+- File upload path:：`/openapi/v1/files/uploads`
+- File purpose：`file-extract`
+- File deletion Http Method：`POST`
+
+**3. VariantDeepSeek**
+
+- DeepSeek platform adaptation
+- Default BaseURL：`https://api.deepseek.com`
+- API Key environment variable name：`DEEPSEEK_API_KEY`
+- Other behaviors are consistent with standard OpenAI
+
+**4. VariantQwen（Qwen）**
+
+- Qwen platform adaptation
+- Default BaseURL：`https://dashscope.aliyuncs.com/compatible-mode/v1`
+- API Key environment variable name：`DASHSCOPE_API_KEY`
+- Other behaviors are consistent with standard OpenAI
+
+##### 7.2. Usage
+
+**Usage Example**：
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/model/openai"
+
+// Use the Hunyuan platform
+model := openai.New("hunyuan-model",
+    openai.WithBaseURL("https://your-hunyuan-api.com"),
+    openai.WithAPIKey("your-api-key"),
+    openai.WithVariant(openai.VariantHunyuan), // Specify the Hunyuan variant
+)
+
+// Use the DeepSeek platform
+model := openai.New("deepseek-chat",
+    openai.WithBaseURL("https://api.deepseek.com/v1"),
+    openai.WithAPIKey("your-api-key"),
+    openai.WithVariant(openai.VariantDeepSeek), // Specify the DeepSeek variant
+)
+```
+
+##### 7.3. Behavioral Differences of Variants Examples
+
+**Message content handling differences**：
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/model"
+
+// For the Hunyuan platform, the file ID is placed in extraFields instead of content parts
+message := model.Message{
+    Role: model.RoleUser,
+    ContentParts: []model.ContentPart{
+        {
+            Type: model.ContentTypeFile,
+            File: &model.File{
+                FileID: "file_123",
+            },
+        },
+    },
+}
+```
+
+**Environment variable auto-configuration**
+
+For certain Variants, the framework supports reading configuration from environment variables automatically:
+
+```bash
+# DeepSeek
+export DEEPSEEK_API_KEY="your-api-key"
+# No need to call WithAPIKey explicitly; the framework reads it automatically
+```
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/model"
+
+// DeepSeek
+model := openai.New("deepseek-chat",
+    openai.WithVariant(openai.VariantDeepSeek), // Automatically reads DEEPSEEK_API_KEY
+)
+```
+
+#### 8. Streaming Tool Call Deltas: ShowToolCallDelta
+
+By default, the OpenAI adapter suppresses raw `tool_calls` chunks in streaming
+responses. Tool calls are accumulated internally and only exposed once in the
+final aggregated response via `Response.Choices[0].Message.ToolCalls`. This
+keeps the stream clean for typical chat UIs that only render assistant text.
+
+For advanced use cases (for example, when the model streams document content
+inside tool arguments and you need to display it incrementally), you can turn
+on raw tool call deltas with `WithShowToolCallDelta`:
+
+```go
+llm := openai.New(
+    "gpt-4.1",
+    openai.WithShowToolCallDelta(true), // Forward tool_call deltas.
+)
+```
+
+When `WithShowToolCallDelta(true)` is enabled:
+
+- Streaming chunks that contain `tool_calls` are no longer suppressed by the
+  adapter.
+- Each chunk is converted into a partial `model.Response` where:
+  - `Response.IsPartial == true`
+  - `Response.Choices[0].Delta.ToolCalls` contains the provider’s raw
+    `tool_calls` delta mapped to `model.ToolCall`:
+    - `Type` comes from the provider `type` field (for example, `"function"`).
+    - `Function.Name` and `Function.Arguments` mirror the original tool name
+      and JSON-encoded arguments string.
+    - `ID` and `Index` preserve the tool call identity so callers can stitch
+      fragments together.
+- The final aggregated response still exposes the merged tool calls in
+  `Response.Choices[0].Message.ToolCalls`, so existing tool execution logic
+  (for example, `FunctionCallResponseProcessor`) continues to work unchanged.
+
+Typical integration pattern when this flag is enabled:
+
+1. Read `Response.Choices[0].Delta.ToolCalls[*].Function.Arguments` on each
+   partial response.
+2. Group chunks by tool call `ID` and append the `Arguments` fragments in
+   order.
+3. Once the accumulated string forms valid JSON, unmarshal it into your
+   business struct (for example, `{ "content": "..." }`) and use it for
+   progressive UI rendering.
+
+If you do not need to inspect tool arguments during streaming, keep
+`WithShowToolCallDelta` disabled to avoid handling partial JSON fragments and
+to preserve the default clean text-streaming behavior.
 
 ## Anthropic Model
 
@@ -1054,18 +1589,256 @@ model := anthropic.New(
 )
 ```
 
-#### 2. Custom HTTP Headers
+#### 2. Model Switching
 
-In environments like gateways, proprietary platforms, or proxy setups, model API requests often require additional HTTP headers (e.g., organization/tenant identifiers, grayscale routing, custom authentication, etc.). The Model module provides two reliable ways to add headers for “all model requests,” including standard requests, streaming, file uploads, batch processing, etc.
+Model switching allows dynamically changing the LLM model used by an Agent at runtime. The framework provides two approaches: agent-level switching (affects all subsequent requests) and per-request switching (affects only a single request).
+
+##### Agent-level Switching
+
+Agent-level switching changes the Agent's default model, affecting all subsequent requests.
+
+###### Approach 1: Direct Model Instance
+
+Set the model directly by passing a model instance to `SetModel`:
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/model/anthropic"
+)
+
+// Create Agent.
+agent := llmagent.New("my-agent",
+    llmagent.WithModel(anthropic.New("claude-3-5-haiku-20241022")),
+)
+
+// Switch to another model.
+agent.SetModel(anthropic.New("claude-3-5-sonnet-20241022"))
+```
+
+**Use Cases**:
+
+```go
+// Select model based on task complexity.
+if isComplexTask {
+    agent.SetModel(anthropic.New("claude-3-5-sonnet-20241022"))  // Use powerful model.
+} else {
+    agent.SetModel(anthropic.New("claude-3-5-haiku-20241022"))  // Use fast model.
+}
+```
+
+###### Approach 2: Switch by Name
+
+Pre-register multiple models with `WithModels`, then switch by name using `SetModelByName`:
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/model/anthropic"
+)
+
+// Create multiple model instances.
+sonnet := anthropic.New("claude-3-5-sonnet-20241022")
+haiku := anthropic.New("claude-3-5-haiku-20241022")
+
+// Register all models when creating the Agent.
+agent := llmagent.New("my-agent",
+    llmagent.WithModels(map[string]model.Model{
+        "smart": sonnet,
+        "fast":  haiku,
+    }),
+    llmagent.WithModel(haiku), // Specify initial model.
+    llmagent.WithInstruction("You are an intelligent assistant."),
+)
+
+// Switch models by name at runtime.
+err := agent.SetModelByName("smart")
+if err != nil {
+    log.Fatal(err)
+}
+
+// Switch to another model.
+err = agent.SetModelByName("fast")
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+**Use Cases**:
+
+```go
+// Select model based on user tier.
+modelName := "fast" // Default to fast model.
+if user.IsPremium() {
+    modelName = "smart" // Premium users get advanced model.
+}
+if err := agent.SetModelByName(modelName); err != nil {
+    log.Printf("Failed to switch model: %v", err)
+}
+
+// Select model based on time of day (cost optimization).
+hour := time.Now().Hour()
+if hour >= 22 || hour < 8 {
+    // Use fast model at night.
+    agent.SetModelByName("fast")
+} else {
+    // Use smart model during the day.
+    agent.SetModelByName("smart")
+}
+```
+
+##### Per-request Switching
+
+Per-request switching allows temporarily specifying a model for a single request without affecting the Agent's default model or other requests. This is useful for scenarios where different models are needed for specific tasks.
+
+###### Approach 1: Using WithModel Option
+
+Use `agent.WithModel` to specify a model instance for a single request:
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/agent"
+    "trpc.group/trpc-go/trpc-agent-go/model/anthropic"
+)
+
+// Use a specific model for this request only.
+eventChan, err := runner.Run(ctx, userID, sessionID, message,
+    agent.WithModel(anthropic.New("claude-3-5-sonnet-20241022")),
+)
+```
+
+###### Approach 2: Using WithModelName Option (Recommended)
+
+Use `agent.WithModelName` to specify a pre-registered model name for a single request:
+
+```go
+// Pre-register multiple models when creating the Agent.
+agent := llmagent.New("my-agent",
+    llmagent.WithModels(map[string]model.Model{
+        "smart": anthropic.New("claude-3-5-sonnet-20241022"),
+        "fast":  anthropic.New("claude-3-5-haiku-20241022"),
+    }),
+    llmagent.WithModel(anthropic.New("claude-3-5-haiku-20241022")), // Default model.
+)
+
+runner := runner.NewRunner("app", agent)
+
+// Temporarily use "smart" model for this request only.
+eventChan, err := runner.Run(ctx, userID, sessionID, message,
+    agent.WithModelName("smart"),
+)
+
+// Next request still uses the default model "claude-3-5-haiku-20241022".
+eventChan2, err := runner.Run(ctx, userID, sessionID, message2)
+```
+
+**Use Cases**:
+
+```go
+// Dynamically select model based on message complexity.
+var opts []agent.RunOption
+if isComplexQuery(message) {
+    opts = append(opts, agent.WithModelName("smart")) // Use powerful model for complex queries.
+}
+
+eventChan, err := runner.Run(ctx, userID, sessionID, message, opts...)
+
+// Use specialized model for specific tasks.
+eventChan, err := runner.Run(ctx, userID, sessionID, visionMessage,
+    agent.WithModelName("vision"),
+)
+```
+
+##### Configuration Details
+
+**WithModels Option**:
+
+- Accepts a `map[string]model.Model` where key is the model name and value is the model instance
+- If both `WithModel` and `WithModels` are set, `WithModel` specifies the initial model
+- If only `WithModels` is set, the first model in the map will be used as the initial model (note: map iteration order is not guaranteed, so it's recommended to explicitly specify the initial model)
+- Reserved name: `__default__` is used internally by the framework and should not be used
+
+**SetModelByName Method**:
+
+- Parameter: model name (string)
+- Returns: error if the model name is not found
+- The model must be pre-registered via `WithModels`
+
+**Per-request Options**:
+
+- `agent.RunOptions.Model`: Directly specify a model instance
+- `agent.RunOptions.ModelName`: Specify a pre-registered model name
+- Priority: `Model` > `ModelName` > Agent default model
+- If the model specified by `ModelName` is not found, it falls back to the Agent's default model
+
+##### Agent-level vs Per-request Comparison
+
+| Feature          | Agent-level Switching        | Per-request Switching          |
+| ---------------- | ---------------------------- | ------------------------------ |
+| Scope            | All subsequent requests      | Current request only           |
+| Usage            | `SetModel`/`SetModelByName`  | `RunOptions.Model`/`ModelName` |
+| State Change     | Changes Agent default model  | Does not change Agent state    |
+| Use Case         | Global strategy adjustment   | Specific task temporary needs  |
+| Concurrency      | Affects all concurrent reqs  | Does not affect other requests |
+| Typical Examples | User tier, time-based policy | Complex queries, reasoning     |
+
+##### Agent-level Approach Comparison
+
+| Feature          | SetModel                     | SetModelByName                            |
+| ---------------- | ---------------------------- | ----------------------------------------- |
+| Usage            | Pass model instance          | Pass model name                           |
+| Pre-registration | Not required                 | Required via WithModels                   |
+| Error Handling   | None                         | Returns error                             |
+| Use Case         | Simple switching             | Complex scenarios, multi-model management |
+| Code Maintenance | Need to hold model instances | Only need to remember names               |
+
+##### Important Notes
+
+**Agent-level Switching**:
+
+- **Immediate Effect**: After calling `SetModel` or `SetModelByName`, the next request immediately uses the new model
+- **Session Persistence**: Switching models does not clear session history
+- **Independent Configuration**: Each model retains its own configuration (temperature, max tokens, etc.)
+- **Concurrency Safe**: Both switching approaches are concurrency-safe
+
+**Per-request Switching**:
+
+- **Temporary Override**: Only affects the current request, does not change the Agent's default model
+- **Higher Priority**: Per-request model settings take precedence over the Agent's default model
+- **No Side Effects**: Does not affect other concurrent requests or subsequent requests
+- **Flexible Combination**: Can be used in combination with agent-level switching
+
+##### Usage Example
+
+For a complete interactive example, see [examples/model/switch](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/switch), which demonstrates both agent-level and per-request switching approaches.
+
+#### 3. Custom HTTP Headers
+
+In environments like gateways, proprietary platforms, or proxy setups, model API requests often require additional HTTP headers (e.g., organization/tenant identifiers, grayscale routing, custom authentication, etc.). The Model module provides three reliable ways to add headers for "all model requests," including standard requests, streaming, file uploads, batch processing, etc.
 
 Recommended order:
 
-* Use **Anthropic RequestOption** to set global headers (simple and intuitive)
-* Use a custom `http.RoundTripper` injection (advanced, more cross-cutting capabilities)
+- Global header via `anthropic.WithHeaders` (simplest for static headers)
+- Use **Anthropic RequestOption** to set global headers (flexible, middleware-friendly)
+- Use a custom `http.RoundTripper` injection (advanced, more cross-cutting capabilities)
 
-Both methods affect streaming requests, as they use the same underlying client.
+All methods affect streaming requests, as they use the same underlying client.
 
-##### 1. Using Anthropic RequestOption to Set Global Headers
+##### 1. Using anthropic.WithHeaders for headers
+
+```go
+import "trpc.group/trpc-go/trpc-agent-go/model/anthropic"
+
+llm := anthropic.New("claude-sonnet-4-0",
+    anthropic.WithHeaders(map[string]string{
+        "X-Custom-Header": "custom-value",
+        "X-Request-ID":    "req-123",
+    }),
+)
+```
+
+##### 2. Using Anthropic RequestOption to Set Global Headers
 
 By using `WithAnthropicClientOptions` combined with `anthropicopt.WithHeader` or `anthropicopt.WithMiddleware`, you can inject headers into every request made by the underlying Anthropic client.
 
@@ -1088,15 +1861,15 @@ llm := anthropic.New("claude-sonnet-4-0",
 
 If you need to set headers conditionally (e.g., only for certain paths or depending on context values), you can use middleware:
 
-```go
+````go
 import (
     anthropicopt "github.com/anthropics/anthropic-sdk-go/option"
     "trpc.group/trpc-go/trpc-agent-go/model/anthropic"
 )
 
-llm := anthropic.New("claude-sonnet-4-0",
-    anthropic.WithAnthropicClientOptions(
-        anthropicopt.WithMiddleware(
+	llm := anthropic.New("claude-sonnet-4-0",
+	    anthropic.WithAnthropicClientOptions(
+	        anthropicopt.WithMiddleware(
             func(r *http.Request, next anthropicopt.MiddlewareNext) (*http.Response, error) {
                 // Example: Set "per-request" headers based on context value
                 if v := r.Context().Value("x-request-id"); v != nil {
@@ -1111,11 +1884,11 @@ llm := anthropic.New("claude-sonnet-4-0",
                 return next(r)
             },
         ),
-    ),
-)
-```
+	    ),
+	)
+	```
 
-##### 2. Using Custom `http.RoundTripper`
+##### 3. Using Custom `http.RoundTripper`
 
 For injecting headers at the HTTP transport layer, ideal for scenarios requiring proxying, TLS, custom monitoring, and other capabilities.
 
@@ -1139,435 +1912,45 @@ llm := anthropic.New("claude-sonnet-4-0",
         anthropic.WithHTTPClientTransport(headerRoundTripper{base: http.DefaultTransport}),
     ),
 )
-```
+````
 
 Regarding **"per-request" headers**:
 
-* The Agent/Runner will propagate `ctx` to the model call; middleware can read the value from `req.Context()` to inject headers for “this call.”
-* For **message completion**, the current API doesn't expose per-call BaseURL overrides; if switching is needed, create a model using a different BaseURL or modify the `r.URL` in middleware.
+- The Agent/Runner will propagate `ctx` to the model call; middleware can read the value from `req.Context()` to inject headers for "this call."
+- For **message completion**, the current API doesn't expose per-call BaseURL overrides; if switching is needed, create a model using a different BaseURL or modify the `r.URL` in middleware.
 
-## Advanced features
+#### 4. Token Tailoring
 
-### 1. Model Switching
-
-Model switching allows dynamically changing the LLM model used by an Agent at runtime. The framework provides two approaches: agent-level switching (affects all subsequent requests) and per-request switching (affects only a single request).
-
-#### Agent-level Switching
-
-Agent-level switching changes the Agent's default model, affecting all subsequent requests.
-
-##### Approach 1: Direct Model Instance
-
-Set the model directly by passing a model instance to `SetModel`:
-
-```go
-import (
-    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
-    "trpc.group/trpc-go/trpc-agent-go/model/openai"
-)
-
-// Create Agent.
-agent := llmagent.New("my-agent",
-    llmagent.WithModel(openai.New("gpt-4o-mini")),
-)
-
-// Switch to another model.
-agent.SetModel(openai.New("gpt-4o"))
-```
-
-**Use Cases**:
-
-```go
-// Select model based on task complexity.
-if isComplexTask {
-    agent.SetModel(openai.New("gpt-4o"))  // Use powerful model.
-} else {
-    agent.SetModel(openai.New("gpt-4o-mini"))  // Use fast model.
-}
-```
-
-##### Approach 2: Switch by Name
-
-Pre-register multiple models with `WithModels`, then switch by name using `SetModelByName`:
-
-```go
-import (
-    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
-    "trpc.group/trpc-go/trpc-agent-go/model"
-    "trpc.group/trpc-go/trpc-agent-go/model/openai"
-)
-
-// Create multiple model instances.
-gpt4 := openai.New("gpt-4o")
-gpt4mini := openai.New("gpt-4o-mini")
-deepseek := openai.New("deepseek-chat")
-
-// Register all models when creating the Agent.
-agent := llmagent.New("my-agent",
-    llmagent.WithModels(map[string]model.Model{
-        "smart": gpt4,
-        "fast":  gpt4mini,
-        "cheap": deepseek,
-    }),
-    llmagent.WithModel(gpt4mini), // Specify initial model.
-    llmagent.WithInstruction("You are an intelligent assistant."),
-)
-
-// Switch models by name at runtime.
-err := agent.SetModelByName("smart")
-if err != nil {
-    log.Fatal(err)
-}
-
-// Switch to another model.
-err = agent.SetModelByName("cheap")
-if err != nil {
-    log.Fatal(err)
-}
-```
-
-**Use Cases**:
-
-```go
-// Select model based on user tier.
-modelName := "fast" // Default to fast model.
-if user.IsPremium() {
-    modelName = "smart" // Premium users get advanced model.
-}
-if err := agent.SetModelByName(modelName); err != nil {
-    log.Printf("Failed to switch model: %v", err)
-}
-
-// Select model based on time of day (cost optimization).
-hour := time.Now().Hour()
-if hour >= 22 || hour < 8 {
-    // Use cheap model at night.
-    agent.SetModelByName("cheap")
-} else {
-    // Use fast model during the day.
-    agent.SetModelByName("fast")
-}
-```
-
-#### Per-request Switching
-
-Per-request switching allows temporarily specifying a model for a single request without affecting the Agent's default model or other requests. This is useful for scenarios where different models are needed for specific tasks.
-
-##### Approach 1: Using WithModel Option
-
-Use `agent.WithModel` to specify a model instance for a single request:
-
-```go
-import (
-    "trpc.group/trpc-go/trpc-agent-go/agent"
-    "trpc.group/trpc-go/trpc-agent-go/model/openai"
-)
-
-// Use a specific model for this request only.
-eventChan, err := runner.Run(ctx, userID, sessionID, message,
-    agent.WithModel(openai.New("gpt-4o")),
-)
-```
-
-##### Approach 2: Using WithModelName Option (Recommended)
-
-Use `agent.WithModelName` to specify a pre-registered model name for a single request:
-
-```go
-// Pre-register multiple models when creating the Agent.
-agent := llmagent.New("my-agent",
-    llmagent.WithModels(map[string]model.Model{
-        "smart": openai.New("gpt-4o"),
-        "fast":  openai.New("gpt-4o-mini"),
-        "cheap": openai.New("deepseek-chat"),
-    }),
-    llmagent.WithModel(openai.New("gpt-4o-mini")), // Default model.
-)
-
-runner := runner.NewRunner("app", agent)
-
-// Temporarily use "smart" model for this request only.
-eventChan, err := runner.Run(ctx, userID, sessionID, message,
-    agent.WithModelName("smart"),
-)
-
-// Next request still uses the default model "gpt-4o-mini".
-eventChan2, err := runner.Run(ctx, userID, sessionID, message2)
-```
-
-**Use Cases**:
-
-```go
-// Dynamically select model based on message complexity.
-var opts []agent.RunOption
-if isComplexQuery(message) {
-    opts = append(opts, agent.WithModelName("smart")) // Use powerful model for complex queries.
-}
-
-eventChan, err := runner.Run(ctx, userID, sessionID, message, opts...)
-
-// Use specialized reasoning model for reasoning tasks.
-eventChan, err := runner.Run(ctx, userID, sessionID, reasoningMessage,
-    agent.WithModelName("deepseek-reasoner"),
-)
-```
-
-#### Configuration Details
-
-**WithModels Option**:
-
-- Accepts a `map[string]model.Model` where key is the model name and value is the model instance
-- If both `WithModel` and `WithModels` are set, `WithModel` specifies the initial model
-- If only `WithModels` is set, the first model in the map will be used as the initial model (note: map iteration order is not guaranteed, so it's recommended to explicitly specify the initial model)
-- Reserved name: `__default__` is used internally by the framework and should not be used
-
-**SetModelByName Method**:
-
-- Parameter: model name (string)
-- Returns: error if the model name is not found
-- The model must be pre-registered via `WithModels`
-
-**Per-request Options**:
-
-- `agent.RunOptions.Model`: Directly specify a model instance
-- `agent.RunOptions.ModelName`: Specify a pre-registered model name
-- Priority: `Model` > `ModelName` > Agent default model
-- If the model specified by `ModelName` is not found, it falls back to the Agent's default model
-
-#### Agent-level vs Per-request Comparison
-
-| Feature          | Agent-level Switching        | Per-request Switching          |
-| ---------------- | ---------------------------- | ------------------------------ |
-| Scope            | All subsequent requests      | Current request only           |
-| Usage            | `SetModel`/`SetModelByName`  | `RunOptions.Model`/`ModelName` |
-| State Change     | Changes Agent default model  | Does not change Agent state    |
-| Use Case         | Global strategy adjustment   | Specific task temporary needs  |
-| Concurrency      | Affects all concurrent reqs  | Does not affect other requests |
-| Typical Examples | User tier, time-based policy | Complex queries, reasoning     |
-
-#### Agent-level Approach Comparison
-
-| Feature          | SetModel                     | SetModelByName                            |
-| ---------------- | ---------------------------- | ----------------------------------------- |
-| Usage            | Pass model instance          | Pass model name                           |
-| Pre-registration | Not required                 | Required via WithModels                   |
-| Error Handling   | None                         | Returns error                             |
-| Use Case         | Simple switching             | Complex scenarios, multi-model management |
-| Code Maintenance | Need to hold model instances | Only need to remember names               |
-
-#### Important Notes
-
-**Agent-level Switching**:
-
-- **Immediate Effect**: After calling `SetModel` or `SetModelByName`, the next request immediately uses the new model
-- **Session Persistence**: Switching models does not clear session history
-- **Independent Configuration**: Each model retains its own configuration (temperature, max tokens, etc.)
-- **Concurrency Safe**: Both switching approaches are concurrency-safe
-
-**Per-request Switching**:
-
-- **Temporary Override**: Only affects the current request, does not change the Agent's default model
-- **Higher Priority**: Per-request model settings take precedence over the Agent's default model
-- **No Side Effects**: Does not affect other concurrent requests or subsequent requests
-- **Flexible Combination**: Can be used in combination with agent-level switching
-
-#### Usage Example
-
-For a complete interactive example, see [examples/model/switch](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/model/switch), which demonstrates both agent-level and per-request switching approaches.
-
-### 2. Token Tailoring
-
-Token Tailoring is an intelligent message management technique that automatically trims messages when they exceed the model's context window limit, ensuring requests can be successfully sent to the LLM API. This feature is particularly useful for long conversation scenarios, maintaining key context while keeping the message list within the model's token constraints.
-
-#### Core Features
-
-- **Dual-mode Configuration**: Supports automatic and advanced modes
-- **Intelligent Preservation**: Automatically preserves system messages and the last conversation turn
-- **Multiple Strategies**: Provides MiddleOut, HeadOut, and TailOut trimming strategies
-- **Efficient Algorithm**: Uses prefix sum and binary search with O(n) time complexity
-- **Real-time Statistics**: Displays message and token counts before and after tailoring
-
-#### Quick Start
+Anthropic models also support Token Tailoring functionality, designed to automatically trim messages when they exceed the model's context window limits, ensuring requests can be successfully sent to the LLM API.
 
 **Automatic Mode (Recommended)**:
 
 ```go
 import (
-    "trpc.group/trpc-go/trpc-agent-go/model/openai"
+    "trpc.group/trpc-go/trpc-agent-go/model/anthropic"
 )
 
-// Simply enable token tailoring, other parameters are auto-configured
-model := openai.New("deepseek-chat",
-    openai.WithEnableTokenTailoring(true),
+// Enable token tailoring with automatic configuration
+model := anthropic.New("claude-3-5-sonnet",
+    anthropic.WithEnableTokenTailoring(true),
 )
 ```
-
-Automatic mode will:
-
-- Automatically detect the model's context window size
-- Calculate optimal `maxInputTokens` (subtracting protocol overhead and output reserve)
-- Use default `SimpleTokenCounter` and `MiddleOutStrategy`
 
 **Advanced Mode**:
 
 ```go
 // Custom token limit and strategy
-model := openai.New("deepseek-chat",
-    openai.WithEnableTokenTailoring(true),               // Required: enable token tailoring
-    openai.WithMaxInputTokens(10000),                    // Custom token limit
-    openai.WithTokenCounter(customCounter),              // Optional: custom counter
-    openai.WithTailoringStrategy(customStrategy),        // Optional: custom strategy
+model := anthropic.New("claude-3-5-sonnet",
+    anthropic.WithEnableTokenTailoring(true),               // Required: enable token tailoring
+    anthropic.WithMaxInputTokens(10000),                    // Custom token limit
+    anthropic.WithTokenCounter(customCounter),              // Optional: custom counter
+    anthropic.WithTailoringStrategy(customStrategy),        // Optional: custom strategy
 )
 ```
 
-#### Tailoring Strategies
+For detailed explanations of the token calculation formula, tailoring strategy, and custom strategy implementation, please refer to [Token Tailoring under OpenAI Model](#3-token-tailoring).
 
-The framework provides three built-in strategies for different scenarios:
-
-**MiddleOutStrategy (Default)**:
-
-Removes messages from the middle, preserving head and tail:
-
-```go
-import "trpc.group/trpc-go/trpc-agent-go/model"
-
-counter := model.NewSimpleTokenCounter()
-strategy := model.NewMiddleOutStrategy(counter)
-
-model := openai.New("deepseek-chat",
-    openai.WithEnableTokenTailoring(true),
-    openai.WithMaxInputTokens(10000),
-    openai.WithTailoringStrategy(strategy),
-)
-```
-
-- **Use Case**: Scenarios requiring both initial and recent context
-- **Preserves**: System message + early messages + recent messages + last turn
-
-**HeadOutStrategy**:
-
-Removes messages from the head, prioritizing recent messages:
-
-```go
-strategy := model.NewHeadOutStrategy(counter)
-
-model := openai.New("deepseek-chat",
-    openai.WithEnableTokenTailoring(true),
-    openai.WithMaxInputTokens(10000),
-    openai.WithTailoringStrategy(strategy),
-)
-```
-
-- **Use Case**: Chat applications where recent context is more important
-- **Preserves**: System message + recent messages + last turn
-
-**TailOutStrategy**:
-
-Removes messages from the tail, prioritizing early messages:
-
-```go
-strategy := model.NewTailOutStrategy(counter)
-
-model := openai.New("deepseek-chat",
-    openai.WithEnableTokenTailoring(true),
-    openai.WithMaxInputTokens(10000),
-    openai.WithTailoringStrategy(strategy),
-)
-```
-
-- **Use Case**: RAG applications where initial instructions and context are more important
-- **Preserves**: System message + early messages + last turn
-
-#### Token Counters
-
-**SimpleTokenCounter (Default)**:
-
-Fast estimation based on character count:
-
-```go
-counter := model.NewSimpleTokenCounter()
-```
-
-- **Pros**: Fast, no external dependencies, suitable for most scenarios
-- **Cons**: Slightly less accurate than tiktoken
-
-**TikToken Counter (Optional)**:
-
-Accurate counting using OpenAI's official tokenizer:
-
-```go
-import "trpc.group/trpc-go/trpc-agent-go/model/tiktoken"
-
-tkCounter, err := tiktoken.New("gpt-4o")
-if err != nil {
-    // Handle error
-}
-
-model := openai.New("gpt-4o-mini",
-    openai.WithEnableTokenTailoring(true),
-    openai.WithTokenCounter(tkCounter),
-)
-```
-
-- **Pros**: Accurately matches OpenAI API token counting
-- **Cons**: Requires additional dependency, slightly lower performance
-
-#### How It Works
-
-Token Tailoring execution flow:
-
-```
-1. Check if token tailoring is enabled via WithEnableTokenTailoring(true)
-2. Calculate total tokens for current messages
-3. If exceeds limit:
-   a. Mark messages that must be preserved (system message + last turn)
-   b. Apply selected strategy to trim middle messages
-   c. Ensure result is within token limit
-4. Return trimmed message list
-```
-
-**Important**: Token tailoring is only activated when `WithEnableTokenTailoring(true)` is set. The `WithMaxInputTokens()` option only sets the token limit but does not enable tailoring by itself.
-
-Key design principles:
-
-- **Immutable Original**: Original message list remains unchanged
-- **Smart Preservation**: Automatically preserves system message and last complete user-assistant pair
-- **Efficient Algorithm**: Uses prefix sum (O(n)) + binary search (O(log n))
-
-#### Model Context Registration
-
-For custom models not recognized by the framework, you can register their context window size to enable automatic mode:
-
-```go
-import "trpc.group/trpc-go/trpc-agent-go/model"
-
-// Register a single model
-model.RegisterModelContextWindow("my-custom-model", 8192)
-
-// Batch register multiple models
-model.RegisterModelContextWindows(map[string]int{
-    "my-model-1": 4096,
-    "my-model-2": 16384,
-    "my-model-3": 32768,
-})
-
-// Then use automatic mode
-m := openai.New("my-custom-model",
-    openai.WithEnableTokenTailoring(true), // Auto-detect context window
-)
-```
-
-**Use Cases**:
-
-- Using privately deployed or custom models
-- Overriding framework built-in context window configurations
-- Adapting to newly released model versions
-
-#### Usage Example
-
-For a complete interactive example, see [examples/tailor](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/tailor).
-
-### 3. Provider
+## Provider
 
 With the emergence of multiple large model providers, some have defined their own API specifications. Currently, the framework has integrated the APIs of OpenAI and Anthropic, and exposes them as models. Users can access different provider models through `openai.New` and `anthropic.New`.
 
@@ -1581,13 +1964,15 @@ The Provider supports the following `Option`:
 | ------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
 | `WithAPIKey` / `WithBaseURL`                                                                      | Set the API Key and Base URL for the model                              |
 | `WithHTTPClientName` / `WithHTTPClientTransport`                                                  | Configure HTTP client properties                                        |
+| `WithHeaders`                                                                                     | Append static HTTP headers across requests                              |
 | `WithChannelBufferSize`                                                                           | Adjust the response channel buffer size                                 |
 | `WithCallbacks`                                                                                   | Configure OpenAI / Anthropic request, response, and streaming callbacks |
 | `WithExtraFields`                                                                                 | Configure custom fields in the request body                             |
 | `WithEnableTokenTailoring` / `WithMaxInputTokens`<br>`WithTokenCounter` / `WithTailoringStrategy` | Token trimming related parameters                                       |
-| `WithOpenAI` / `WithAnthropic`                                                                    | Pass-through native options for the respective providers                |
+| `WithTokenTailoringConfig`                                                                        | Custom token tailoring budget parameters for advanced configuration     |
+| `WithOpenAIOption` / `WithAnthropicOption`                                                        | Pass-through native options for the respective providers                |
 
-#### Usage Example
+### Usage Example
 
 ```go
 import (
@@ -1611,9 +1996,35 @@ modelInstance, err := provider.Model(
 agent := llmagent.New("chat-assistant", llmagent.WithModel(modelInstance))
 ```
 
+**Advanced Configuration with TokenTailoringConfig**:
+
+For advanced users who need to fine-tune token allocation strategy, you can use `WithTokenTailoringConfig`:
+
+```go
+import (
+    "trpc.group/trpc-go/trpc-agent-go/model"
+    "trpc.group/trpc-go/trpc-agent-go/model/provider"
+)
+
+// Custom token tailoring budget parameters for all providers
+config := &model.TokenTailoringConfig{
+    ProtocolOverheadTokens: 1024,
+    ReserveOutputTokens:    4096,
+    SafetyMarginRatio:      0.15,
+}
+
+modelInstance, err := provider.Model(
+    "openai",
+    "deepseek-chat",
+    provider.WithAPIKey(c.apiKey),
+    provider.WithEnableTokenTailoring(true),
+    provider.WithTokenTailoringConfig(config),
+)
+```
+
 Full code can be found in [examples/provider](https://github.com/trpc-group/trpc-agent-go/tree/main/examples/provider).
 
-#### Registering a Custom Provider
+### Registering a Custom Provider
 
 The framework supports registering custom providers to integrate other large model providers or custom model implementations.
 

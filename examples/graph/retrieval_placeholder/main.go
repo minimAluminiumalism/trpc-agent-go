@@ -1,6 +1,5 @@
 //
-// Tencent is pleased to support the open source community by making
-// trpc-agent-go available.
+// Tencent is pleased to support the open source community by making trpc-agent-go available.
 //
 // Copyright (C) 2025 Tencent.  All rights reserved.
 //
@@ -125,6 +124,9 @@ func run(ctx context.Context, modelName string) error {
 		return fmt.Errorf("create graph agent failed: %w", err)
 	}
 	r := runner.NewRunner(appName, ga, runner.WithSessionService(svc))
+
+	// Ensure runner resources are cleaned up (trpc-agent-go >= v0.5.0)
+	defer r.Close()
 
 	fmt.Printf("✅ Session ready: %s\n", sessionID)
 

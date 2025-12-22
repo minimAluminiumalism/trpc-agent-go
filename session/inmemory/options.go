@@ -12,7 +12,16 @@ package inmemory
 import (
 	"time"
 
+	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/session/summary"
+)
+
+const (
+	defaultSessionEventLimit     = 1000
+	defaultCleanupIntervalSecond = 5 * time.Minute // 5 min
+
+	defaultAsyncSummaryNum  = 3
+	defaultSummaryQueueSize = 100
 )
 
 // serviceOpts is the options for session service.
@@ -36,10 +45,24 @@ type serviceOpts struct {
 	summaryQueueSize int
 	// summaryJobTimeout is the timeout for processing a single summary job.
 	summaryJobTimeout time.Duration
+	// appendEventHooks are hooks for AppendEvent.
+	appendEventHooks []session.AppendEventHook
+	// getSessionHooks are hooks for GetSession.
+	getSessionHooks []session.GetSessionHook
 }
 
 // ServiceOpt is the option for the in-memory session service.
 type ServiceOpt func(*serviceOpts)
+
+var (
+	defaultOptions = serviceOpts{
+		sessionEventLimit: defaultSessionEventLimit,
+		cleanupInterval:   0,
+		asyncSummaryNum:   defaultAsyncSummaryNum,
+		summaryQueueSize:  defaultSummaryQueueSize,
+		summaryJobTimeout: 30 * time.Second,
+	}
+)
 
 // WithSessionEventLimit sets the limit of events in a session.
 func WithSessionEventLimit(limit int) ServiceOpt {
@@ -116,5 +139,19 @@ func WithSummaryJobTimeout(timeout time.Duration) ServiceOpt {
 			return
 		}
 		opts.summaryJobTimeout = timeout
+	}
+}
+
+// WithAppendEventHook adds AppendEvent hooks.
+func WithAppendEventHook(hooks ...session.AppendEventHook) ServiceOpt {
+	return func(opts *serviceOpts) {
+		opts.appendEventHooks = append(opts.appendEventHooks, hooks...)
+	}
+}
+
+// WithGetSessionHook adds GetSession hooks.
+func WithGetSessionHook(hooks ...session.GetSessionHook) ServiceOpt {
+	return func(opts *serviceOpts) {
+		opts.getSessionHooks = append(opts.getSessionHooks, hooks...)
 	}
 }

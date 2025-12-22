@@ -1,10 +1,10 @@
 //
-// Tencent is pleased to support the open source community by making
-// trpc-agent-go available.
+// Tencent is pleased to support the open source community by making trpc-agent-go available.
 //
 // Copyright (C) 2025 Tencent.  All rights reserved.
 //
 // trpc-agent-go is licensed under the Apache License Version 2.0.
+//
 //
 
 // Package main demonstrates model‑orchestrated external tools that run
@@ -76,6 +76,10 @@ func main() {
 		fmt.Printf("failed to set up workflow: %v\n", err)
 		os.Exit(1)
 	}
+
+	// Ensure runner resources are cleaned up (trpc-agent-go >= v0.5.0)
+	defer workflow.runner.Close()
+
 	if err := workflow.interactive(ctx); err != nil {
 		fmt.Printf("workflow ended with error: %v\n", err)
 		os.Exit(1)
@@ -624,12 +628,10 @@ func (c *externalCoordinator) callbacks() *tool.Callbacks {
 // the client to submit the tool result.
 func (c *externalCoordinator) before(
 	ctx context.Context,
-	toolName string,
-	decl *tool.Declaration,
-	jsonArgs *[]byte,
-) (any, error) {
+	args *tool.BeforeToolArgs,
+) (*tool.BeforeToolResult, error) {
 	// Only intercept the external extract tool; others run normally.
-	if toolName != toolNameFetch {
+	if args.ToolName != toolNameFetch {
 		return nil, nil
 	}
 	_, _ = tool.ToolCallIDFromContext(ctx)
@@ -639,7 +641,7 @@ func (c *externalCoordinator) before(
 	}
 	prompt := map[string]any{
 		"message": "Run extract externally and return content.",
-		"tool":    toolName,
+		"tool":    args.ToolName,
 	}
 	resume, err := graph.Interrupt(
 		ctx, state, interruptKeyTool, prompt,
@@ -649,7 +651,9 @@ func (c *externalCoordinator) before(
 	}
 	// Convert a simple string into {"content": string} object.
 	parsed := parseExternalResult(resume)
-	return parsed, nil
+	return &tool.BeforeToolResult{
+		CustomResult: parsed,
+	}, nil
 }
 
 func (c *externalCoordinator) getState() graph.State {

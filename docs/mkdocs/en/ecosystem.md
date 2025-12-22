@@ -321,20 +321,20 @@ import (
 )
 
 type APIToolSet struct {
-    tools map[string]tool.CallableTool
+    tools map[string]tool.Tool
     mu    sync.RWMutex
 }
 
 func New() *APIToolSet {
     return &APIToolSet{
-        tools: make(map[string]tool.CallableTool),
+        tools: make(map[string]tool.Tool),
     }
 }
 
-func (a *APIToolSet) AddTool(name string, tool tool.CallableTool) {
+func (a *APIToolSet) AddTool(name string, t tool.Tool) {
     a.mu.Lock()
     defer a.mu.Unlock()
-    a.tools[name] = tool
+    a.tools[name] = t
 }
 
 func (a *APIToolSet) RemoveTool(name string) {
@@ -343,11 +343,11 @@ func (a *APIToolSet) RemoveTool(name string) {
     delete(a.tools, name)
 }
 
-func (a *APIToolSet) Tools(ctx context.Context) []tool.CallableTool {
+func (a *APIToolSet) Tools(ctx context.Context) []tool.Tool {
     a.mu.RLock()
     defer a.mu.RUnlock()
     
-    var result []tool.CallableTool
+    var result []tool.Tool
     for _, t := range a.tools {
         result = append(result, t)
     }
@@ -359,9 +359,12 @@ func (a *APIToolSet) Close() error {
     defer a.mu.Unlock()
     
     // Clean up resources.
-    a.tools = make(map[string]tool.CallableTool)
+    a.tools = make(map[string]tool.Tool)
     return nil
 }
+
+// Name identifies this ToolSet.
+func (a *APIToolSet) Name() string { return "api-tools" }
 ```
 
 **Open Source Components That Can Be Integrated:**
@@ -832,7 +835,7 @@ Implementation points:
 - Configure authentication and rate limiting according to target service guidelines.
 - Return values strictly align with `memory.Entry` and `memory.Memory`, use UTC for time fields.
 - Tool declarations should accurately describe input and output for frontend and model understanding.
-- Add README, examples and tests to ensure compatibility with `runner`, `server/debug` combinations.
+- Add README, examples and tests to ensure compatibility with runner-based integrations.
 
 **Open Source Components That Can Be Integrated:**
 
@@ -997,24 +1000,11 @@ Contribution directions:
 
 **Existing Implementation Reference:**
 
-- **ADK Web Compatible HTTP Service**: `server/debug`.
-  - Endpoints (implemented):
-    - `GET /list-apps`: List available `Agent` applications.
-    - `GET /apps/{appName}/users/{userId}/sessions`: List user sessions.
-    - `POST /apps/{appName}/users/{userId}/sessions`: Create session.
-    - `GET /apps/{appName}/users/{userId}/sessions/{sessionId}`: Query session.
-    - `POST /run`: Non-streaming conversation inference, returns aggregated event list.
-    - `POST /run_sse`: SSE streaming inference, returns token-level event stream.
-    - `GET /debug/trace/{event_id}`: Query Trace attributes by event.
-    - `GET /debug/trace/session/{session_id}`: Query Trace list by Session.
-  - Features: Built-in CORS, pluggable session storage (default In-Memory), integrated with `runner.Runner`, observability instrumentation (exports key Spans).
-  - Scope note: Designed for debugging with ADK Web. It constructs runners internally from Agents and enforces a single `session.Service` across its session APIs and runners. Not recommended for production.
 - **A2A Server**: `server/a2a`.
   - Service encapsulation for A2A protocol, built-in `AuthProvider` and task orchestration, suitable for platform-to-Agent integration scenarios.
 
 **Alignment with Frontend Protocols:**
 
-- **ADK Web**: Already aligned with request/response and event Schema, see `server/debug/internal/schema`.
 - **AG-UI**: Reference `https://github.com/ag-ui-protocol/ag-ui`.
   - Required capabilities:
     - Session list/create/query.
@@ -1032,40 +1022,16 @@ Contribution directions:
   - Input: Map UI's `Content`/`Part` to internal `model.Message`.
   - Output events: Map internal `event.Event` to UI-expected envelope/parts, structure tool calls and tool responses to avoid duplicate text display.
 - **Streaming Transmission**:
-  - SSE already implemented in `server/debug`, prioritize reuse; WebSocket can be ecosystem extension.
+  - Prefer SSE for streaming; WebSocket can be an ecosystem extension.
   - Non-streaming endpoints need to aggregate final messages and tool responses according to UI expectations.
 - **Session Storage**:
   - Inject specific implementation through `runner.WithSessionService`, reuse `session` module.
-  - For `server/debug`, set a single backend via `debug.WithSessionService(...)`; it overrides any runner‑level session service to ensure consistency.
 - **Observability**:
-  - Reuse `telemetry/trace` and `telemetry/metric`. `server/debug` already demonstrates how to export key Spans and event attributes for UI-side debugging and positioning.
+  - Reuse `telemetry/trace` and `telemetry/metric`, export key spans and event attributes for UI-side debugging and positioning.
 - **Authentication and Security**:
   - Support API Key/JWT/custom Header; add rate limiting and cross-domain control for sensitive endpoints.
 - **Open Specifications**:
   - Recommend attaching `openapi.json`/`README.md` to each `server/*` submodule for frontend/integration party integration.
-
-**Minimal Example (reuse ADK Web compatible service):**
-
-```go
-package main
-
-import (
-    "net/http"
-
-    "trpc.group/trpc-go/trpc-agent-go/agent/llmagent"
-    debugsrv "trpc.group/trpc-go/trpc-agent-go/server/debug"
-)
-
-func main() {
-    // 1. Register Agent.
-    ag := llmagent.New("assistant")
-    s := debugsrv.New(map[string]agent.Agent{
-        ag.Info().Name: ag,
-    })
-    // 2. Expose HTTP Handler.
-    _ = http.ListenAndServe(":8080", s.Handler())
-}
-```
 
 **AG-UI Adaptation Suggestion (skeleton):**
 
@@ -1116,7 +1082,6 @@ func (s *Server) routes() {
 
 Link references:
 
-- `server/debug` (ADK Web compatible) and its `openapi.json`. 
 - `server/a2a` (A2A protocol encapsulation). 
 
 ### 9. Planner Ecosystem
@@ -1178,7 +1143,7 @@ func (p *Planner) ProcessPlanningResponse(ctx context.Context, inv *agent.Invoca
 **Contribution Suggestions:**
 
 - Provide implementation and README, test cases, examples in `planner/<name>/`.
-- Combine with `docs/overall-introduction.md`'s Observability and `server/debug` endpoints to provide end-to-end examples for frontend UI demonstration.
+- Combine with `docs/overall-introduction.md`'s Observability to provide end-to-end examples for frontend UI demonstration.
 - Follow goimports and error message style, add periods at end of comments, code line breaks around 80 columns.
 
 ## Component Relationship Description

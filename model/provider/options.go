@@ -14,6 +14,9 @@ import (
 
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/model/anthropic"
+	"trpc.group/trpc-go/trpc-agent-go/model/gemini"
+	"trpc.group/trpc-go/trpc-agent-go/model/hunyuan"
+	"trpc.group/trpc-go/trpc-agent-go/model/ollama"
 	"trpc.group/trpc-go/trpc-agent-go/model/openai"
 )
 
@@ -22,21 +25,26 @@ type Option func(*Options)
 
 // Options contains resolved settings used when constructing provider-backed models.
 type Options struct {
-	ProviderName         string                  // ProviderName is the provider identifier passed to Model.
-	ModelName            string                  // ModelName is the concrete model identifier.
-	APIKey               string                  // APIKey holds the credential used for downstream SDK initialization.
-	BaseURL              string                  // BaseURL overrides the default endpoint when specified.
-	HTTPClientName       string                  // HTTPClientName is the logical name applied to the HTTP client.
-	HTTPClientTransport  http.RoundTripper       // HTTPClientTransport allows customizing the HTTP transport.
-	Callbacks            *Callbacks              // Callbacks captures provider-specific callback hooks.
-	ChannelBufferSize    *int                    // ChannelBufferSize is the response channel buffer size.
-	ExtraFields          map[string]any          // ExtraFields are serialized into provider-specific request payloads.
-	EnableTokenTailoring *bool                   // EnableTokenTailoring toggles automatic token tailoring.
-	MaxInputTokens       *int                    // MaxInputTokens sets the maximum input tokens for token tailoring.
-	TokenCounter         model.TokenCounter      // TokenCounter provides a custom token counting implementation.
-	TailoringStrategy    model.TailoringStrategy // TailoringStrategy defines the strategy for token tailoring.
-	OpenAIOption         []openai.Option         // OpenAIOption stores additional OpenAI options.
-	AnthropicOption      []anthropic.Option      // AnthropicOption stores additional Anthropic options.
+	ProviderName         string                      // ProviderName is the provider identifier passed to Model.
+	ModelName            string                      // ModelName is the concrete model identifier.
+	APIKey               string                      // APIKey holds the credential used for downstream SDK initialization.
+	BaseURL              string                      // BaseURL overrides the default endpoint when specified.
+	HTTPClientName       string                      // HTTPClientName is the logical name applied to the HTTP client.
+	HTTPClientTransport  http.RoundTripper           // HTTPClientTransport allows customizing the HTTP transport.
+	Callbacks            *Callbacks                  // Callbacks captures provider-specific callback hooks.
+	ChannelBufferSize    *int                        // ChannelBufferSize is the response channel buffer size.
+	Headers              map[string]string           // Headers are appended to outbound provider requests.
+	ExtraFields          map[string]any              // ExtraFields are serialized into provider-specific request payloads.
+	EnableTokenTailoring *bool                       // EnableTokenTailoring toggles automatic token tailoring.
+	MaxInputTokens       *int                        // MaxInputTokens sets the maximum input tokens for token tailoring.
+	TokenCounter         model.TokenCounter          // TokenCounter provides a custom token counting implementation.
+	TailoringStrategy    model.TailoringStrategy     // TailoringStrategy defines the strategy for token tailoring.
+	TokenTailoringConfig *model.TokenTailoringConfig // TokenTailoringConfig customizes token tailoring budget parameters for all providers.
+	OpenAIOption         []openai.Option             // OpenAIOption stores additional OpenAI options.
+	AnthropicOption      []anthropic.Option          // AnthropicOption stores additional Anthropic options.
+	GeminiOption         []gemini.Option             // GeminiOption stores additional Gemini options.
+	OllamaOption         []ollama.Option             // OllamaOption stores additional Ollama options.
+	HunyuanOption        []hunyuan.Option            // HunyuanOption stores additional Hunyuan options.
 }
 
 // Callbacks collects provider specific callback hooks.
@@ -57,6 +65,30 @@ type Callbacks struct {
 	AnthropicChatChunk anthropic.ChatChunkCallbackFunc
 	// AnthropicStreamComplete runs after an Anthropic streaming session completes.
 	AnthropicStreamComplete anthropic.ChatStreamCompleteCallbackFunc
+	// GeminiChatRequest runs before dispatching a chat request to Gemini providers.
+	GeminiChatRequest gemini.ChatRequestCallbackFunc
+	// GeminiChatResponse runs after receiving a full chat response from Gemini providers.
+	GeminiChatResponse gemini.ChatResponseCallbackFunc
+	// GeminiChatChunk runs for each streaming chunk from Gemini providers.
+	GeminiChatChunk gemini.ChatChunkCallbackFunc
+	// GeminiStreamComplete runs after an Gemini streaming session completes.
+	GeminiStreamComplete gemini.ChatStreamCompleteCallbackFunc
+	// OllamaChatRequest runs before dispatching a chat request to Ollama providers.
+	OllamaChatRequest ollama.ChatRequestCallbackFunc
+	// OllamaChatResponse runs after receiving a full chat response from Ollama providers.
+	OllamaChatResponse ollama.ChatResponseCallbackFunc
+	// OllamaChatChunk runs for each streaming chunk from Ollama providers.
+	OllamaChatChunk ollama.ChatChunkCallbackFunc
+	// OllamaStreamComplete runs after an Ollama streaming session completes.
+	OllamaStreamComplete ollama.ChatStreamCompleteCallbackFunc
+	// HunyuanChatRequest runs before dispatching a chat request to Hunyuan providers.
+	HunyuanChatRequest hunyuan.ChatRequestCallbackFunc
+	// HunyuanChatResponse runs after receiving a full chat response from Hunyuan providers.
+	HunyuanChatResponse hunyuan.ChatResponseCallbackFunc
+	// HunyuanChatChunk runs for each streaming chunk from Hunyuan providers.
+	HunyuanChatChunk hunyuan.ChatChunkCallbackFunc
+	// HunyuanStreamComplete runs after a Hunyuan streaming session completes.
+	HunyuanStreamComplete hunyuan.ChatStreamCompleteCallbackFunc
 }
 
 // WithAPIKey records the API key for the provider.
@@ -84,6 +116,18 @@ func WithHTTPClientName(name string) Option {
 func WithHTTPClientTransport(transport http.RoundTripper) Option {
 	return func(o *Options) {
 		o.HTTPClientTransport = transport
+	}
+}
+
+// WithHeaders appends static HTTP headers for supported providers.
+func WithHeaders(headers map[string]string) Option {
+	return func(o *Options) {
+		if o.Headers == nil {
+			o.Headers = make(map[string]string)
+		}
+		for k, v := range headers {
+			o.Headers[k] = v
+		}
 	}
 }
 
@@ -116,6 +160,18 @@ func WithCallbacks(cb Callbacks) Option {
 		}
 		if cb.AnthropicStreamComplete != nil {
 			o.Callbacks.AnthropicStreamComplete = cb.AnthropicStreamComplete
+		}
+		if cb.OllamaChatRequest != nil {
+			o.Callbacks.OllamaChatRequest = cb.OllamaChatRequest
+		}
+		if cb.OllamaChatResponse != nil {
+			o.Callbacks.OllamaChatResponse = cb.OllamaChatResponse
+		}
+		if cb.OllamaStreamComplete != nil {
+			o.Callbacks.OllamaStreamComplete = cb.OllamaStreamComplete
+		}
+		if cb.OllamaChatChunk != nil {
+			o.Callbacks.OllamaChatChunk = cb.OllamaChatChunk
 		}
 	}
 }
@@ -167,6 +223,25 @@ func WithTailoringStrategy(strategy model.TailoringStrategy) Option {
 	}
 }
 
+// WithTokenTailoringConfig sets custom token tailoring budget parameters for all providers.
+// This allows advanced users to fine-tune the token allocation strategy.
+//
+// Example:
+//
+//	provider.WithTokenTailoringConfig(&model.TokenTailoringConfig{
+//	    ProtocolOverheadTokens: 1024,
+//	    ReserveOutputTokens:    4096,
+//	    SafetyMarginRatio:      0.15,
+//	})
+//
+// Note: It is recommended to use the default values unless you have specific
+// requirements.
+func WithTokenTailoringConfig(config *model.TokenTailoringConfig) Option {
+	return func(o *Options) {
+		o.TokenTailoringConfig = config
+	}
+}
+
 // WithOpenAIOption appends raw OpenAI options.
 func WithOpenAIOption(opt ...openai.Option) Option {
 	return func(o *Options) {
@@ -178,5 +253,26 @@ func WithOpenAIOption(opt ...openai.Option) Option {
 func WithAnthropicOption(opt ...anthropic.Option) Option {
 	return func(o *Options) {
 		o.AnthropicOption = append(o.AnthropicOption, opt...)
+	}
+}
+
+// WithGeminiOption appends raw Gemini options.
+func WithGeminiOption(opt ...gemini.Option) Option {
+	return func(o *Options) {
+		o.GeminiOption = append(o.GeminiOption, opt...)
+	}
+}
+
+// WithOllamaOption appends raw Ollama options.
+func WithOllamaOption(opt ...ollama.Option) Option {
+	return func(o *Options) {
+		o.OllamaOption = append(o.OllamaOption, opt...)
+	}
+}
+
+// WithHunyuanOption appends raw Hunyuan options.
+func WithHunyuanOption(opt ...hunyuan.Option) Option {
+	return func(o *Options) {
+		o.HunyuanOption = append(o.HunyuanOption, opt...)
 	}
 }

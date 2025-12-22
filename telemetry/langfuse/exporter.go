@@ -104,12 +104,53 @@ func transformSpan(span *tracepb.Span) {
 	}
 
 	switch operationName {
+	case itelemetry.OperationInvokeAgent:
+		transformInvokeAgent(span)
 	case itelemetry.OperationChat:
 		transformCallLLM(span)
 	case itelemetry.OperationExecuteTool:
 		transformExecuteTool(span)
 	default:
 	}
+}
+
+func transformInvokeAgent(span *tracepb.Span) {
+	var newAttributes []*commonpb.KeyValue
+
+	newAttributes = append(newAttributes, &commonpb.KeyValue{
+		Key: observationType,
+		Value: &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_StringValue{StringValue: observationTypeAgent},
+		},
+	})
+
+	for _, attr := range span.Attributes {
+		switch attr.Key {
+		case itelemetry.KeyGenAIInputMessages:
+			if attr.Value != nil {
+				newAttributes = append(newAttributes, &commonpb.KeyValue{
+					Key: observationInput,
+					Value: &commonpb.AnyValue{
+						Value: &commonpb.AnyValue_StringValue{StringValue: attr.Value.GetStringValue()},
+					},
+				})
+			}
+			// Skip this attribute (delete it)
+		case itelemetry.KeyGenAIOutputMessages:
+			if attr.Value != nil {
+				newAttributes = append(newAttributes, &commonpb.KeyValue{
+					Key: observationOutput,
+					Value: &commonpb.AnyValue{
+						Value: &commonpb.AnyValue_StringValue{StringValue: attr.Value.GetStringValue()},
+					},
+				})
+			}
+			// Skip this attribute (delete it)
+		default:
+			newAttributes = append(newAttributes, attr)
+		}
+	}
+	span.Attributes = newAttributes
 }
 
 // transformCallLLM transforms LLM call spans for Langfuse
@@ -120,13 +161,18 @@ func transformCallLLM(span *tracepb.Span) {
 	newAttributes = append(newAttributes, &commonpb.KeyValue{
 		Key: observationType,
 		Value: &commonpb.AnyValue{
-			Value: &commonpb.AnyValue_StringValue{StringValue: "generation"},
+			Value: &commonpb.AnyValue_StringValue{StringValue: observationTypeGeneration},
 		},
 	})
 
 	// Process existing attributes
+	var llmSessionID *commonpb.AnyValue
 	for _, attr := range span.Attributes {
 		switch attr.Key {
+		case itelemetry.KeyGenAIConversationID, itelemetry.KeyRunnerSessionID, traceSessionID:
+			llmSessionID = attr.Value
+		case itelemetry.KeyRunnerUserID:
+			newAttributes = append(newAttributes, &commonpb.KeyValue{Key: traceUserID, Value: attr.Value})
 		case itelemetry.KeyLLMRequest:
 			if attr.Value != nil {
 				request := attr.Value.GetStringValue()
@@ -159,6 +205,7 @@ func transformCallLLM(span *tracepb.Span) {
 					},
 				})
 			}
+
 			// Skip this attribute (delete it)
 		case itelemetry.KeyLLMResponse:
 			if attr.Value != nil {
@@ -182,6 +229,9 @@ func transformCallLLM(span *tracepb.Span) {
 			newAttributes = append(newAttributes, attr)
 		}
 	}
+	if llmSessionID != nil { // use post set session id
+		newAttributes = append(newAttributes, &commonpb.KeyValue{Key: traceSessionID, Value: llmSessionID})
+	}
 
 	// Replace span attributes
 	span.Attributes = newAttributes
@@ -195,13 +245,18 @@ func transformExecuteTool(span *tracepb.Span) {
 	newAttributes = append(newAttributes, &commonpb.KeyValue{
 		Key: observationType,
 		Value: &commonpb.AnyValue{
-			Value: &commonpb.AnyValue_StringValue{StringValue: "tool"},
+			Value: &commonpb.AnyValue_StringValue{StringValue: observationTypeTool},
 		},
 	})
 
 	// Process existing attributes
+	var llmSessionID *commonpb.AnyValue
 	for _, attr := range span.Attributes {
 		switch attr.Key {
+		case itelemetry.KeyGenAIConversationID, itelemetry.KeyRunnerSessionID, traceSessionID:
+			llmSessionID = attr.Value
+		case itelemetry.KeyRunnerUserID:
+			newAttributes = append(newAttributes, &commonpb.KeyValue{Key: traceUserID, Value: attr.Value})
 		case itelemetry.KeyGenAIToolCallArguments:
 			if attr.Value != nil {
 				newAttributes = append(newAttributes, &commonpb.KeyValue{
@@ -240,6 +295,9 @@ func transformExecuteTool(span *tracepb.Span) {
 			// Keep other attributes
 			newAttributes = append(newAttributes, attr)
 		}
+	}
+	if llmSessionID != nil { // use post set session id
+		newAttributes = append(newAttributes, &commonpb.KeyValue{Key: traceSessionID, Value: llmSessionID})
 	}
 
 	// Replace span attributes

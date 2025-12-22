@@ -23,7 +23,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"trpc.group/trpc-go/trpc-agent-go/event"
-	isession "trpc.group/trpc-go/trpc-agent-go/internal/session"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 )
@@ -50,7 +49,7 @@ func TestNewService(t *testing.T) {
 			name:        "invalid redis URL",
 			options:     []ServiceOpt{WithRedisClientURL("invalid://url")},
 			expectError: true,
-			errorMsg:    "create redis client from url failed",
+			errorMsg:    "create redis client failed",
 		},
 		{
 			name:        "empty options",
@@ -941,6 +940,49 @@ func TestService_SessionTTL(t *testing.T) {
 	}
 }
 
+func TestService_getSessionSummaryTTL(t *testing.T) {
+	redisURL, cleanup := setupTestRedis(t)
+	defer cleanup()
+
+	ttl := 3 * time.Second
+	service, err := NewService(
+		WithRedisClientURL(redisURL),
+		WithSessionTTL(ttl),
+	)
+	require.NoError(t, err)
+	defer service.Close()
+
+	ctx := context.Background()
+	key := session.Key{
+		AppName:   "summary-app",
+		UserID:    "summary-user",
+		SessionID: "summary-session",
+	}
+	_, err = service.CreateSession(ctx, key, session.StateMap{})
+	require.NoError(t, err)
+
+	summary := map[string]*session.Summary{
+		session.SummaryFilterKeyAllContents: {
+			Summary:   "hello",
+			UpdatedAt: time.Now(),
+		},
+	}
+	summaryBytes, err := json.Marshal(summary)
+	require.NoError(t, err)
+
+	client := buildRedisClient(t, redisURL)
+	summaryKey := getSessionSummaryKey(key)
+	err = client.HSet(ctx, summaryKey, key.SessionID, summaryBytes).Err()
+	require.NoError(t, err)
+
+	_, err = service.getSession(ctx, key, 0, time.Time{})
+	require.NoError(t, err)
+
+	ttlVal := client.TTL(ctx, summaryKey).Val()
+	assert.Greater(t, ttlVal, time.Duration(0))
+	assert.LessOrEqual(t, ttlVal, ttl)
+}
+
 // TestService_AppStateTTL tests app state TTL functionality
 func TestService_AppStateTTL(t *testing.T) {
 	tests := []struct {
@@ -1293,7 +1335,7 @@ func TestEnsureEventStartWithUser(t *testing.T) {
 				Events:  tt.setupEvents(),
 			}
 
-			isession.EnsureEventStartWithUser(sess)
+			sess.EnsureEventStartWithUser()
 
 			assert.Equal(t, tt.expectedLength, len(sess.Events), "Event length should match expected")
 
@@ -1449,6 +1491,21 @@ func TestGetSession_AllAssistantEvents_Integration(t *testing.T) {
 					{
 						Index: 0,
 						Message: model.Message{
+							Role:    model.RoleUser,
+							Content: "user message 1",
+						},
+					},
+				},
+			},
+		},
+		{
+			ID:        "event1",
+			Timestamp: baseTime.Add(-3 * time.Hour),
+			Response: &model.Response{
+				Choices: []model.Choice{
+					{
+						Index: 1,
+						Message: model.Message{
 							Role:    model.RoleAssistant,
 							Content: "Assistant message 1",
 						},
@@ -1462,7 +1519,7 @@ func TestGetSession_AllAssistantEvents_Integration(t *testing.T) {
 			Response: &model.Response{
 				Choices: []model.Choice{
 					{
-						Index: 0,
+						Index: 2,
 						Message: model.Message{
 							Role:    model.RoleAssistant,
 							Content: "Assistant message 2",
@@ -1485,7 +1542,7 @@ func TestGetSession_AllAssistantEvents_Integration(t *testing.T) {
 	require.NotNil(t, retrievedSess)
 
 	// Should have no events since all are from assistant
-	assert.Equal(t, 0, len(retrievedSess.Events), "Should filter out all assistant events when no user events exist")
+	assert.Equal(t, 3, len(retrievedSess.Events), "Should filter out all assistant events when no user events exist")
 }
 
 func TestService_Close_MultipleTimes(t *testing.T) {
@@ -1642,6 +1699,7 @@ func TestStartAsyncSummaryWorker(t *testing.T) {
 	redisURL, cleanup := setupTestRedis(t)
 	defer cleanup()
 
+	// Test without summarizer - async workers should not be started
 	service, err := NewService(
 		WithRedisClientURL(redisURL),
 		WithAsyncSummaryNum(2),
@@ -1650,7 +1708,24 @@ func TestStartAsyncSummaryWorker(t *testing.T) {
 	require.NoError(t, err)
 	defer service.Close()
 
-	// Verify that summary job channels are initialized
+	// Verify that summary job channels are not initialized when no summarizer is provided
+	assert.Len(t, service.summaryJobChans, 0)
+}
+
+func TestStartAsyncSummaryWorkerWithSummarizer(t *testing.T) {
+	redisURL, cleanup := setupTestRedis(t)
+	defer cleanup()
+
+	service, err := NewService(
+		WithRedisClientURL(redisURL),
+		WithAsyncSummaryNum(2),
+		WithSummaryQueueSize(50),
+		WithSummarizer(&fakeSummarizer{allow: true, out: "test"}),
+	)
+	require.NoError(t, err)
+	defer service.Close()
+
+	// Verify that summary job channels are initialized when summarizer is provided
 	assert.Len(t, service.summaryJobChans, 2)
 	assert.NotNil(t, service.summaryJobChans[0])
 	assert.NotNil(t, service.summaryJobChans[1])
@@ -1941,6 +2016,51 @@ func TestService_GetSession_WithOptions(t *testing.T) {
 	sess2, err := service.GetSession(ctx, key, session.WithEventTime(time.Now().Add(-1*time.Hour)))
 	require.NoError(t, err)
 	assert.NotNil(t, sess2)
+}
+
+func TestService_GetSession_AttachSummaries(t *testing.T) {
+	redisURL, cleanup := setupTestRedis(t)
+	defer cleanup()
+
+	service, err := NewService(WithRedisClientURL(redisURL))
+	require.NoError(t, err)
+	defer service.Close()
+
+	ctx := context.Background()
+	key := session.Key{
+		AppName:   "testapp",
+		UserID:    "user123",
+		SessionID: "session-with-summary",
+	}
+
+	sess, err := service.CreateSession(ctx, key, session.StateMap{})
+	require.NoError(t, err)
+
+	evt := createTestEvent("evt-summary", "agent", "content", time.Now(), false)
+	err = service.AppendEvent(ctx, sess, evt)
+	require.NoError(t, err)
+
+	sumMap := map[string]*session.Summary{
+		"": {
+			Summary:   "cached-summary",
+			UpdatedAt: time.Now().UTC(),
+		},
+	}
+	payload, err := json.Marshal(sumMap)
+	require.NoError(t, err)
+	client := buildRedisClient(t, redisURL)
+	err = client.HSet(
+		ctx, getSessionSummaryKey(key), key.SessionID, string(payload),
+	).Err()
+	require.NoError(t, err)
+
+	got, err := service.GetSession(ctx, key)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	require.NotNil(t, got.Summaries)
+	sum, ok := got.Summaries[""]
+	require.True(t, ok)
+	assert.Equal(t, "cached-summary", sum.Summary)
 }
 
 func TestService_ListSessions_WithOptions(t *testing.T) {
@@ -2263,6 +2383,108 @@ func TestService_AppendEvent_WithLimit(t *testing.T) {
 	assert.LessOrEqual(t, len(retrievedSess.Events), limit)
 }
 
+func TestService_AppendTrackEvent_Persistence(t *testing.T) {
+	tests := []struct {
+		name               string
+		enableAsyncPersist bool
+	}{
+		{name: "sync", enableAsyncPersist: false},
+		{name: "async", enableAsyncPersist: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			redisURL, cleanup := setupTestRedis(t)
+			defer cleanup()
+
+			service, err := NewService(
+				WithRedisClientURL(redisURL),
+				WithEnableAsyncPersist(tt.enableAsyncPersist),
+			)
+			require.NoError(t, err)
+			defer service.Close()
+
+			sessionKey := session.Key{
+				AppName:   "track-app",
+				UserID:    "track-user",
+				SessionID: "track-session",
+			}
+
+			sess, err := service.CreateSession(context.Background(), sessionKey, session.StateMap{})
+			require.NoError(t, err)
+
+			trackName := session.Track("agui")
+			payload := json.RawMessage(`{"hello":"world"}`)
+			trackEvt := &session.TrackEvent{
+				Track:     trackName,
+				Payload:   payload,
+				Timestamp: time.Now(),
+			}
+
+			require.NoError(t, service.AppendTrackEvent(context.Background(), sess, trackEvt))
+
+			require.Eventually(t, func() bool {
+				fetched, err := service.GetSession(context.Background(), sessionKey)
+				if err != nil || fetched == nil || fetched.Tracks == nil {
+					return false
+				}
+				history, ok := fetched.Tracks[trackName]
+				if !ok || history == nil || len(history.Events) == 0 {
+					return false
+				}
+				last := history.Events[len(history.Events)-1]
+				return last.Track == trackName && string(last.Payload) == string(payload)
+			}, 2*time.Second, 10*time.Millisecond, "track event not persisted")
+		})
+	}
+}
+
+func TestService_GetSessionTrackAfterTime(t *testing.T) {
+	redisURL, cleanup := setupTestRedis(t)
+	defer cleanup()
+
+	service, err := NewService(WithRedisClientURL(redisURL))
+	require.NoError(t, err)
+	defer service.Close()
+
+	sessionKey := session.Key{
+		AppName:   "track-app",
+		UserID:    "track-user",
+		SessionID: "track-session",
+	}
+
+	sess, err := service.CreateSession(context.Background(), sessionKey, session.StateMap{})
+	require.NoError(t, err)
+
+	trackName := session.Track("agui")
+	oldTime := time.Now().Add(-2 * time.Hour)
+	newTime := time.Now().Add(-1 * time.Hour)
+
+	oldPayload := json.RawMessage(`{"idx":1}`)
+	newPayload := json.RawMessage(`{"idx":2}`)
+
+	require.NoError(t, service.AppendTrackEvent(context.Background(), sess, &session.TrackEvent{
+		Track:     trackName,
+		Payload:   oldPayload,
+		Timestamp: oldTime,
+	}))
+	require.NoError(t, service.AppendTrackEvent(context.Background(), sess, &session.TrackEvent{
+		Track:     trackName,
+		Payload:   newPayload,
+		Timestamp: newTime,
+	}))
+
+	cutoff := newTime.Add(-30 * time.Minute)
+	retrieved, err := service.GetSession(context.Background(), sessionKey, session.WithEventTime(cutoff))
+	require.NoError(t, err)
+	require.NotNil(t, retrieved)
+	require.NotNil(t, retrieved.Tracks)
+	history, ok := retrieved.Tracks[trackName]
+	require.True(t, ok)
+	require.Len(t, history.Events, 1)
+	require.Equal(t, string(newPayload), string(history.Events[0].Payload))
+}
+
 func TestService_DeleteSession_NonExistent(t *testing.T) {
 	redisURL, cleanup := setupTestRedis(t)
 	defer cleanup()
@@ -2553,6 +2775,263 @@ func TestService_DeleteSession_WithEvents(t *testing.T) {
 	assert.Nil(t, deletedSess)
 }
 
+func TestService_ListSessionsWithTrackEvents(t *testing.T) {
+	redisURL, cleanup := setupTestRedis(t)
+	defer cleanup()
+
+	service, err := NewService(WithRedisClientURL(redisURL))
+	require.NoError(t, err)
+	defer service.Close()
+
+	ctx := context.Background()
+	key := session.Key{
+		AppName:   "track-app",
+		UserID:    "track-user",
+		SessionID: "track-session",
+	}
+	sess, err := service.CreateSession(ctx, key, session.StateMap{})
+	require.NoError(t, err)
+
+	payload := json.RawMessage(`"list-track"`)
+	require.NoError(t, service.AppendTrackEvent(ctx, sess, &session.TrackEvent{
+		Track:     "alpha",
+		Payload:   payload,
+		Timestamp: time.Now(),
+	}))
+
+	sessions, err := service.ListSessions(ctx, session.UserKey{
+		AppName: key.AppName,
+		UserID:  key.UserID,
+	})
+	require.NoError(t, err)
+	require.Len(t, sessions, 1)
+	require.NotNil(t, sessions[0].Tracks)
+	alpha, ok := sessions[0].Tracks["alpha"]
+	require.True(t, ok)
+	require.Len(t, alpha.Events, 1)
+	assert.Equal(t, payload, alpha.Events[0].Payload)
+}
+
+func TestGetTrackEvents_EmptyKeys(t *testing.T) {
+	s := &Service{}
+	trackEvents, err := s.getTrackEvents(context.Background(), nil, nil, 0, time.Time{})
+	require.NoError(t, err)
+	assert.Nil(t, trackEvents)
+}
+
+func TestGetTrackEvents_Mismatch(t *testing.T) {
+	s := &Service{}
+	keys := []session.Key{{AppName: "a", UserID: "u", SessionID: "s"}}
+	_, err := s.getTrackEvents(context.Background(), keys, nil, 0, time.Time{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "mismatch")
+}
+
+func TestService_AppendTrackEventRecover(t *testing.T) {
+	redisURL, cleanup := setupTestRedis(t)
+	defer cleanup()
+
+	service, err := NewService(
+		WithRedisClientURL(redisURL),
+		WithEnableAsyncPersist(true),
+		WithAsyncPersisterNum(1),
+	)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	key := session.Key{
+		AppName:   "recover-app",
+		UserID:    "recover-user",
+		SessionID: "recover-session",
+	}
+	sess, err := service.CreateSession(ctx, key, session.StateMap{})
+	require.NoError(t, err)
+
+	require.NoError(t, service.Close())
+
+	trackEvent := &session.TrackEvent{
+		Track:     "alpha",
+		Payload:   json.RawMessage(`"recover"`),
+		Timestamp: time.Now(),
+	}
+
+	assert.NotPanics(t, func() {
+		err = service.AppendTrackEvent(ctx, sess, trackEvent)
+	})
+	assert.NoError(t, err)
+}
+
+func TestService_getTrackEventsEmptyKeys(t *testing.T) {
+	service := &Service{}
+	result, err := service.getTrackEvents(context.Background(), nil, nil, 0, time.Time{})
+	require.NoError(t, err)
+	assert.Nil(t, result)
+}
+
+func TestService_getTrackEventsStateMismatch(t *testing.T) {
+	service := &Service{}
+	_, err := service.getTrackEvents(
+		context.Background(),
+		[]session.Key{{AppName: "app", UserID: "user", SessionID: "s1"}},
+		nil,
+		0,
+		time.Time{},
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "session states count mismatch")
+}
+
+func TestService_getTrackEventsLimitAndTTL(t *testing.T) {
+	redisURL, cleanup := setupTestRedis(t)
+	defer cleanup()
+
+	ttl := 2 * time.Second
+	service, err := NewService(
+		WithRedisClientURL(redisURL),
+		WithSessionTTL(ttl),
+	)
+	require.NoError(t, err)
+	defer service.Close()
+
+	ctx := context.Background()
+	key := session.Key{
+		AppName:   "app",
+		UserID:    "user",
+		SessionID: "session",
+	}
+	_, err = service.CreateSession(ctx, key, session.StateMap{})
+	require.NoError(t, err)
+
+	require.NoError(t, service.addTrackEvent(ctx, key, &session.TrackEvent{
+		Track:     "alpha",
+		Payload:   json.RawMessage(`"old"`),
+		Timestamp: time.Now().Add(-time.Minute),
+	}))
+	require.NoError(t, service.addTrackEvent(ctx, key, &session.TrackEvent{
+		Track:     "alpha",
+		Payload:   json.RawMessage(`"new"`),
+		Timestamp: time.Now(),
+	}))
+
+	client := buildRedisClient(t, redisURL)
+	state := fetchSessionState(t, ctx, client, key)
+	result, err := service.getTrackEvents(ctx, []session.Key{key}, []*SessionState{state}, 1, time.Time{})
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+	alpha, ok := result[0]["alpha"]
+	require.True(t, ok)
+	require.Len(t, alpha, 1)
+	assert.Equal(t, json.RawMessage(`"new"`), alpha[0].Payload)
+
+	trackTTL := client.TTL(ctx, getTrackKey(key, "alpha")).Val()
+	require.Greater(t, trackTTL, time.Duration(0))
+	require.LessOrEqual(t, trackTTL, ttl)
+}
+
+func TestService_getTrackEventsAfterTime(t *testing.T) {
+	redisURL, cleanup := setupTestRedis(t)
+	defer cleanup()
+
+	service, err := NewService(WithRedisClientURL(redisURL))
+	require.NoError(t, err)
+	defer service.Close()
+
+	ctx := context.Background()
+	key := session.Key{
+		AppName:   "filter-app",
+		UserID:    "filter-user",
+		SessionID: "filter-session",
+	}
+	_, err = service.CreateSession(ctx, key, session.StateMap{})
+	require.NoError(t, err)
+
+	oldEvent := &session.TrackEvent{
+		Track:     "alpha",
+		Payload:   json.RawMessage(`"first"`),
+		Timestamp: time.Now().Add(-2 * time.Hour),
+	}
+	newEvent := &session.TrackEvent{
+		Track:     "alpha",
+		Payload:   json.RawMessage(`"second"`),
+		Timestamp: time.Now(),
+	}
+
+	require.NoError(t, service.addTrackEvent(ctx, key, oldEvent))
+	require.NoError(t, service.addTrackEvent(ctx, key, newEvent))
+
+	client := buildRedisClient(t, redisURL)
+	state := fetchSessionState(t, ctx, client, key)
+	cutoff := newEvent.Timestamp.Add(-time.Minute)
+
+	result, err := service.getTrackEvents(
+		ctx,
+		[]session.Key{key},
+		[]*SessionState{state},
+		0,
+		cutoff,
+	)
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+	events := result[0]["alpha"]
+	require.Len(t, events, 1)
+	assert.Equal(t, json.RawMessage(`"second"`), events[0].Payload)
+}
+
+func TestService_getTrackEventsOrderingAndEmpty(t *testing.T) {
+	redisURL, cleanup := setupTestRedis(t)
+	defer cleanup()
+
+	service, err := NewService(WithRedisClientURL(redisURL))
+	require.NoError(t, err)
+	defer service.Close()
+
+	ctx := context.Background()
+	key := session.Key{
+		AppName:   "order-app",
+		UserID:    "order-user",
+		SessionID: "order-session",
+	}
+	_, err = service.CreateSession(ctx, key, session.StateMap{})
+	require.NoError(t, err)
+
+	oldEvent := &session.TrackEvent{
+		Track:     "alpha",
+		Payload:   json.RawMessage(`"first"`),
+		Timestamp: time.Now().Add(-time.Hour),
+	}
+	newEvent := &session.TrackEvent{
+		Track:     "alpha",
+		Payload:   json.RawMessage(`"second"`),
+		Timestamp: time.Now(),
+	}
+	require.NoError(t, service.addTrackEvent(ctx, key, oldEvent))
+	require.NoError(t, service.addTrackEvent(ctx, key, newEvent))
+
+	client := buildRedisClient(t, redisURL)
+	state := fetchSessionState(t, ctx, client, key)
+	result, err := service.getTrackEvents(ctx, []session.Key{key}, []*SessionState{state}, 0, time.Time{})
+	require.NoError(t, err)
+	require.Len(t, result, 1)
+	events := result[0]["alpha"]
+	require.Len(t, events, 2)
+	assert.Equal(t, json.RawMessage(`"first"`), events[0].Payload)
+	assert.Equal(t, json.RawMessage(`"second"`), events[1].Payload)
+
+	keyNoTrack := session.Key{
+		AppName:   "order-app",
+		UserID:    "order-user",
+		SessionID: "no-track",
+	}
+	_, err = service.CreateSession(ctx, keyNoTrack, session.StateMap{})
+	require.NoError(t, err)
+
+	stateNoTrack := fetchSessionState(t, ctx, client, keyNoTrack)
+	emptyResult, err := service.getTrackEvents(ctx, []session.Key{keyNoTrack}, []*SessionState{stateNoTrack}, 0, time.Time{})
+	require.NoError(t, err)
+	require.Len(t, emptyResult, 1)
+	assert.Empty(t, emptyResult[0])
+}
+
 // TestProcessEventCmd_SkipMalformed ensures malformed JSON items are skipped
 // rather than failing the entire list parsing.
 func TestProcessEventCmd_SkipMalformed(t *testing.T) {
@@ -2568,10 +3047,367 @@ func TestProcessEventCmd_SkipMalformed(t *testing.T) {
 	cmd.SetVal([]string{malformed, string(validBytes)})
 
 	// Call the helper under test.
-	events, err := processEventCmd(cmd)
+	events, err := processEventCmd(context.Background(), cmd)
 	require.NoError(t, err)
 
 	// Only the valid one should be returned.
 	require.Len(t, events, 1)
 	require.Equal(t, "ok", events[0].ID)
+}
+
+func Test_normalizeSessionEvents(t *testing.T) {
+	t.Run("nil_when_no_slices", func(t *testing.T) {
+		assert.Nil(t, normalizeSessionEvents(nil))
+	})
+	t.Run("first_slice_returned", func(t *testing.T) {
+		evts := []event.Event{{ID: "a"}}
+		res := normalizeSessionEvents([][]event.Event{evts})
+		require.Len(t, res, 1)
+		assert.Equal(t, "a", res[0].ID)
+	})
+}
+
+func Test_attachSummaries(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("skip_when_no_events", func(t *testing.T) {
+		sess := session.NewSession("app", "user", "sess")
+		cmd := redis.NewStringCmd(ctx, "hget", "k")
+		attachSummaries(sess, cmd)
+		assert.Empty(t, sess.Summaries)
+	})
+
+	t.Run("attach_when_events_present", func(t *testing.T) {
+		sess := session.NewSession("app", "user", "sess")
+		sess.Events = []event.Event{{ID: "evt"}}
+
+		summary := map[string]*session.Summary{
+			session.SummaryFilterKeyAllContents: {
+				Summary:   "hi",
+				UpdatedAt: time.Now(),
+			},
+		}
+		bytes, err := json.Marshal(summary)
+		require.NoError(t, err)
+
+		cmd := redis.NewStringCmd(ctx, "hget", "k")
+		cmd.SetVal(string(bytes))
+
+		attachSummaries(sess, cmd)
+		require.NotNil(t, sess.Summaries)
+		assert.Contains(t, sess.Summaries, session.SummaryFilterKeyAllContents)
+	})
+}
+
+func Test_collectTrackQueryResultsSkipNil(t *testing.T) {
+	ctx := context.Background()
+	cmd := redis.NewStringSliceCmd(ctx, "zrange", "k")
+	cmd.SetErr(redis.Nil)
+
+	results, err := collectTrackQueryResults(
+		[]*trackQuery{
+			{
+				sessionIdx: 0,
+				track:      session.Track("alpha"),
+				cmd:        cmd,
+			},
+		},
+		1,
+	)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Empty(t, results[0])
+}
+
+func fetchSessionState(t *testing.T, ctx context.Context, client *redis.Client, key session.Key) *SessionState {
+	t.Helper()
+	raw, err := client.HGet(ctx, getSessionStateKey(key), key.SessionID).Bytes()
+	require.NoError(t, err)
+	var state SessionState
+	require.NoError(t, json.Unmarshal(raw, &state))
+	if state.State == nil {
+		state.State = make(session.StateMap)
+	}
+	return &state
+}
+
+func TestAppendEventHook(t *testing.T) {
+	redisURL, cleanup := setupTestRedis(t)
+	defer cleanup()
+
+	t.Run("hook modifies event before storage", func(t *testing.T) {
+		hookCalled := false
+		service, err := NewService(
+			WithRedisClientURL(redisURL),
+			WithAppendEventHook(func(ctx *session.AppendEventContext, next func() error) error {
+				hookCalled = true
+				ctx.Event.Tag = "hook_processed"
+				return next()
+			}),
+		)
+		require.NoError(t, err)
+		defer service.Close()
+
+		ctx := context.Background()
+		key := session.Key{AppName: "app", UserID: "user", SessionID: "sess"}
+		sess, err := service.CreateSession(ctx, key, nil)
+		require.NoError(t, err)
+
+		// Add a user message first
+		userEvt := event.New("inv0", "user")
+		userEvt.Response = &model.Response{
+			Choices: []model.Choice{{Message: model.Message{Role: model.RoleUser, Content: "Hello"}}},
+		}
+		err = service.AppendEvent(ctx, sess, userEvt)
+		require.NoError(t, err)
+
+		// Then add assistant message
+		evt := event.New("inv1", "assistant")
+		evt.Response = &model.Response{
+			Choices: []model.Choice{{Message: model.Message{Role: model.RoleAssistant, Content: "Hi there"}}},
+		}
+
+		err = service.AppendEvent(ctx, sess, evt)
+		require.NoError(t, err)
+		assert.True(t, hookCalled)
+
+		// Verify the event was modified by hook
+		assert.Equal(t, "hook_processed", evt.Tag)
+
+		// Verify storage
+		retrieved, err := service.GetSession(ctx, key)
+		require.NoError(t, err)
+		require.Len(t, retrieved.Events, 2)
+	})
+
+	t.Run("hook can abort event storage", func(t *testing.T) {
+		service, err := NewService(
+			WithRedisClientURL(redisURL),
+			WithAppendEventHook(func(ctx *session.AppendEventContext, next func() error) error {
+				return nil // skip next()
+			}),
+		)
+		require.NoError(t, err)
+		defer service.Close()
+
+		ctx := context.Background()
+		key := session.Key{AppName: "app2", UserID: "user", SessionID: "sess"}
+		sess, err := service.CreateSession(ctx, key, nil)
+		require.NoError(t, err)
+
+		evt := event.New("inv1", "assistant")
+		evt.Response = &model.Response{
+			Choices: []model.Choice{{Message: model.Message{Role: model.RoleAssistant, Content: "Hello"}}},
+		}
+
+		err = service.AppendEvent(ctx, sess, evt)
+		require.NoError(t, err)
+
+		// Event should not be stored since hook aborted
+		retrieved, err := service.GetSession(ctx, key)
+		require.NoError(t, err)
+		assert.Len(t, retrieved.Events, 0)
+	})
+
+	t.Run("multiple hooks execute in order", func(t *testing.T) {
+		order := []string{}
+		service, err := NewService(
+			WithRedisClientURL(redisURL),
+			WithAppendEventHook(func(ctx *session.AppendEventContext, next func() error) error {
+				order = append(order, "hook1_before")
+				err := next()
+				order = append(order, "hook1_after")
+				return err
+			}),
+			WithAppendEventHook(func(ctx *session.AppendEventContext, next func() error) error {
+				order = append(order, "hook2_before")
+				err := next()
+				order = append(order, "hook2_after")
+				return err
+			}),
+		)
+		require.NoError(t, err)
+		defer service.Close()
+
+		ctx := context.Background()
+		key := session.Key{AppName: "app3", UserID: "user", SessionID: "sess"}
+		sess, err := service.CreateSession(ctx, key, nil)
+		require.NoError(t, err)
+
+		evt := event.New("inv1", "assistant")
+		evt.Response = &model.Response{
+			Choices: []model.Choice{{Message: model.Message{Role: model.RoleAssistant, Content: "Hello"}}},
+		}
+
+		err = service.AppendEvent(ctx, sess, evt)
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{"hook1_before", "hook2_before", "hook2_after", "hook1_after"}, order)
+	})
+}
+
+func TestAppendEvent_AsyncRecover(t *testing.T) {
+	ch := make(chan *sessionEventPair, 1)
+	close(ch)
+
+	service := &Service{
+		opts: ServiceOpts{
+			enableAsyncPersist: true,
+		},
+		eventPairChans: []chan *sessionEventPair{ch},
+	}
+	sess := &session.Session{
+		ID:      "sess",
+		AppName: "app",
+		UserID:  "user",
+		State:   make(session.StateMap),
+	}
+	evt := &event.Event{Response: &model.Response{}}
+
+	assert.NotPanics(t, func() {
+		err := service.AppendEvent(context.Background(), sess, evt)
+		require.NoError(t, err)
+	})
+}
+
+func TestAppendTrackEvent_AsyncRecover(t *testing.T) {
+	ch := make(chan *trackEventPair, 1)
+	close(ch)
+
+	service := &Service{
+		opts: ServiceOpts{
+			enableAsyncPersist: true,
+		},
+		trackEventChans: []chan *trackEventPair{ch},
+	}
+	sess := &session.Session{
+		ID:      "sess",
+		AppName: "app",
+		UserID:  "user",
+		State:   make(session.StateMap),
+	}
+	trackEvent := &session.TrackEvent{
+		Track:     "alpha",
+		Timestamp: time.Now(),
+	}
+
+	assert.NotPanics(t, func() {
+		err := service.AppendTrackEvent(
+			context.Background(),
+			sess,
+			trackEvent,
+		)
+		require.NoError(t, err)
+	})
+}
+
+func TestGetSessionHook(t *testing.T) {
+	redisURL, cleanup := setupTestRedis(t)
+	defer cleanup()
+
+	t.Run("hook modifies session after retrieval", func(t *testing.T) {
+		hookCalled := false
+		service, err := NewService(
+			WithRedisClientURL(redisURL),
+			WithGetSessionHook(func(ctx *session.GetSessionContext, next func() (*session.Session, error)) (*session.Session, error) {
+				hookCalled = true
+				sess, err := next()
+				if err != nil || sess == nil {
+					return sess, err
+				}
+				sess.State["hook_added"] = []byte("true")
+				return sess, nil
+			}),
+		)
+		require.NoError(t, err)
+		defer service.Close()
+
+		ctx := context.Background()
+		key := session.Key{AppName: "app4", UserID: "user", SessionID: "sess"}
+		_, err = service.CreateSession(ctx, key, nil)
+		require.NoError(t, err)
+
+		retrieved, err := service.GetSession(ctx, key)
+		require.NoError(t, err)
+		assert.True(t, hookCalled)
+		assert.Equal(t, []byte("true"), retrieved.State["hook_added"])
+	})
+
+	t.Run("hook can filter events", func(t *testing.T) {
+		service, err := NewService(
+			WithRedisClientURL(redisURL),
+			WithGetSessionHook(func(ctx *session.GetSessionContext, next func() (*session.Session, error)) (*session.Session, error) {
+				sess, err := next()
+				if err != nil || sess == nil {
+					return sess, err
+				}
+				filtered := make([]event.Event, 0)
+				for _, e := range sess.Events {
+					if e.Tag != "skip" {
+						filtered = append(filtered, e)
+					}
+				}
+				sess.Events = filtered
+				return sess, nil
+			}),
+		)
+		require.NoError(t, err)
+		defer service.Close()
+
+		ctx := context.Background()
+		key := session.Key{AppName: "app5", UserID: "user", SessionID: "sess"}
+		sess, err := service.CreateSession(ctx, key, nil)
+		require.NoError(t, err)
+
+		evt1 := event.New("inv1", "user")
+		evt1.Response = &model.Response{
+			Choices: []model.Choice{{Message: model.Message{Role: model.RoleUser, Content: "Q1"}}},
+		}
+		evt1.Tag = "skip"
+		err = service.AppendEvent(ctx, sess, evt1)
+		require.NoError(t, err)
+
+		evt2 := event.New("inv2", "assistant")
+		evt2.Response = &model.Response{
+			Choices: []model.Choice{{Message: model.Message{Role: model.RoleAssistant, Content: "A1"}}},
+		}
+		err = service.AppendEvent(ctx, sess, evt2)
+		require.NoError(t, err)
+
+		retrieved, err := service.GetSession(ctx, key)
+		require.NoError(t, err)
+		assert.Len(t, retrieved.Events, 1)
+		assert.Equal(t, "A1", retrieved.Events[0].Response.Choices[0].Message.Content)
+	})
+
+	t.Run("multiple hooks execute in order", func(t *testing.T) {
+		order := []string{}
+		service, err := NewService(
+			WithRedisClientURL(redisURL),
+			WithGetSessionHook(func(ctx *session.GetSessionContext, next func() (*session.Session, error)) (*session.Session, error) {
+				order = append(order, "hook1_before")
+				sess, err := next()
+				order = append(order, "hook1_after")
+				return sess, err
+			}),
+			WithGetSessionHook(func(ctx *session.GetSessionContext, next func() (*session.Session, error)) (*session.Session, error) {
+				order = append(order, "hook2_before")
+				sess, err := next()
+				order = append(order, "hook2_after")
+				return sess, err
+			}),
+		)
+		require.NoError(t, err)
+		defer service.Close()
+
+		ctx := context.Background()
+		key := session.Key{AppName: "app6", UserID: "user", SessionID: "sess"}
+		_, err = service.CreateSession(ctx, key, nil)
+		require.NoError(t, err)
+
+		_, err = service.GetSession(ctx, key)
+		require.NoError(t, err)
+
+		assert.Equal(t, []string{"hook1_before", "hook2_before", "hook2_after", "hook1_after"}, order)
+	})
 }

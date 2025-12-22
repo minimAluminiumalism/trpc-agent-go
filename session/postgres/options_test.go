@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"trpc.group/trpc-go/trpc-agent-go/internal/session/sqldb"
 )
 
 func TestValidateTablePrefix(t *testing.T) {
@@ -76,7 +77,7 @@ func TestValidateTablePrefix(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateTablePrefix(tt.prefix)
+			err := sqldb.ValidateTablePrefix(tt.prefix)
 			if tt.wantError {
 				assert.Error(t, err, "Expected error for prefix: %s", tt.prefix)
 			} else {
@@ -182,6 +183,30 @@ func TestWithInitDBTablePrefix_Validation(t *testing.T) {
 
 // Test all ServiceOpt functions
 func TestServiceOptions(t *testing.T) {
+	t.Run("WithPostgresClientDSN", func(t *testing.T) {
+		tests := []struct {
+			name string
+			dsn  string
+		}{
+			{
+				name: "URL format",
+				dsn:  "postgres://user:password@localhost:5432/mydb?sslmode=disable",
+			},
+			{
+				name: "Key-Value format",
+				dsn:  "host=localhost port=5432 user=postgres password=secret dbname=mydb sslmode=disable",
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				opts := &ServiceOpts{}
+				WithPostgresClientDSN(tt.dsn)(opts)
+				assert.Equal(t, tt.dsn, opts.dsn)
+			})
+		}
+	})
+
 	t.Run("WithSessionEventLimit", func(t *testing.T) {
 		opts := &ServiceOpts{}
 		WithSessionEventLimit(100)(opts)
@@ -317,5 +342,11 @@ func TestServiceOptions(t *testing.T) {
 		opts := &ServiceOpts{}
 		WithSkipDBInit(true)(opts)
 		assert.True(t, opts.skipDBInit)
+	})
+
+	t.Run("WithSchema", func(t *testing.T) {
+		opts := &ServiceOpts{}
+		WithSchema("public")(opts)
+		assert.Equal(t, "public", opts.schema)
 	})
 }

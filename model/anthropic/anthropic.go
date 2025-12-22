@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"strings"
 	"time"
 
@@ -23,56 +22,13 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/anthropics/anthropic-sdk-go/packages/param"
 	"github.com/anthropics/anthropic-sdk-go/shared/constant"
+	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
+	imodel "trpc.group/trpc-go/trpc-agent-go/model/internal/model"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
 
-const (
-	defaultChannelBufferSize = 256
-	functionToolType         = "function"
-)
-
-// HTTPClient is the interface for the HTTP client.
-type HTTPClient interface {
-	Do(*http.Request) (*http.Response, error)
-}
-
-// HTTPClientNewFunc is the function type for creating a new HTTP client.
-type HTTPClientNewFunc func(opts ...HTTPClientOption) HTTPClient
-
-// DefaultNewHTTPClient is the default HTTP client for Anthropic.
-var DefaultNewHTTPClient HTTPClientNewFunc = func(opts ...HTTPClientOption) HTTPClient {
-	options := &HTTPClientOptions{}
-	for _, opt := range opts {
-		opt(options)
-	}
-	return &http.Client{
-		Transport: options.Transport,
-	}
-}
-
-// HTTPClientOption is the option for the HTTP client.
-type HTTPClientOption func(*HTTPClientOptions)
-
-// WithHTTPClientName is the option for the HTTP client name.
-func WithHTTPClientName(name string) HTTPClientOption {
-	return func(options *HTTPClientOptions) {
-		options.Name = name
-	}
-}
-
-// WithHTTPClientTransport is the option for the HTTP client transport.
-func WithHTTPClientTransport(transport http.RoundTripper) HTTPClientOption {
-	return func(options *HTTPClientOptions) {
-		options.Transport = transport
-	}
-}
-
-// HTTPClientOptions is the options for the HTTP client.
-type HTTPClientOptions struct {
-	Name      string
-	Transport http.RoundTripper
-}
+const functionToolType = "function"
 
 // Model implements the model.Model interface for Anthropic API.
 type Model struct {
@@ -86,138 +42,26 @@ type Model struct {
 	chatResponseCallback       ChatResponseCallbackFunc
 	chatChunkCallback          ChatChunkCallbackFunc
 	chatStreamCompleteCallback ChatStreamCompleteCallbackFunc
-}
-
-// ChatRequestCallbackFunc is the function type for the chat request callback.
-type ChatRequestCallbackFunc func(
-	ctx context.Context,
-	chatRequest *anthropic.MessageNewParams,
-)
-
-// ChatResponseCallbackFunc is the function type for the chat response callback.
-type ChatResponseCallbackFunc func(
-	ctx context.Context,
-	chatRequest *anthropic.MessageNewParams,
-	chatResponse *anthropic.Message,
-)
-
-// ChatChunkCallbackFunc is the function type for the chat chunk callback.
-type ChatChunkCallbackFunc func(
-	ctx context.Context,
-	chatRequest *anthropic.MessageNewParams,
-	chatChunk *anthropic.MessageStreamEventUnion,
-)
-
-// ChatStreamCompleteCallbackFunc is the function type for the chat stream completion callback.
-// This callback is invoked when streaming is completely finished (success or error).
-type ChatStreamCompleteCallbackFunc func(
-	ctx context.Context,
-	chatRequest *anthropic.MessageNewParams,
-	accumulator *anthropic.Message, // nil if streamErr is not nil
-	streamErr error, // nil if streaming completed successfully
-)
-
-// options contains configuration options for creating an Anthropic model.
-type options struct {
-	apiKey                     string                         // API key for the Anthropic client.
-	baseURL                    string                         // Base URL for the Anthropic client.
-	channelBufferSize          int                            // Buffer size for response channels (default: 256)
-	HTTPClientOptions          []HTTPClientOption             // Options for the HTTP client.
-	anthropicClientOptions     []option.RequestOption         // Options for building Anthropic client.
-	anthropicRequestOptions    []option.RequestOption         // Options for building Anthropic request.
-	chatRequestCallback        ChatRequestCallbackFunc        // Callback for the chat request.
-	chatResponseCallback       ChatResponseCallbackFunc       // Callback for the chat response.
-	chatChunkCallback          ChatChunkCallbackFunc          // Callback for the chat chunk.
-	chatStreamCompleteCallback ChatStreamCompleteCallbackFunc // Callback for the chat stream completion.
-}
-
-// Option is a function that configures an Anthropic model.
-type Option func(*options)
-
-// WithAPIKey sets the API key for the Anthropic client.
-func WithAPIKey(key string) Option {
-	return func(o *options) {
-		o.apiKey = key
-	}
-}
-
-// WithBaseURL sets the base URL for the Anthropic client.
-func WithBaseURL(url string) Option {
-	return func(o *options) {
-		o.baseURL = url
-	}
-}
-
-// WithChannelBufferSize sets the channel buffer size for the Anthropic client, 256 by default.
-func WithChannelBufferSize(size int) Option {
-	return func(o *options) {
-		if size <= 0 {
-			size = defaultChannelBufferSize
-		}
-		o.channelBufferSize = size
-	}
-}
-
-// WithAnthropicClientOptions appends custom request options for the Anthropic client.
-func WithAnthropicClientOptions(opts ...option.RequestOption) Option {
-	return func(o *options) {
-		o.anthropicClientOptions = append(o.anthropicClientOptions, opts...)
-	}
-}
-
-// WithAnthropicRequestOptions appends per-request options for the Anthropic client.
-func WithAnthropicRequestOptions(opts ...option.RequestOption) Option {
-	return func(o *options) {
-		o.anthropicRequestOptions = append(o.anthropicRequestOptions, opts...)
-	}
-}
-
-// WithChatRequestCallback sets the function to be called before sending a chat request.
-func WithChatRequestCallback(fn ChatRequestCallbackFunc) Option {
-	return func(opts *options) {
-		opts.chatRequestCallback = fn
-	}
-}
-
-// WithChatResponseCallback sets the function to be called after receiving a chat response.
-// Used for non-streaming responses.
-func WithChatResponseCallback(fn ChatResponseCallbackFunc) Option {
-	return func(opts *options) {
-		opts.chatResponseCallback = fn
-	}
-}
-
-// WithChatChunkCallback sets the function to be called after receiving a chat chunk.
-// Used for streaming responses.
-func WithChatChunkCallback(fn ChatChunkCallbackFunc) Option {
-	return func(opts *options) {
-		opts.chatChunkCallback = fn
-	}
-}
-
-// WithChatStreamCompleteCallback sets the function to be called when streaming is completed.
-// Called for both successful and failed streaming completions.
-func WithChatStreamCompleteCallback(fn ChatStreamCompleteCallbackFunc) Option {
-	return func(opts *options) {
-		opts.chatStreamCompleteCallback = fn
-	}
-}
-
-// WithHTTPClientOptions sets the HTTP client options for the Anthropic client.
-func WithHTTPClientOptions(httpOpts ...HTTPClientOption) Option {
-	return func(opts *options) {
-		opts.HTTPClientOptions = httpOpts
-	}
+	enableTokenTailoring       bool                    // Enable automatic token tailoring.
+	maxInputTokens             int                     // Max input tokens for token tailoring.
+	tokenCounter               model.TokenCounter      // Token counter for token tailoring.
+	tailoringStrategy          model.TailoringStrategy // Tailoring strategy for token tailoring.
+	// Token tailoring budget parameters (instance-level overrides).
+	protocolOverheadTokens int
+	reserveOutputTokens    int
+	inputTokensFloor       int
+	outputTokensFloor      int
+	safetyMarginRatio      float64
+	maxInputTokensRatio    float64
 }
 
 // New creates a new Anthropic model adapter.
 func New(name string, opts ...Option) *Model {
-	o := &options{
-		channelBufferSize: defaultChannelBufferSize,
-	}
+	o := defaultOptions
 	for _, opt := range opts {
-		opt(o)
+		opt(&o)
 	}
+
 	var clientOpts []option.RequestOption
 	if o.apiKey != "" {
 		clientOpts = append(clientOpts, option.WithAPIKey(o.apiKey))
@@ -225,9 +69,14 @@ func New(name string, opts ...Option) *Model {
 	if o.baseURL != "" {
 		clientOpts = append(clientOpts, option.WithBaseURL(o.baseURL))
 	}
-	clientOpts = append(clientOpts, option.WithHTTPClient(DefaultNewHTTPClient(o.HTTPClientOptions...)))
+	clientOpts = append(clientOpts, option.WithHTTPClient(model.DefaultNewHTTPClient(o.httpClientOptions...)))
 	clientOpts = append(clientOpts, o.anthropicClientOptions...)
 	client := anthropic.NewClient(clientOpts...)
+
+	if o.tailoringStrategy == nil {
+		o.tailoringStrategy = model.NewMiddleOutStrategy(o.tokenCounter)
+	}
+
 	return &Model{
 		client:                     client,
 		name:                       name,
@@ -239,6 +88,16 @@ func New(name string, opts ...Option) *Model {
 		chatResponseCallback:       o.chatResponseCallback,
 		chatChunkCallback:          o.chatChunkCallback,
 		chatStreamCompleteCallback: o.chatStreamCompleteCallback,
+		enableTokenTailoring:       o.enableTokenTailoring,
+		tokenCounter:               o.tokenCounter,
+		tailoringStrategy:          o.tailoringStrategy,
+		maxInputTokens:             o.maxInputTokens,
+		protocolOverheadTokens:     o.tokenTailoringConfig.ProtocolOverheadTokens,
+		reserveOutputTokens:        o.tokenTailoringConfig.ReserveOutputTokens,
+		inputTokensFloor:           o.tokenTailoringConfig.InputTokensFloor,
+		outputTokensFloor:          o.tokenTailoringConfig.OutputTokensFloor,
+		safetyMarginRatio:          o.tokenTailoringConfig.SafetyMarginRatio,
+		maxInputTokensRatio:        o.tokenTailoringConfig.MaxInputTokensRatio,
 	}
 }
 
@@ -257,6 +116,10 @@ func (m *Model) GenerateContent(
 	if request == nil {
 		return nil, errors.New("request cannot be nil")
 	}
+
+	// Apply token tailoring if configured.
+	m.applyTokenTailoring(ctx, request)
+
 	chatRequest, err := m.buildChatRequest(request)
 	if err != nil {
 		return nil, fmt.Errorf("build chat request: %w", err)
@@ -275,6 +138,99 @@ func (m *Model) GenerateContent(
 		m.handleNonStreamingResponse(ctx, *chatRequest, responseChan)
 	}()
 	return responseChan, nil
+}
+
+// applyTokenTailoring performs best-effort token tailoring if configured.
+// It uses the token tailoring strategy defined in imodel package.
+func (m *Model) applyTokenTailoring(ctx context.Context, request *model.Request) {
+	// Early return if token tailoring is disabled or no messages to process.
+	if !m.enableTokenTailoring || len(request.Messages) == 0 {
+		return
+	}
+
+	// Determine max input tokens using priority: user config > auto calculation > default.
+	maxInputTokens := m.maxInputTokens
+	if maxInputTokens <= 0 {
+		// Auto-calculate based on model context window with custom or default parameters.
+		contextWindow := imodel.ResolveContextWindow(m.name)
+		if m.protocolOverheadTokens > 0 || m.reserveOutputTokens > 0 {
+			// Use custom parameters if any are set.
+			maxInputTokens = imodel.CalculateMaxInputTokensWithParams(
+				contextWindow,
+				m.protocolOverheadTokens,
+				m.reserveOutputTokens,
+				m.inputTokensFloor,
+				m.safetyMarginRatio,
+				m.maxInputTokensRatio,
+			)
+		} else {
+			// Use default parameters.
+			maxInputTokens = imodel.CalculateMaxInputTokens(contextWindow)
+		}
+		log.DebugfContext(
+			ctx,
+			"auto-calculated max input tokens: model=%s, "+
+				"contextWindow=%d, maxInputTokens=%d",
+			m.name,
+			contextWindow,
+			maxInputTokens,
+		)
+	}
+
+	// Apply token tailoring.
+	tailored, err := m.tailoringStrategy.TailorMessages(ctx, request.Messages, maxInputTokens)
+	if err != nil {
+		log.WarnContext(
+			ctx,
+			"token tailoring failed in anthropic.Model",
+			err,
+		)
+		return
+	}
+
+	request.Messages = tailored
+
+	// Calculate remaining tokens for output based on context window.
+	usedTokens, err := m.tokenCounter.CountTokensRange(ctx, request.Messages, 0, len(request.Messages))
+	if err != nil {
+		log.WarnContext(
+			ctx,
+			"failed to count tokens after tailoring",
+			err,
+		)
+		return
+	}
+
+	// Set max output tokens only if user hasn't specified it.
+	// This respects user's explicit configuration while providing a safe default.
+	if request.GenerationConfig.MaxTokens == nil {
+		contextWindow := imodel.ResolveContextWindow(m.name)
+		var maxOutputTokens int
+		if m.protocolOverheadTokens > 0 || m.outputTokensFloor > 0 {
+			// Use custom parameters if any are set.
+			maxOutputTokens = imodel.CalculateMaxOutputTokensWithParams(
+				contextWindow,
+				usedTokens,
+				m.protocolOverheadTokens,
+				m.outputTokensFloor,
+				m.safetyMarginRatio,
+			)
+		} else {
+			// Use default parameters.
+			maxOutputTokens = imodel.CalculateMaxOutputTokens(contextWindow, usedTokens)
+		}
+		if maxOutputTokens > 0 {
+			request.GenerationConfig.MaxTokens = &maxOutputTokens
+			log.DebugfContext(
+				ctx,
+				"token tailoring: contextWindow=%d, usedTokens=%d, "+
+					"maxOutputTokens=%d",
+				contextWindow,
+				usedTokens,
+				maxOutputTokens,
+			)
+		}
+	}
 }
 
 // buildChatRequest builds the chat request for the Anthropic API.
@@ -586,7 +542,7 @@ func convertTools(tools map[string]tool.Tool) []anthropic.ToolUnionParam {
 		result = append(result, anthropic.ToolUnionParam{
 			OfTool: &anthropic.ToolParam{
 				Name:        declaration.Name,
-				Description: anthropic.String(declaration.Description),
+				Description: anthropic.String(buildToolDescription(declaration)),
 				InputSchema: anthropic.ToolInputSchemaParam{
 					Type:       constant.Object(declaration.InputSchema.Type),
 					Properties: declaration.InputSchema.Properties,
@@ -596,6 +552,22 @@ func convertTools(tools map[string]tool.Tool) []anthropic.ToolUnionParam {
 		})
 	}
 	return result
+}
+
+// buildToolDescription builds the description for a tool.
+// It appends the output schema to the description.
+func buildToolDescription(declaration *tool.Declaration) string {
+	desc := declaration.Description
+	if declaration.OutputSchema == nil {
+		return desc
+	}
+	schemaJSON, err := json.Marshal(declaration.OutputSchema)
+	if err != nil {
+		log.Debugf("marshal output schema for tool %s: %v", declaration.Name, err)
+		return desc
+	}
+	desc += "Output schema: " + string(schemaJSON)
+	return desc
 }
 
 // convertMessages builds Anthropic message parameters and system prompts from trpc-agent-go messages.

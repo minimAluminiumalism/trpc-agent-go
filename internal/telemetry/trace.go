@@ -124,6 +124,8 @@ var (
 	KeyGenAIRequestTopP             = semconvtrace.KeyGenAIRequestTopP
 	KeyGenAISystemInstructions      = semconvtrace.KeyGenAISystemInstructions
 	KeyGenAITokenType               = semconvtrace.KeyGenAITokenType
+	KeyGenAIRequestThinkingEnabled  = semconvtrace.KeyGenAIRequestThinkingEnabled
+	KeyGenAIRequestToolDefinitions  = "gen_ai.request.tool.definitions"
 
 	KeyGenAIToolName          = semconvtrace.KeyGenAIToolName
 	KeyGenAIToolDescription   = semconvtrace.KeyGenAIToolDescription
@@ -192,7 +194,7 @@ const ToolNameMergedTools = "(merged tools)"
 
 // TraceMergedToolCalls traces the invocation of a merged tool call.
 // Calling this function is not needed for telemetry purposes. This is provided
-// for preventing /debug/trace requests (typically sent by web UI).
+// for preventing trace-query requests typically sent by web UIs.
 func TraceMergedToolCalls(span trace.Span, rspEvent *event.Event) {
 	span.SetAttributes(
 		attribute.String(KeyGenAISystem, SystemTRPCGoAgent),
@@ -259,6 +261,9 @@ func TraceBeforeInvokeAgent(span trace.Span, invoke *agent.Invocation, agentDesc
 		}
 		if tp := genConfig.TopP; tp != nil {
 			span.SetAttributes(attribute.Float64(KeyGenAIRequestTopP, *tp))
+		}
+		if te := genConfig.ThinkingEnabled; te != nil {
+			span.SetAttributes(attribute.Bool(KeyGenAIRequestThinkingEnabled, *te))
 		}
 	}
 
@@ -401,12 +406,34 @@ func buildRequestAttributes(req *model.Request) []attribute.KeyValue {
 	if tp := genConfig.TopP; tp != nil {
 		attrs = append(attrs, attribute.Float64(KeyGenAIRequestTopP, *tp))
 	}
+	if te := genConfig.ThinkingEnabled; te != nil {
+		attrs = append(attrs, attribute.Bool(KeyGenAIRequestThinkingEnabled, *te))
+	}
 
 	// Add request body
 	if bts, err := json.Marshal(req); err == nil {
 		attrs = append(attrs, attribute.String(KeyLLMRequest, string(bts)))
 	} else {
 		attrs = append(attrs, attribute.String(KeyLLMRequest, "<not json serializable>"))
+	}
+
+	// Add tool definitions as best-effort structured array (JSON string fallback)
+	if len(req.Tools) > 0 {
+		definitions := make([]*tool.Declaration, 0, len(req.Tools))
+		for _, t := range req.Tools {
+			if t == nil {
+				continue
+			}
+			if decl := t.Declaration(); decl != nil {
+				definitions = append(definitions, decl)
+			}
+		}
+
+		if len(definitions) > 0 {
+			if bts, err := json.Marshal(definitions); err == nil {
+				attrs = append(attrs, attribute.String(KeyGenAIRequestToolDefinitions, string(bts)))
+			}
+		}
 	}
 
 	// Add messages
